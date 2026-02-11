@@ -8,7 +8,8 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "cron:alerts": "tsx scripts/reactive-alerts.ts"
+    "cron:alerts": "tsx scripts/reactive-alerts.ts",
+    "test:sms": "tsx scripts/test-sms.ts"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.2.3",
