@@ -6,6 +6,7 @@ import { supabase } from "@/lib/supabase";
 import { useSession } from "@/hooks/useSession";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { downloadXlsx } from "@/components/utils/xlsx";
+import { fetchHiddenSernos, resolveSelectedSub } from "@/lib/subscriptionVisibility";
 
 type YearRow = {
   month: number; // 1-12
@@ -16,6 +17,7 @@ type YearRow = {
 type SubscriptionOption = {
   subscriptionSerNo: number;
   meterSerial: string | null;
+  nickname: string | null;
 };
 
 const MONTH_LABELS = [
@@ -107,24 +109,42 @@ export default function YekdemDetail() {
         if (cancel) return;
         if (error) throw error;
 
-        const list: SubscriptionOption[] = (data ?? []).map((r: any) => ({
-          subscriptionSerNo: Number(r.subscription_serno),
-          meterSerial: r.meter_serial ?? null,
-        }));
+        const sernos = (data ?? []).map((r: any) => Number(r.subscription_serno)).filter(Number.isFinite);
+        let nickMap = new Map<number, string | null>();
+        if (sernos.length > 0) {
+          const { data: ssData } = await supabase
+            .from("subscription_settings")
+            .select("subscription_serno, nickname")
+            .eq("user_id", uid)
+            .in("subscription_serno", sernos);
+          for (const r of (ssData ?? []) as any[]) {
+            const k = Number(r.subscription_serno);
+            if (Number.isFinite(k)) nickMap.set(k, r.nickname ?? null);
+          }
+        }
+        if (cancel) return;
+
+        const allList: SubscriptionOption[] = (data ?? []).map((r: any) => {
+          const serno = Number(r.subscription_serno);
+          return {
+            subscriptionSerNo: serno,
+            meterSerial: r.meter_serial ?? null,
+            nickname: nickMap.get(serno) ?? null,
+          };
+        });
+
+        // Gizli tesisleri filtrele
+        const hidden = await fetchHiddenSernos(uid);
+        if (cancel) return;
+        const list = allList.filter((s) => !hidden.has(s.subscriptionSerNo));
 
         setSubs(list);
 
-        if (list.length > 0) {
-          const ok =
-            selectedSub != null &&
-            list.some((s) => s.subscriptionSerNo === selectedSub);
-          const next = ok ? selectedSub! : list[0].subscriptionSerNo;
-          setSelectedSub(next);
-          localStorage.setItem(LS_SUB_KEY, String(next));
-        } else {
-          setSelectedSub(null);
-          localStorage.removeItem(LS_SUB_KEY);
-        }
+        const next = resolveSelectedSub(
+          list.map((s) => s.subscriptionSerNo),
+          selectedSub,
+        );
+        setSelectedSub(next);
       } catch (e: any) {
         if (!cancel) {
           console.error("subscription list (YEKDEM) error:", e);
@@ -143,12 +163,15 @@ export default function YekdemDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uid, sessionLoading]);
 
-  const selectedMeterSerial =
-    subs.find((s) => s.subscriptionSerNo === selectedSub)?.meterSerial ?? null;
+  const selectedSubObj = subs.find((s) => s.subscriptionSerNo === selectedSub);
+  const selectedMeterSerial = selectedSubObj?.meterSerial ?? null;
 
-  const selectedSubLabel =
-    selectedMeterSerial ??
-    (selectedSub != null ? String(selectedSub) : "Tesis seçilmedi");
+  const selectedSubLabel = (() => {
+    if (!selectedSubObj) return selectedSub != null ? String(selectedSub) : "Tesis seçilmedi";
+    const nick = selectedSubObj.nickname;
+    const serial = selectedSubObj.meterSerial ?? String(selectedSubObj.subscriptionSerNo);
+    return nick ? `${serial} - ${nick}` : serial;
+  })();
 
   // ─────────────────────────────
   // Bu yılın YEKDEM değerlerini çek (period_year/period_month)
@@ -303,11 +326,14 @@ export default function YekdemDetail() {
               className="h-10 md:h-9 w-full sm:w-[420px] md:w-auto min-w-0 max-w-full rounded-lg border border-neutral-300 bg-white px-3 md:px-2 text-[16px] md:text-xs text-neutral-800 focus:outline-none focus:ring-1 focus:ring-[#0A66FF]"
             >
               {subs.length === 0 && <option value="">Tesis bulunamadı</option>}
-              {subs.map((s) => (
-                <option key={s.subscriptionSerNo} value={s.subscriptionSerNo}>
-                  {s.meterSerial ?? String(s.subscriptionSerNo)}
-                </option>
-              ))}
+              {subs.map((s) => {
+                const serial = s.meterSerial ?? String(s.subscriptionSerNo);
+                return (
+                  <option key={s.subscriptionSerNo} value={s.subscriptionSerNo}>
+                    {s.nickname ? `${serial} - ${s.nickname}` : serial}
+                  </option>
+                );
+              })}
             </select>
 
             {subsLoading && (

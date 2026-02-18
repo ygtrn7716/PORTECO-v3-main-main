@@ -6,6 +6,7 @@ import {
   calculateYekdemMahsup,
 } from "@/components/utils/calculateInvoice";
 import type { InvoiceBreakdown, TariffType } from "@/components/utils/calculateInvoice";
+import { fetchAllConsumption, fetchAllPtf } from "@/lib/paginatedFetch";
 
 type TariffRow = {
   dagitim_bedeli: number | null;
@@ -41,25 +42,27 @@ async function fetchSubYekdemValue(
 ): Promise<number | null> {
   const { uid, sub, year, month } = params;
 
+  // 1) period_year/period_month (primary)
   const r1 = await supabase
     .from("subscription_yekdem")
     .select("yekdem_value")
     .eq("user_id", uid)
     .eq("subscription_serno", sub)
-    .eq("year", year)
-    .eq("month", month)
+    .eq("period_year", year)
+    .eq("period_month", month)
     .maybeSingle();
 
   if (!r1.error) return r1.data?.yekdem_value != null ? num(r1.data.yekdem_value, 0) : null;
 
-  if (isMissingColumnError(r1.error, "year") || isMissingColumnError(r1.error, "month")) {
+  // 2) year/month (fallback)
+  if (isMissingColumnError(r1.error, "period_year") || isMissingColumnError(r1.error, "period_month")) {
     const r2 = await supabase
       .from("subscription_yekdem")
       .select("yekdem_value")
       .eq("user_id", uid)
       .eq("subscription_serno", sub)
-      .eq("period_year", year)
-      .eq("period_month", month)
+      .eq("year", year)
+      .eq("month", month)
       .maybeSingle();
 
     if (r2.error) throw r2.error;
@@ -75,13 +78,14 @@ async function fetchSubYekdemForMahsup(
 ): Promise<{ yekdem_value: number | null; yekdem_final: number | null } | null> {
   const { uid, sub, year, month } = params;
 
+  // 1) period_year/period_month (primary)
   const r1 = await supabase
     .from("subscription_yekdem")
     .select("yekdem_value, yekdem_final")
     .eq("user_id", uid)
     .eq("subscription_serno", sub)
-    .eq("year", year)
-    .eq("month", month)
+    .eq("period_year", year)
+    .eq("period_month", month)
     .maybeSingle();
 
   if (!r1.error) {
@@ -92,14 +96,15 @@ async function fetchSubYekdemForMahsup(
     };
   }
 
-  if (isMissingColumnError(r1.error, "year") || isMissingColumnError(r1.error, "month")) {
+  // 2) year/month (fallback)
+  if (isMissingColumnError(r1.error, "period_year") || isMissingColumnError(r1.error, "period_month")) {
     const r2 = await supabase
       .from("subscription_yekdem")
       .select("yekdem_value, yekdem_final")
       .eq("user_id", uid)
       .eq("subscription_serno", sub)
-      .eq("period_year", year)
-      .eq("period_month", month)
+      .eq("year", year)
+      .eq("month", month)
       .maybeSingle();
 
     if (r2.error) throw r2.error;
@@ -155,12 +160,14 @@ async function fetchPtfMapToDate(params: {
 }) {
   const { supabase, startIso, endIso } = params;
 
-  // önce ptf_tl_kwh dene
-  const r1 = await supabase
-    .from("epias_ptf_hourly")
-    .select("ts, ptf_tl_kwh")
-    .gte("ts", startIso)
-    .lte("ts", endIso);
+  // önce ptf_tl_kwh dene (paginated - PostgREST max_rows limiti aşılmasın)
+  const r1 = await fetchAllPtf({
+    supabase,
+    columns: "ts, ptf_tl_kwh",
+    startIso,
+    endIso,
+    endInclusive: true,
+  });
 
   if (!r1.error) {
     const map = new Map<string, number>();
@@ -174,11 +181,13 @@ async function fetchPtfMapToDate(params: {
 
   // fallback: ptf_tl_mwh / 1000
   if (isMissingColumnError(r1.error, "ptf_tl_kwh")) {
-    const r2 = await supabase
-      .from("epias_ptf_hourly")
-      .select("ts, ptf_tl_mwh")
-      .gte("ts", startIso)
-      .lte("ts", endIso);
+    const r2 = await fetchAllPtf({
+      supabase,
+      columns: "ts, ptf_tl_mwh",
+      startIso,
+      endIso,
+      endInclusive: true,
+    });
 
     if (r2.error) throw r2.error;
 
@@ -232,6 +241,7 @@ export type MonthInvoiceToDateResult = {
 
   hasYekdemMahsup: boolean;
   yekdemMahsup: number;
+  yekdemMissing: "none" | "value" | "final" | "both";
 
   totalWithMahsup: number;
 };
@@ -295,13 +305,16 @@ export async function computeMonthInvoiceToDate(params: {
   if (ptfMap.size === 0) return null;
 
   // tüketim (start -> cutoff inclusive) + reaktif yüzdeler için ri/rc
-  const cons = await supabase
-    .from("consumption_hourly")
-    .select("ts, cn, ri, rc")
-    .eq("user_id", uid)
-    .eq("subscription_serno", subscriptionSerNo)
-    .gte("ts", monthStartIso)
-    .lte("ts", cutoffIso);
+  // paginated - PostgREST max_rows limiti aşılmasın
+  const cons = await fetchAllConsumption({
+    supabase,
+    userId: uid,
+    subscriptionSerno: subscriptionSerNo,
+    columns: "ts, cn, ri, rc",
+    startIso: monthStartIso,
+    endIso: cutoffIso,
+    endInclusive: true,
+  });
 
   if (cons.error) throw cons.error;
 
@@ -339,10 +352,10 @@ export async function computeMonthInvoiceToDate(params: {
 
   const monthlyPTF = sumPtfWeighted / billableKwh; // tüketim ağırlıklı ortalama
 
-  // settings: KBK, terim, gerilim, tarife, güç limit, trafo, btv_enabled
+  // settings: KBK, terim, gerilim, tarife, güç limit, trafo
   const settingsRes = await supabase
     .from("subscription_settings")
-    .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, btv_enabled")
+    .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri")
     .eq("user_id", uid)
     .eq("subscription_serno", subscriptionSerNo)
     .maybeSingle();
@@ -354,7 +367,6 @@ export async function computeMonthInvoiceToDate(params: {
   const terim = settingsRes.data.terim ?? null;
   const gerilim = settingsRes.data.gerilim ?? null;
   const tarife = settingsRes.data.tarife ?? null;
-  const btvEnabled = settingsRes.data.btv_enabled ?? true;
 
   const contractPowerKw = num(settingsRes.data.guc_bedel_limit, 0);
   const trafoDegeri = num(settingsRes.data.trafo_degeri, 0);
@@ -362,6 +374,35 @@ export async function computeMonthInvoiceToDate(params: {
   if (!terim || !gerilim || !tarife) return null;
 
   const tariffType = mapTermToTariffType(terim);
+
+  // multiplier + btv_enabled (owner_subscriptions)
+  let multiplier = 1;
+  let btvEnabled = true;
+
+  const subRes1 = await supabase
+    .from("owner_subscriptions")
+    .select("multiplier, btv_enabled")
+    .eq("user_id", uid)
+    .eq("subscription_serno", subscriptionSerNo)
+    .maybeSingle();
+
+  if (subRes1.error) throw subRes1.error;
+  if (subRes1.data?.multiplier != null && Number.isFinite(Number(subRes1.data.multiplier))) {
+    multiplier = Number(subRes1.data.multiplier);
+    btvEnabled = subRes1.data.btv_enabled ?? true;
+  } else {
+    const subRes2 = await supabase
+      .from("owner_subscriptions")
+      .select("multiplier, btv_enabled")
+      .eq("subscription_serno", subscriptionSerNo)
+      .maybeSingle();
+
+    if (subRes2.error) throw subRes2.error;
+    if (subRes2.data?.multiplier != null && Number.isFinite(Number(subRes2.data.multiplier))) {
+      multiplier = Number(subRes2.data.multiplier);
+    }
+    btvEnabled = subRes2.data?.btv_enabled ?? true;
+  }
 
   // resmi dağıtım/güç tarifesi
   const tariffRes = await supabase
@@ -395,32 +436,6 @@ export async function computeMonthInvoiceToDate(params: {
   const rcPenaltyEnergy = rcPercent > REACTIVE_LIMIT_RC ? totalRc : 0;
   const penaltyEnergy = riPenaltyEnergy + rcPenaltyEnergy;
   const reactivePenaltyCharge = penaltyEnergy * reactiveUnitPrice; // KDV öncesi
-
-  // demand (is_final varsa kullan, yoksa 0)
-  let multiplier = 1;
-
-  const subRes1 = await supabase
-    .from("owner_subscriptions")
-    .select("multiplier")
-    .eq("user_id", uid)
-    .eq("subscription_serno", subscriptionSerNo)
-    .maybeSingle();
-
-  if (subRes1.error) throw subRes1.error;
-  if (subRes1.data?.multiplier != null && Number.isFinite(Number(subRes1.data.multiplier))) {
-    multiplier = Number(subRes1.data.multiplier);
-  } else {
-    const subRes2 = await supabase
-      .from("owner_subscriptions")
-      .select("multiplier")
-      .eq("subscription_serno", subscriptionSerNo)
-      .maybeSingle();
-
-    if (subRes2.error) throw subRes2.error;
-    if (subRes2.data?.multiplier != null && Number.isFinite(Number(subRes2.data.multiplier))) {
-      multiplier = Number(subRes2.data.multiplier);
-    }
-  }
 
   const dmRes = await supabase
     .from("demand_monthly")
@@ -469,6 +484,7 @@ export async function computeMonthInvoiceToDate(params: {
   // YEKDEM mahsup: M-1 (tam ay)  — InvoiceDetail ile aynı mantık
   let yekdemMahsup = 0;
   let hasYekdemMahsup = false;
+  let yekdemMissing: "none" | "value" | "final" | "both" = "both";
 
   try {
     const prevForMahsup = m.subtract(1, "month"); // M-1
@@ -491,13 +507,14 @@ export async function computeMonthInvoiceToDate(params: {
         0
       );
     } else {
-      const hourlyPrev = await supabase
-        .from("consumption_hourly")
-        .select("ts, cn")
-        .eq("user_id", uid)
-        .eq("subscription_serno", subscriptionSerNo)
-        .gte("ts", prevStart.toDate().toISOString())
-        .lt("ts", prevEndExclusive.toDate().toISOString());
+      const hourlyPrev = await fetchAllConsumption({
+        supabase,
+        userId: uid,
+        subscriptionSerno: subscriptionSerNo,
+        columns: "ts, cn",
+        startIso: prevStart.toDate().toISOString(),
+        endIso: prevEndExclusive.toDate().toISOString(),
+      });
 
       if (!hourlyPrev.error && hourlyPrev.data?.length) {
         prevKwh = (hourlyPrev.data ?? []).reduce(
@@ -515,16 +532,28 @@ export async function computeMonthInvoiceToDate(params: {
         month: prevForMahsup.month() + 1,
       });
 
-      if (yRow?.yekdem_value != null && yRow?.yekdem_final != null) {
-        yekdemMahsup = calculateYekdemMahsup({
-          totalKwh: prevKwh,
-          kbk,
-          btvRate,
-          vatRate,
-          yekdemOld: num(yRow.yekdem_value, 0),
-          yekdemNew: num(yRow.yekdem_final, 0),
-        });
-        hasYekdemMahsup = true;
+      if (yRow) {
+        const hasValue = yRow.yekdem_value != null;
+        const hasFinal = yRow.yekdem_final != null;
+
+        if (hasValue && hasFinal) {
+          yekdemMahsup = calculateYekdemMahsup({
+            totalKwh: prevKwh,
+            kbk,
+            btvRate,
+            vatRate,
+            yekdemOld: num(yRow.yekdem_value, 0),
+            yekdemNew: num(yRow.yekdem_final, 0),
+          });
+          hasYekdemMahsup = true;
+          yekdemMissing = "none";
+        } else if (!hasValue && !hasFinal) {
+          yekdemMissing = "both";
+        } else if (!hasValue) {
+          yekdemMissing = "value";
+        } else {
+          yekdemMissing = "final";
+        }
       }
     }
   } catch {
@@ -574,6 +603,7 @@ export async function computeMonthInvoiceToDate(params: {
 
     hasYekdemMahsup,
     yekdemMahsup,
+    yekdemMissing,
 
     totalWithMahsup,
   };

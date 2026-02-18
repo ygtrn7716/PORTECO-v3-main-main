@@ -14,6 +14,8 @@ import {
   calculateYekdemMahsup,
   type TariffType,
 } from "@/components/utils/calculateInvoice";
+import { fetchHiddenSernos, resolveSelectedSub } from "@/lib/subscriptionVisibility";
+import { fetchAllConsumption } from "@/lib/paginatedFetch";
 
 type ImgSpec = {
   src: string;
@@ -214,7 +216,7 @@ function StatCard({
       onMouseMove={handleMouseMove}
       onMouseEnter={() => setIsHovered(true)}
       onMouseLeave={handleMouseLeave}
-      className="stat-card group relative overflow-hidden w-full h-[160px] rounded-2xl border border-neutral-200/80 bg-white p-5 cursor-pointer"
+      className={`stat-card group relative overflow-hidden w-full h-[160px] rounded-2xl border border-neutral-200/80 bg-white p-5 ${onClick ? "cursor-pointer" : "cursor-default"}`}
       style={{
         transform: isHovered
           ? `perspective(600px) rotateX(${tilt.x}deg) rotateY(${tilt.y}deg) scale3d(1.02, 1.02, 1.02)`
@@ -290,11 +292,13 @@ function StatCard({
         </div>
       </div>
 
-      <div className="absolute bottom-4 right-4 translate-y-3 opacity-0 transition-all duration-300 ease-out group-hover:translate-y-0 group-hover:opacity-100 z-10">
-        <span className="rounded-lg bg-[#0A66FF] px-3 py-1.5 text-xs font-medium text-white shadow-lg shadow-[#0A66FF]/25">
-          Detay →
-        </span>
-      </div>
+      {onClick && (
+        <div className="absolute bottom-4 right-4 translate-y-3 opacity-0 transition-all duration-300 ease-out group-hover:translate-y-0 group-hover:opacity-100 z-10">
+          <span className="rounded-lg bg-[#0A66FF] px-3 py-1.5 text-xs font-medium text-white shadow-lg shadow-[#0A66FF]/25">
+            Detay →
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -358,6 +362,7 @@ export default function Dashboard() {
   const [yekdemMahsup, setYekdemMahsup] = useState<number | null>(null);
   const [hasYekdemMahsup, setHasYekdemMahsup] = useState(false);
   const [yekdemMahsupLabel, setYekdemMahsupLabel] = useState<string>("");
+  const [yekdemMissing, setYekdemMissing] = useState<"none" | "value" | "final" | "both">("both");
 
   // ✅ Tüm tesislerin toplamları (birden fazla tesis varsa gösterilir)
   const [allSubsTotalKwh, setAllSubsTotalKwh] = useState<number | null>(null);
@@ -452,21 +457,18 @@ export default function Dashboard() {
           }));
         }
 
-        setSubs(list);
+        // Gizli tesisleri filtrele
+        const hidden = await fetchHiddenSernos(uid);
+        if (cancel) return;
+        const visibleList = list.filter((s) => !hidden.has(s.subscriptionSerNo));
 
-        if (list.length > 0) {
-          const ok =
-            selectedSub != null &&
-            list.some((s) => s.subscriptionSerNo === selectedSub);
+        setSubs(visibleList);
 
-          const next = ok ? selectedSub! : list[0].subscriptionSerNo;
-
-          setSelectedSub(next);
-          localStorage.setItem(LS_SUB_KEY, String(next));
-        } else {
-          setSelectedSub(null);
-          localStorage.removeItem(LS_SUB_KEY);
-        }
+        const next = resolveSelectedSub(
+          visibleList.map((s) => s.subscriptionSerNo),
+          selectedSub,
+        );
+        setSelectedSub(next);
       } catch (e: any) {
         if (!cancel) {
           console.error("subscription list error:", e);
@@ -502,13 +504,14 @@ export default function Dashboard() {
         const start = dayjsTR().subtract(1, "month").startOf("month");
         const end = dayjsTR().startOf("month");
 
-        const hourly = await supabase
-          .from("consumption_hourly")
-          .select("ts, cn, ri, rc")
-          .eq("user_id", uid)
-          .eq("subscription_serno", selectedSub)
-          .gte("ts", start.toDate().toISOString())
-          .lt("ts", end.toDate().toISOString());
+        const hourly = await fetchAllConsumption({
+          supabase,
+          userId: uid,
+          subscriptionSerno: selectedSub,
+          columns: "ts, cn, ri, rc",
+          startIso: start.toDate().toISOString(),
+          endIso: end.toDate().toISOString(),
+        });
 
         if (cancel) return;
         if (hourly.error) throw hourly.error;
@@ -764,7 +767,7 @@ export default function Dashboard() {
         // 5.1) settings
         const { data: settings, error: settingsErr } = await supabase
           .from("subscription_settings")
-          .select("terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, btv_enabled")
+          .select("terim, gerilim, tarife, guc_bedel_limit, trafo_degeri")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -781,8 +784,6 @@ export default function Dashboard() {
         const terim = settings.terim ?? null;
         const gerilim = settings.gerilim ?? null;
         const tarife = settings.tarife ?? null;
-
-        const btvEnabled = settings.btv_enabled ?? true;
 
         const trafoDegeri =
           settings.trafo_degeri != null && Number.isFinite(Number(settings.trafo_degeri))
@@ -817,10 +818,10 @@ export default function Dashboard() {
           return;
         }
 
-        // 5.3) multiplier
+        // 5.3) multiplier + btv_enabled
         const { data: subRow, error: subErr } = await supabase
           .from("owner_subscriptions")
-          .select("multiplier")
+          .select("multiplier, btv_enabled")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -830,6 +831,7 @@ export default function Dashboard() {
 
         const multiplier =
           subRow && subRow.multiplier != null ? Number(subRow.multiplier) : 1;
+        const btvEnabled = subRow?.btv_enabled ?? true;
 
         // 5.4) demand (geçen ay)
         const { data: demandRow, error: demandErr } = await supabase
@@ -908,6 +910,7 @@ export default function Dashboard() {
         // ✅ YEKDEM mahsup (M-1)
         let yekdemMahsupValue = 0;
         let has = false;
+        let missing: "none" | "value" | "final" | "both" = "both";
 
         try {
           const billingMonth = dayjsTR().year(periodYear).month(periodMonth - 1); // M
@@ -934,13 +937,14 @@ export default function Dashboard() {
               0
             );
           } else {
-            const hourlyPrev = await supabase
-              .from("consumption_hourly")
-              .select("ts, cn")
-              .eq("user_id", uid)
-              .eq("subscription_serno", selectedSub)
-              .gte("ts", prevStart.toDate().toISOString())
-              .lt("ts", prevEndExclusive.toDate().toISOString());
+            const hourlyPrev = await fetchAllConsumption({
+              supabase,
+              userId: uid,
+              subscriptionSerno: selectedSub,
+              columns: "ts, cn",
+              startIso: prevStart.toDate().toISOString(),
+              endIso: prevEndExclusive.toDate().toISOString(),
+            });
 
             if (!hourlyPrev.error && hourlyPrev.data?.length) {
               prevPeriodKwh = hourlyPrev.data.reduce(
@@ -958,16 +962,28 @@ export default function Dashboard() {
               month: prevForYekdem.month() + 1,
             });
 
-            if (yRow && yRow.yekdem_value != null && yRow.yekdem_final != null) {
-              yekdemMahsupValue = calculateYekdemMahsup({
-                totalKwh: prevPeriodKwh,
-                kbk: monthlyKbk,
-                btvRate,
-                vatRate,
-                yekdemOld: Number(yRow.yekdem_value),
-                yekdemNew: Number(yRow.yekdem_final),
-              });
-              has = true;
+            if (yRow) {
+              const hasValue = yRow.yekdem_value != null;
+              const hasFinal = yRow.yekdem_final != null;
+
+              if (hasValue && hasFinal) {
+                yekdemMahsupValue = calculateYekdemMahsup({
+                  totalKwh: prevPeriodKwh,
+                  kbk: monthlyKbk,
+                  btvRate,
+                  vatRate,
+                  yekdemOld: Number(yRow.yekdem_value),
+                  yekdemNew: Number(yRow.yekdem_final),
+                });
+                has = true;
+                missing = "none";
+              } else if (!hasValue && !hasFinal) {
+                missing = "both";
+              } else if (!hasValue) {
+                missing = "value";
+              } else {
+                missing = "final";
+              }
             }
           }
         } catch (e) {
@@ -988,6 +1004,7 @@ export default function Dashboard() {
         if (!cancel) {
           setYekdemMahsup(yekdemMahsupValue);
           setHasYekdemMahsup(has);
+          setYekdemMissing(missing);
           setInvoiceTotal(totalWithMahsup); // ✅ mahsup dahil
         }
       } catch (e: any) {
@@ -1056,19 +1073,20 @@ export default function Dashboard() {
         for (const serno of allSernos) {
           if (cancel) return;
 
-          // 6.1) Consumption (cn, ri, rc) — per tesis
-          const { data: hourly } = await supabase
-            .from("consumption_hourly")
-            .select("cn, ri, rc")
-            .eq("user_id", uid)
-            .eq("subscription_serno", serno)
-            .gte("ts", start.toDate().toISOString())
-            .lt("ts", end.toDate().toISOString());
+          // 6.1) Consumption (cn, ri, rc) — per tesis (paginated)
+          const hourlyRes = await fetchAllConsumption({
+            supabase,
+            userId: uid,
+            subscriptionSerno: serno,
+            columns: "cn, ri, rc",
+            startIso: start.toDate().toISOString(),
+            endIso: end.toDate().toISOString(),
+          });
 
           let subKwh = 0;
           let subRi = 0;
           let subRc = 0;
-          for (const r of (hourly ?? []) as any[]) {
+          for (const r of (hourlyRes.data ?? []) as any[]) {
             subKwh += Number(r.cn) || 0;
             subRi += Number(r.ri) || 0;
             subRc += Number(r.rc) || 0;
@@ -1130,7 +1148,7 @@ export default function Dashboard() {
           // KBK
           const { data: kbkData } = await supabase
             .from("subscription_settings")
-            .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, btv_enabled")
+            .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri")
             .eq("user_id", uid)
             .eq("subscription_serno", serno)
             .maybeSingle();
@@ -1144,7 +1162,6 @@ export default function Dashboard() {
           const tarife = kbkData.tarife ?? null;
           if (!terim || !gerilim || !tarife) continue;
 
-          const btvEnabled = kbkData.btv_enabled ?? true;
           const trafoDegeri = kbkData.trafo_degeri != null && Number.isFinite(Number(kbkData.trafo_degeri)) ? Number(kbkData.trafo_degeri) : 0;
           const gucLimit = kbkData.guc_bedel_limit != null ? Number(kbkData.guc_bedel_limit) : 0;
 
@@ -1159,15 +1176,16 @@ export default function Dashboard() {
           if (cancel) return;
           if (!tariffRow) continue;
 
-          // Multiplier
+          // Multiplier + btv_enabled
           const { data: subRow } = await supabase
             .from("owner_subscriptions")
-            .select("multiplier")
+            .select("multiplier, btv_enabled")
             .eq("user_id", uid)
             .eq("subscription_serno", serno)
             .maybeSingle();
           if (cancel) return;
           const multiplier = subRow?.multiplier != null ? Number(subRow.multiplier) : 1;
+          const btvEnabled = subRow?.btv_enabled ?? true;
 
           // Demand
           const { data: demandRow } = await supabase
@@ -1239,15 +1257,16 @@ export default function Dashboard() {
             if (dailyPrev?.length) {
               prevPeriodKwh = dailyPrev.reduce((s: number, r: any) => s + (Number(r.kwh_in) || 0), 0);
             } else {
-              const { data: hourlyPrev } = await supabase
-                .from("consumption_hourly")
-                .select("ts, cn")
-                .eq("user_id", uid)
-                .eq("subscription_serno", serno)
-                .gte("ts", prevStart2.toDate().toISOString())
-                .lt("ts", prevEnd2.toDate().toISOString());
-              if (hourlyPrev?.length) {
-                prevPeriodKwh = hourlyPrev.reduce((s: number, r: any) => s + (Number(r.cn) || 0), 0);
+              const hourlyPrevRes = await fetchAllConsumption({
+                supabase,
+                userId: uid,
+                subscriptionSerno: serno,
+                columns: "ts, cn",
+                startIso: prevStart2.toDate().toISOString(),
+                endIso: prevEnd2.toDate().toISOString(),
+              });
+              if (hourlyPrevRes.data?.length) {
+                prevPeriodKwh = hourlyPrevRes.data.reduce((s: number, r: any) => s + (Number(r.cn) || 0), 0);
               }
             }
 
@@ -1370,7 +1389,11 @@ export default function Dashboard() {
   }, [subs.length, allSubsTotalKwh, allSubsTotalInvoice, allSubsTotalMahsup]);
 
   const filesSubtitle = !hasYekdemMahsup
-    ? "Önceki dönem için yekdem_final girilmemiş."
+    ? yekdemMissing === "value"
+      ? "Önceki dönem için yekdem_value girilmemiş."
+      : yekdemMissing === "final"
+      ? "Önceki dönem için yekdem_final girilmemiş."
+      : "Önceki dönem YEKDEM verileri girilmemiş."
     : `${yekdemMahsupLabel || "M-1"} için (yekdem_final - yekdem_value)`;
 
   const filesValueClass =
@@ -1542,7 +1565,7 @@ export default function Dashboard() {
             badgeText={c.key === "files" ? filesBadgeText : undefined}
             badgeClassName={c.key === "files" ? filesBadgeClass : undefined}
             totalLine={totalLineByKey[c.key]}
-            onClick={() => {
+            onClick={c.key === "valley" ? undefined : () => {
               if (c.key === "files") {
                 navigate("/dashboard/yekdem-mahsup");
                 return;

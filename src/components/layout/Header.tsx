@@ -184,7 +184,7 @@ export default function Header() {
                       : "text-brand-blue border border-brand-blue hover:bg-neutral-lightBlue"
                   }`}
                 >
-                  Cikis Yap
+                  Çıkış Yap
                 </button>
               ) : (
                 <Link
@@ -196,7 +196,7 @@ export default function Header() {
                   }`}
                   onClick={() => setOpen(false)}
                 >
-                  Giris Yap
+                  Giriş Yap
                 </Link>
               ))}
           </div>
@@ -262,7 +262,7 @@ export default function Header() {
                         : "text-brand-blue border border-brand-blue hover:bg-neutral-lightBlue"
                     }`}
                   >
-                    Cikis Yap
+                    Çıkış Yap
                   </button>
                 ) : (
                   <Link
@@ -274,7 +274,7 @@ export default function Header() {
                         : "text-brand-blue border border-brand-blue hover:bg-neutral-lightBlue"
                     }`}
                   >
-                    Giris Yap
+                    Giriş Yap
                   </Link>
                 ))}
             </div>

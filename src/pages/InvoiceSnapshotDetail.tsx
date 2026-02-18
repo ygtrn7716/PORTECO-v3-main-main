@@ -74,7 +74,7 @@ const yekdemCell = useMemo(() => {
 
   if (!row.has_yekdem_mahsup) {
     return {
-      text: "Önceki dönem için yekdem_final girilmemiş.",
+      text: "Önceki dönem YEKDEM verileri girilmemiş.",
       cls: "text-neutral-900",
     };
   }
@@ -182,7 +182,7 @@ const yekdemCell = useMemo(() => {
                   <tr className="border-b border-neutral-100">
                     <td className="py-2 pr-4">Dağıtım Bedeli</td>
                     <td className="py-2 pr-4 text-neutral-600">
-                      {fmtUnit(row.unit_price_distribution)} TL/kWh × {fmtKwh(row.total_consumption_kwh)} kWh
+                      {fmtUnit(row.unit_price_distribution)} TL/kWh × {fmtKwh(Number(row.total_consumption_kwh ?? 0) + Number(row.trafo_degeri ?? 0))} kWh
                     </td>
                     <td className="py-2 pr-4 text-right">{fmtMoney2(row.distribution_charge)}</td>
                   </tr>

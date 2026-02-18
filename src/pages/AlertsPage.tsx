@@ -4,18 +4,21 @@ import { supabase } from "@/lib/supabase";
 import { useSession } from "@/hooks/useSession";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import PhoneNumberManager from "@/components/dashboard/PhoneNumberManager";
+import EmailManager from "@/components/dashboard/EmailManager";
 import {
   Bell,
   ShieldAlert,
   ShieldCheck,
   AlertTriangle,
   MessageSquare,
+  Mail,
   Clock,
   CheckCircle2,
   XCircle,
   Zap,
   Building2,
 } from "lucide-react";
+import { fetchHiddenSernos } from "@/lib/subscriptionVisibility";
 
 type AlertStateRow = {
   subscription_serno: number;
@@ -31,6 +34,17 @@ type SmsLogRow = {
   subscription_serno: string | null;
   phone_number: string;
   message_type: string;
+  message_body: string;
+  status: string;
+  error_message: string | null;
+  created_at: string;
+};
+
+type EmailLogRow = {
+  id: string;
+  subscription_serno: string | null;
+  email_address: string;
+  subject: string;
   message_body: string;
   status: string;
   error_message: string | null;
@@ -100,8 +114,10 @@ export default function AlertsPage() {
   const [alerts, setAlerts] = useState<AlertStateRow[]>([]);
   const [smsLogs, setSmsLogs] = useState<SmsLogRow[]>([]);
   const [facilities, setFacilities] = useState<FacilityInfo[]>([]);
+  const [emailLogs, setEmailLogs] = useState<EmailLogRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [smsLoading, setSmsLoading] = useState(true);
+  const [emailLoading, setEmailLoading] = useState(true);
 
   // Fetch alert states and facilities
   useEffect(() => {
@@ -119,7 +135,16 @@ export default function AlertsPage() {
           .order("subscription_serno", { ascending: true });
 
         if (cancel) return;
-        setFacilities((facData as FacilityInfo[]) ?? []);
+
+        // Gizli tesisleri filtrele
+        const hidden = await fetchHiddenSernos(uid);
+        if (cancel) return;
+        const visibleFacilities = ((facData as FacilityInfo[]) ?? []).filter(
+          (f) => !hidden.has(f.subscription_serno)
+        );
+        setFacilities(visibleFacilities);
+
+        const visibleSernos = new Set(visibleFacilities.map((f) => f.subscription_serno));
 
         // Fetch alert states
         const { data: alertData } = await supabase
@@ -129,7 +154,10 @@ export default function AlertsPage() {
           .order("period_ym", { ascending: false });
 
         if (cancel) return;
-        setAlerts((alertData as AlertStateRow[]) ?? []);
+        const visibleAlerts = ((alertData as AlertStateRow[]) ?? []).filter(
+          (a) => visibleSernos.has(a.subscription_serno)
+        );
+        setAlerts(visibleAlerts);
       } catch (e) {
         console.error("AlertsPage load error:", e);
       } finally {
@@ -167,6 +195,33 @@ export default function AlertsPage() {
     return () => { cancel = true; };
   }, [uid, sessionLoading]);
 
+  // Fetch Email logs
+  useEffect(() => {
+    if (sessionLoading || !uid) return;
+    let cancel = false;
+
+    (async () => {
+      setEmailLoading(true);
+      try {
+        const { data } = await supabase
+          .from("email_logs")
+          .select("id, subscription_serno, email_address, subject, message_body, status, error_message, created_at")
+          .eq("user_id", uid)
+          .order("created_at", { ascending: false })
+          .limit(50);
+
+        if (cancel) return;
+        setEmailLogs((data as EmailLogRow[]) ?? []);
+      } catch (e) {
+        console.error("Email logs load error:", e);
+      } finally {
+        if (!cancel) setEmailLoading(false);
+      }
+    })();
+
+    return () => { cancel = true; };
+  }, [uid, sessionLoading]);
+
   const facilityLabel = (serno: number) => {
     const f = facilities.find((x) => x.subscription_serno === serno);
     if (!f) return `Tesis #${serno}`;
@@ -192,7 +247,7 @@ export default function AlertsPage() {
           <div>
             <h1 className="text-xl font-bold text-neutral-900">Uyarilar</h1>
             <p className="text-sm text-neutral-500">
-              Reaktif enerji uyari durumlari ve SMS gecmisi
+              Reaktif enerji uyari durumlari, SMS ve Email gecmisi
             </p>
           </div>
         </div>
@@ -437,8 +492,90 @@ export default function AlertsPage() {
           )}
         </section>
 
+        {/* Email Log History */}
+        <section>
+          <div className="flex items-center gap-2 mb-4">
+            <Mail className="h-5 w-5 text-[#0A66FF]" />
+            <h2 className="text-base font-semibold text-neutral-900">Email Gecmisi</h2>
+          </div>
+
+          {emailLoading ? (
+            <div className="rounded-2xl border border-neutral-200 bg-white p-8 text-center">
+              <div className="inline-block h-6 w-6 animate-spin rounded-full border-2 border-[#0A66FF] border-t-transparent" />
+              <p className="mt-2 text-sm text-neutral-500">Yukleniyor...</p>
+            </div>
+          ) : emailLogs.length === 0 ? (
+            <div className="rounded-2xl border border-neutral-200 bg-white p-8 text-center">
+              <Mail className="h-10 w-10 text-neutral-300 mx-auto mb-3" />
+              <p className="text-sm text-neutral-600 font-medium">Henuz email gonderimi yok</p>
+              <p className="text-xs text-neutral-400 mt-1">
+                Reaktif uyarilar tetiklendiginde email gecmisiniz burada gorunecek.
+              </p>
+            </div>
+          ) : (
+            <div className="rounded-2xl border border-neutral-200/80 bg-white overflow-hidden shadow-sm">
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-neutral-100 bg-neutral-50/80">
+                      <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">Tarih</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">Email</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">Konu</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">Durum</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-neutral-100">
+                    {emailLogs.map((log) => (
+                      <tr key={log.id} className="hover:bg-neutral-50/50 transition-colors">
+                        <td className="px-4 py-3 text-neutral-600 whitespace-nowrap">
+                          <div className="flex items-center gap-1.5">
+                            <Clock className="h-3.5 w-3.5 text-neutral-400" />
+                            {formatDate(log.created_at)}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-neutral-600 whitespace-nowrap text-xs">
+                          {log.email_address}
+                        </td>
+                        <td className="px-4 py-3 text-neutral-600 max-w-xs">
+                          <p className="truncate" title={log.subject}>{log.subject}</p>
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <span
+                            className={`inline-flex items-center gap-1 text-xs font-medium ${
+                              log.status === "sent"
+                                ? "text-emerald-600"
+                                : log.status === "failed"
+                                ? "text-red-600"
+                                : "text-neutral-500"
+                            }`}
+                          >
+                            {log.status === "sent" ? (
+                              <CheckCircle2 className="h-3.5 w-3.5" />
+                            ) : log.status === "failed" ? (
+                              <XCircle className="h-3.5 w-3.5" />
+                            ) : (
+                              <Clock className="h-3.5 w-3.5" />
+                            )}
+                            {log.status === "sent" ? "Gonderildi" : log.status === "failed" ? "Basarisiz" : "Bekliyor"}
+                          </span>
+                          {log.error_message && (
+                            <p className="text-xs text-red-400 mt-0.5">{log.error_message}</p>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </section>
+
         {/* Phone Number Management */}
         <PhoneNumberManager />
+
+        {/* Email Management */}
+        <EmailManager />
       </div>
     </DashboardShell>
   );

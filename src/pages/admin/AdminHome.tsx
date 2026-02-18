@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { supabase } from "@/lib/supabase";
 import { Users, Building2, ArrowDownWideNarrow } from "lucide-react";
+import { fetchAllConsumptionAdmin } from "@/lib/paginatedFetch";
 
 const quickLinks = [
   { title: "Arıl Hesap Bilgileri", to: "/dashboard/admin/user-integrations" },
@@ -18,6 +19,8 @@ const quickLinks = [
   { title: "Kaydedilen Faturalar", to: "/dashboard/admin/invoice-snapshots" },
   { title: "Aylık Özet", to: "/dashboard/admin/monthly-overview" },
   { title: "İletişim Mesajları", to: "/dashboard/admin/contact-messages" },
+  { title: "Kullanıcı Emailleri", to: "/dashboard/admin/user-emails" },
+  { title: "Email Kayıtları", to: "/dashboard/admin/email-logs" },
 ];
 
 type ReactiveRow = {
@@ -83,11 +86,13 @@ export default function AdminHome() {
       const endISO = monthEnd.toISOString();
 
       // 3. Bu ayın tüm consumption_hourly verilerini çek (cn, ri, rc)
-      const { data: consumption } = await supabase
-        .from("consumption_hourly")
-        .select("subscription_serno, cn, ri, rc")
-        .gte("ts", startISO)
-        .lt("ts", endISO);
+      // paginated - admin sorgusu user filtresi yok, binlerce satır olabilir
+      const { data: consumption } = await fetchAllConsumptionAdmin({
+        supabase,
+        columns: "subscription_serno, cn, ri, rc",
+        startIso: startISO,
+        endIso: endISO,
+      });
 
       if (!mounted) return;
 

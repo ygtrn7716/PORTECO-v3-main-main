@@ -47,6 +47,8 @@ import EpiasPtfAdmin from "@/pages/admin/EpiasPtfAdmin";
 import InvoiceSnapshotsAdmin from "@/pages/admin/InvoiceSnapshotsAdmin";
 import MonthlyOverviewAdmin from "@/pages/admin/MonthlyOverviewAdmin";
 import ContactMessagesAdmin from "@/pages/admin/ContactMessagesAdmin";
+import UserEmailsAdmin from "@/pages/admin/UserEmailsAdmin";
+import EmailLogsAdmin from "@/pages/admin/EmailLogsAdmin";
 
 export default function App() {
   const { pathname } = useLocation();
@@ -103,6 +105,8 @@ export default function App() {
               <Route path="invoice-snapshots" element={<InvoiceSnapshotsAdmin />} />
               <Route path="monthly-overview" element={<MonthlyOverviewAdmin />} />
               <Route path="contact-messages" element={<ContactMessagesAdmin />} />
+              <Route path="user-emails" element={<UserEmailsAdmin />} />
+              <Route path="email-logs" element={<EmailLogsAdmin />} />
             </Route>
           </Route>
         </Routes>

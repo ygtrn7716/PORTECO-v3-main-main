@@ -6,10 +6,13 @@ import { useSession } from "@/hooks/useSession";
 import { useNavigate } from "react-router-dom";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { calculateYekdemMahsup } from "@/components/utils/calculateInvoice";
+import { resolveSelectedSub } from "@/lib/subscriptionVisibility";
+import { fetchAllConsumption } from "@/lib/paginatedFetch";
 
 type SubscriptionOption = {
   subscriptionSerNo: number;
   title: string | null;
+  nickname: string | null;
 };
 
 const LS_SUB_KEY = "eco_selected_sub";
@@ -48,14 +51,14 @@ async function fetchSubYekdemForMahsup(params: {
 }): Promise<{ yekdem_value: number | null; yekdem_final: number | null } | null> {
   const { uid, sub, year, month } = params;
 
-  // 1) year/month
+  // 1) period_year/period_month (primary)
   const r1 = await supabase
     .from("subscription_yekdem")
     .select("yekdem_value, yekdem_final")
     .eq("user_id", uid)
     .eq("subscription_serno", sub)
-    .eq("year", year)
-    .eq("month", month)
+    .eq("period_year", year)
+    .eq("period_month", month)
     .maybeSingle();
 
   if (!r1.error) {
@@ -66,15 +69,15 @@ async function fetchSubYekdemForMahsup(params: {
     };
   }
 
-  // 2) period_year/period_month
-  if (isMissingColumnError(r1.error, "year") || isMissingColumnError(r1.error, "month")) {
+  // 2) year/month (fallback)
+  if (isMissingColumnError(r1.error, "period_year") || isMissingColumnError(r1.error, "period_month")) {
     const r2 = await supabase
       .from("subscription_yekdem")
       .select("yekdem_value, yekdem_final")
       .eq("user_id", uid)
       .eq("subscription_serno", sub)
-      .eq("period_year", year)
-      .eq("period_month", month)
+      .eq("year", year)
+      .eq("month", month)
       .maybeSingle();
 
     if (r2.error) throw r2.error;
@@ -137,7 +140,7 @@ export default function YekdemMahsupDetail() {
 
         const { data, error } = await supabase
           .from("subscription_settings")
-          .select("subscription_serno, title")
+          .select("subscription_serno, title, nickname, is_hidden")
           .eq("user_id", uid)
           .order("subscription_serno", { ascending: true });
 
@@ -146,10 +149,13 @@ export default function YekdemMahsupDetail() {
 
         let list: SubscriptionOption[] = [];
         if (data && data.length > 0) {
-          list = data.map((r: any) => ({
-            subscriptionSerNo: Number(r.subscription_serno),
-            title: r.title ?? null,
-          }));
+          list = data
+            .filter((r: any) => !r.is_hidden)
+            .map((r: any) => ({
+              subscriptionSerNo: Number(r.subscription_serno),
+              title: r.title ?? null,
+              nickname: r.nickname ?? null,
+            }));
         } else {
           const { data: osData, error: osErr } = await supabase
             .from("owner_subscriptions")
@@ -163,20 +169,17 @@ export default function YekdemMahsupDetail() {
           list = (osData ?? []).map((r: any) => ({
             subscriptionSerNo: Number(r.subscription_serno),
             title: r.title ?? null,
+            nickname: null,
           }));
         }
 
         setSubs(list);
 
-        if (list.length > 0) {
-          const ok = selectedSub != null && list.some((s) => s.subscriptionSerNo === selectedSub);
-          const next = ok ? selectedSub! : list[0].subscriptionSerNo;
-          setSelectedSub(next);
-          localStorage.setItem(LS_SUB_KEY, String(next));
-        } else {
-          setSelectedSub(null);
-          localStorage.removeItem(LS_SUB_KEY);
-        }
+        const next = resolveSelectedSub(
+          list.map((s) => s.subscriptionSerNo),
+          selectedSub,
+        );
+        setSelectedSub(next);
       } catch (e: any) {
         if (!cancel) {
           console.error("subscription list (Mahsup) error:", e);
@@ -195,9 +198,11 @@ export default function YekdemMahsupDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uid, sessionLoading]);
 
-  const selectedSubLabel =
-    subs.find((s) => s.subscriptionSerNo === selectedSub)?.title ??
-    (selectedSub != null ? `Tesis ${selectedSub}` : "Tesis seçilmedi");
+  const selectedSubLabel = (() => {
+    const s = subs.find((s) => s.subscriptionSerNo === selectedSub);
+    if (!s) return selectedSub != null ? `Tesis ${selectedSub}` : "Tesis seçilmedi";
+    return s.nickname ?? s.title ?? `Tesis ${s.subscriptionSerNo}`;
+  })();
 
   // 1) mahsup hesabı
   useEffect(() => {
@@ -279,13 +284,14 @@ export default function YekdemMahsupDetail() {
             0
           );
         } else {
-          const hourlyPrev = await supabase
-            .from("consumption_hourly")
-            .select("ts, cn")
-            .eq("user_id", uid)
-            .eq("subscription_serno", selectedSub)
-            .gte("ts", prevStart.toDate().toISOString())
-            .lt("ts", prevEndExclusive.toDate().toISOString());
+          const hourlyPrev = await fetchAllConsumption({
+            supabase,
+            userId: uid,
+            subscriptionSerno: selectedSub,
+            columns: "ts, cn",
+            startIso: prevStart.toDate().toISOString(),
+            endIso: prevEndExclusive.toDate().toISOString(),
+          });
 
           if (hourlyPrev.error) throw hourlyPrev.error;
 
@@ -308,8 +314,15 @@ export default function YekdemMahsupDetail() {
         });
 
         if (!yRow || yRow.yekdem_value == null || yRow.yekdem_final == null) {
+          const missing = !yRow
+            ? "yekdem_value ve yekdem_final"
+            : yRow.yekdem_value == null && yRow.yekdem_final == null
+            ? "yekdem_value ve yekdem_final"
+            : yRow.yekdem_value == null
+            ? "yekdem_value"
+            : "yekdem_final";
           throw new Error(
-            `${mahsupMonthLabel} için yekdem_value / yekdem_final eksik. (Mahsup hesaplanamaz)`
+            `${mahsupMonthLabel} için ${missing} eksik. (Mahsup hesaplanamaz)`
           );
         }
 
@@ -406,7 +419,7 @@ const mahsupView = useMemo(() => {
               {subs.length === 0 && <option value="">Tesis bulunamadı</option>}
               {subs.map((s) => (
                 <option key={s.subscriptionSerNo} value={s.subscriptionSerNo}>
-                  {s.title ?? `Tesis ${s.subscriptionSerNo}`}
+                  {s.nickname ?? s.title ?? `Tesis ${s.subscriptionSerNo}`}
                 </option>
               ))}
             </select>

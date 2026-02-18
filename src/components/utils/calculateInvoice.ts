@@ -35,6 +35,7 @@ export interface InvoiceInput {
 export interface InvoiceBreakdown {
   energyCharge: number;
   distributionCharge: number;
+  distributionBaseKwh: number; // totalConsumptionKwh + trafoKwh
   btvCharge: number;
 
   powerBaseCharge: number;
@@ -80,7 +81,8 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
 
   const trafoCharge = unitPriceEnergy * trafoKwh;
 
-  const distributionCharge = unitPriceDistribution * totalConsumptionKwh;
+  const distributionBaseKwh = totalConsumptionKwh + trafoKwh;
+  const distributionCharge = unitPriceDistribution * distributionBaseKwh;
 
   // 2) BTV (enerji üzerinden)
   // ✅ İstersen trafoyu da enerji sayıp BTV'ye dahil ediyoruz:
@@ -124,6 +126,7 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
     energyCharge,
     trafoCharge, // ✅
     distributionCharge,
+    distributionBaseKwh,
     btvCharge,
     powerBaseCharge,
     powerExcessCharge,

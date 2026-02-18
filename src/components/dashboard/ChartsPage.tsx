@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { useSession } from "@/hooks/useSession";
 import { supabase } from "@/lib/supabase";
+import { resolveSelectedSub } from "@/lib/subscriptionVisibility";
 
 import {
   ResponsiveContainer,
@@ -233,7 +234,8 @@ export default function ChartsPage() {
             subscription_settings:subscription_settings (
               title,
               nickname,
-              kbk
+              kbk,
+              is_hidden
             )
           `
           )
@@ -243,30 +245,31 @@ export default function ChartsPage() {
         if (cancel) return;
         if (error) throw error;
 
-        const list: SubOption[] = (data ?? []).map((r: any) => {
-          const ss = r.subscription_settings;
-          const nick = (ss?.nickname ?? ss?.title ?? null) as string | null;
-          const kbk = ss?.kbk != null ? Number(ss.kbk) : null;
+        const list: SubOption[] = (data ?? [])
+          .filter((r: any) => {
+            const ss = r.subscription_settings;
+            return !(ss?.is_hidden);
+          })
+          .map((r: any) => {
+            const ss = r.subscription_settings;
+            const nick = (ss?.nickname ?? ss?.title ?? null) as string | null;
+            const kbk = ss?.kbk != null ? Number(ss.kbk) : null;
 
-          return {
-            subscriptionSerNo: Number(r.subscription_serno),
-            meterSerial: r.meter_serial ?? null,
-            nickname: nick,
-            kbk: Number.isFinite(kbk as any) ? kbk : null,
-          };
-        });
+            return {
+              subscriptionSerNo: Number(r.subscription_serno),
+              meterSerial: r.meter_serial ?? null,
+              nickname: nick,
+              kbk: Number.isFinite(kbk as any) ? kbk : null,
+            };
+          });
 
         setSubs(list);
 
-        if (list.length > 0) {
-          const ok = selectedSub != null && list.some((s) => s.subscriptionSerNo === selectedSub);
-          const next = ok ? selectedSub! : list[0].subscriptionSerNo;
-          setSelectedSub(next);
-          localStorage.setItem(LS_SUB_KEY, String(next));
-        } else {
-          setSelectedSub(null);
-          localStorage.removeItem(LS_SUB_KEY);
-        }
+        const next = resolveSelectedSub(
+          list.map((s) => s.subscriptionSerNo),
+          selectedSub,
+        );
+        setSelectedSub(next);
       } catch (e: any) {
         if (!cancel) {
           setSubs([]);

@@ -3,7 +3,9 @@
     "allow": [
       "Bash(npx vite build)",
       "Bash(supabase functions deploy:*)",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Bash(find:*)",
+      "Bash(npx tsc:*)"
     ]
   }
 }

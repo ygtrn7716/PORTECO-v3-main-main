@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { dayjsTR } from "@/lib/dayjs";
 import { supabase } from "@/lib/supabase";
 import { useSession } from "@/hooks/useSession";
+import { fetchAllConsumption } from "@/lib/paginatedFetch";
 
 type Props = {
   subscriptionSerNo: number | null;
@@ -153,13 +154,14 @@ export default function ReactiveSection({ subscriptionSerNo }: Props) {
         const start = dayjsTR().startOf("month");
         const end = dayjsTR().add(1, "hour"); // ufak pay
 
-        const res = await supabase
-          .from("consumption_hourly")
-          .select("cn, ri, rc")
-          .eq("user_id", uid)
-          .eq("subscription_serno", subscriptionSerNo) // ✅ tesis filtresi
-          .gte("ts", start.toDate().toISOString())
-          .lt("ts", end.toDate().toISOString());
+        const res = await fetchAllConsumption({
+          supabase,
+          userId: uid,
+          subscriptionSerno: subscriptionSerNo,
+          columns: "cn, ri, rc",
+          startIso: start.toDate().toISOString(),
+          endIso: end.toDate().toISOString(),
+        });
 
         if (cancel) return;
         if (res.error) throw res.error;

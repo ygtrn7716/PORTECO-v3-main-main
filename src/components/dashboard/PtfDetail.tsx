@@ -6,10 +6,13 @@ import { useSession } from "@/hooks/useSession";
 import { supabase } from "@/lib/supabase";
 import { dayjsTR } from "@/lib/dayjs";
 import { downloadXlsx } from "@/components/utils/xlsx";
+import { fetchHiddenSernos, resolveSelectedSub } from "@/lib/subscriptionVisibility";
+import { fetchAllConsumption, fetchAllPtf } from "@/lib/paginatedFetch";
 
 type SubscriptionOption = {
   subscriptionSerNo: number;
   meterSerial: string | null;
+  nickname: string | null;
 };
 
 type Row = {
@@ -126,12 +129,15 @@ export default function PtfDetail() {
     return `${labels[month - 1]} ${year}`;
   }, [month, year]);
 
-  const selectedMeterSerial =
-    subs.find((s) => s.subscriptionSerNo === selectedSub)?.meterSerial ?? null;
+  const selectedSubObj = subs.find((s) => s.subscriptionSerNo === selectedSub);
+  const selectedMeterSerial = selectedSubObj?.meterSerial ?? null;
 
-  const selectedSubLabel =
-    selectedMeterSerial ??
-    (selectedSub != null ? String(selectedSub) : "Tesis seçilmedi");
+  const selectedSubLabel = (() => {
+    if (!selectedSubObj) return selectedSub != null ? String(selectedSub) : "Tesis seçilmedi";
+    const nick = selectedSubObj.nickname;
+    const serial = selectedSubObj.meterSerial ?? String(selectedSubObj.subscriptionSerNo);
+    return nick ? `${serial} - ${nick}` : serial;
+  })();
 
   // 0) tesisleri çek (LABEL = owner_subscriptions.meter_serial)
   useEffect(() => {
@@ -154,24 +160,42 @@ export default function PtfDetail() {
         if (cancel) return;
         if (error) throw error;
 
-        const list: SubscriptionOption[] = (data ?? []).map((r: any) => ({
-          subscriptionSerNo: Number(r.subscription_serno),
-          meterSerial: r.meter_serial ?? null,
-        }));
+        const sernos = (data ?? []).map((r: any) => Number(r.subscription_serno)).filter(Number.isFinite);
+        let nickMap = new Map<number, string | null>();
+        if (sernos.length > 0) {
+          const { data: ssData } = await supabase
+            .from("subscription_settings")
+            .select("subscription_serno, nickname")
+            .eq("user_id", uid)
+            .in("subscription_serno", sernos);
+          for (const r of (ssData ?? []) as any[]) {
+            const k = Number(r.subscription_serno);
+            if (Number.isFinite(k)) nickMap.set(k, r.nickname ?? null);
+          }
+        }
+        if (cancel) return;
+
+        const allList: SubscriptionOption[] = (data ?? []).map((r: any) => {
+          const serno = Number(r.subscription_serno);
+          return {
+            subscriptionSerNo: serno,
+            meterSerial: r.meter_serial ?? null,
+            nickname: nickMap.get(serno) ?? null,
+          };
+        });
+
+        // Gizli tesisleri filtrele
+        const hidden = await fetchHiddenSernos(uid);
+        if (cancel) return;
+        const list = allList.filter((s) => !hidden.has(s.subscriptionSerNo));
 
         setSubs(list);
 
-        if (list.length > 0) {
-          const ok =
-            selectedSub != null &&
-            list.some((s) => s.subscriptionSerNo === selectedSub);
-          const next = ok ? selectedSub! : list[0].subscriptionSerNo;
-          setSelectedSub(next);
-          localStorage.setItem(LS_SUB_KEY, String(next));
-        } else {
-          setSelectedSub(null);
-          localStorage.removeItem(LS_SUB_KEY);
-        }
+        const next = resolveSelectedSub(
+          list.map((s) => s.subscriptionSerNo),
+          selectedSub,
+        );
+        setSelectedSub(next);
       } catch (e: any) {
         if (!cancel) {
           setSubsErr(e?.message ?? "Tesisler yüklenemedi");
@@ -204,25 +228,26 @@ export default function PtfDetail() {
         const start = dayjsTR().year(year).month(month - 1).startOf("month");
         const end = start.clone().add(1, "month");
 
-        // consumption
-        const cons = await supabase
-          .from("consumption_hourly")
-          .select("ts, cn")
-          .eq("user_id", uid)
-          .eq("subscription_serno", selectedSub)
-          .gte("ts", start.toDate().toISOString())
-          .lt("ts", end.toDate().toISOString())
-          .order("ts", { ascending: true });
+        // consumption (paginated - PostgREST max_rows limiti aşılmasın)
+        const cons = await fetchAllConsumption({
+          supabase,
+          userId: uid,
+          subscriptionSerno: selectedSub,
+          columns: "ts, cn",
+          startIso: start.toDate().toISOString(),
+          endIso: end.toDate().toISOString(),
+        });
 
         if (cancel) return;
         if (cons.error) throw cons.error;
 
-        // ptf
-        const ptf = await supabase
-          .from("epias_ptf_hourly")
-          .select("ts, ptf_tl_mwh")
-          .gte("ts", start.toDate().toISOString())
-          .lt("ts", end.toDate().toISOString());
+        // ptf (paginated)
+        const ptf = await fetchAllPtf({
+          supabase,
+          columns: "ts, ptf_tl_mwh",
+          startIso: start.toDate().toISOString(),
+          endIso: end.toDate().toISOString(),
+        });
 
         if (cancel) return;
         if (ptf.error) throw ptf.error;
@@ -335,11 +360,14 @@ export default function PtfDetail() {
               className="h-10 md:h-9 w-full sm:w-[420px] md:w-auto min-w-0 max-w-full rounded-lg border border-neutral-300 bg-white px-3 md:px-2 text-[16px] md:text-xs text-neutral-800 focus:outline-none focus:ring-1 focus:ring-[#0A66FF]"
             >
               {subs.length === 0 && <option value="">Tesis bulunamadı</option>}
-              {subs.map((s) => (
-                <option key={s.subscriptionSerNo} value={s.subscriptionSerNo}>
-                  {s.meterSerial ?? String(s.subscriptionSerNo)}
-                </option>
-              ))}
+              {subs.map((s) => {
+                const serial = s.meterSerial ?? String(s.subscriptionSerNo);
+                return (
+                  <option key={s.subscriptionSerNo} value={s.subscriptionSerNo}>
+                    {s.nickname ? `${serial} - ${s.nickname}` : serial}
+                  </option>
+                );
+              })}
             </select>
 
             {subsLoading && <span className="text-[11px] text-neutral-500">Yükleniyor…</span>}

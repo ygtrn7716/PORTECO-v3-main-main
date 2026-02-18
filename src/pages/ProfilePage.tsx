@@ -13,13 +13,18 @@ import {
   Save,
   Hash,
   Tag,
+  Zap,
 } from "lucide-react";
+import { setSubscriptionHidden } from "@/lib/subscriptionVisibility";
+import { setBtvEnabled } from "@/lib/btvToggle";
 
 type FacilityRow = {
   subscriptionSerNo: number;
   meterSerial: string | null;
   title: string | null;
   nickname: string | null;
+  isHidden: boolean;
+  btvEnabled: boolean;
 };
 
 export default function ProfilePage() {
@@ -35,6 +40,52 @@ export default function ProfilePage() {
   const [nickValues, setNickValues] = useState<Record<number, string>>({});
   const [nickSaving, setNickSaving] = useState<Record<number, boolean>>({});
   const [nickMsg, setNickMsg] = useState<Record<number, string | null>>({});
+  const [hiddenSaving, setHiddenSaving] = useState<Record<number, boolean>>({});
+  const [btvSaving, setBtvSaving] = useState<Record<number, boolean>>({});
+
+  const toggleVisibility = async (serno: number) => {
+    if (!uid) return;
+    const facility = facilities.find((f) => f.subscriptionSerNo === serno);
+    if (!facility) return;
+
+    const newHidden = !facility.isHidden;
+    setHiddenSaving((p) => ({ ...p, [serno]: true }));
+
+    try {
+      await setSubscriptionHidden(uid, serno, newHidden);
+      setFacilities((prev) =>
+        prev.map((f) =>
+          f.subscriptionSerNo === serno ? { ...f, isHidden: newHidden } : f
+        )
+      );
+    } catch (e: any) {
+      console.error("toggle visibility error:", e);
+    } finally {
+      setHiddenSaving((p) => ({ ...p, [serno]: false }));
+    }
+  };
+
+  const toggleBtv = async (serno: number) => {
+    if (!uid) return;
+    const facility = facilities.find((f) => f.subscriptionSerNo === serno);
+    if (!facility) return;
+
+    const newVal = !facility.btvEnabled;
+    setBtvSaving((p) => ({ ...p, [serno]: true }));
+
+    try {
+      await setBtvEnabled(uid, serno, newVal);
+      setFacilities((prev) =>
+        prev.map((f) =>
+          f.subscriptionSerNo === serno ? { ...f, btvEnabled: newVal } : f
+        )
+      );
+    } catch (e: any) {
+      console.error("toggle btv error:", e);
+    } finally {
+      setBtvSaving((p) => ({ ...p, [serno]: false }));
+    }
+  };
 
   const effectiveLabel = useMemo(() => {
     const map = new Map<number, string>();
@@ -59,7 +110,7 @@ export default function ProfilePage() {
       try {
         const { data: osData, error: osErr } = await supabase
           .from("owner_subscriptions")
-          .select("subscription_serno, meter_serial, title")
+          .select("subscription_serno, meter_serial, title, btv_enabled")
           .eq("user_id", uid)
           .order("subscription_serno", { ascending: true });
 
@@ -73,12 +124,12 @@ export default function ProfilePage() {
             .map((r: any) => Number(r.subscription_serno))
             .filter((n: any) => Number.isFinite(n));
 
-          let ssMap = new Map<number, { title: string | null; nickname: string | null }>();
+          let ssMap = new Map<number, { title: string | null; nickname: string | null; isHidden: boolean }>();
 
           if (sernos.length > 0) {
             const { data: ssData, error: ssErr } = await supabase
               .from("subscription_settings")
-              .select("subscription_serno, title, nickname")
+              .select("subscription_serno, title, nickname, is_hidden")
               .eq("user_id", uid)
               .in("subscription_serno", sernos);
 
@@ -89,7 +140,7 @@ export default function ProfilePage() {
             for (const r of (ssData ?? []) as any[]) {
               const k = Number(r.subscription_serno);
               if (Number.isFinite(k)) {
-                ssMap.set(k, { title: r.title ?? null, nickname: r.nickname ?? null });
+                ssMap.set(k, { title: r.title ?? null, nickname: r.nickname ?? null, isHidden: r.is_hidden ?? false });
               }
             }
           }
@@ -103,12 +154,14 @@ export default function ProfilePage() {
               meterSerial: r.meter_serial ?? null,
               title: ss?.title ?? r.title ?? null,
               nickname: ss?.nickname ?? null,
+              isHidden: ss?.isHidden ?? false,
+              btvEnabled: r.btv_enabled ?? true,
             };
           });
         } else {
           const { data: ssData, error: ssErr } = await supabase
             .from("subscription_settings")
-            .select("subscription_serno, title, nickname")
+            .select("subscription_serno, title, nickname, is_hidden")
             .eq("user_id", uid)
             .order("subscription_serno", { ascending: true });
 
@@ -120,6 +173,8 @@ export default function ProfilePage() {
             meterSerial: null,
             title: r.title ?? null,
             nickname: r.nickname ?? null,
+            isHidden: r.is_hidden ?? false,
+            btvEnabled: true,
           }));
         }
 
@@ -136,7 +191,7 @@ export default function ProfilePage() {
         setNickMsg({});
       } catch (e: any) {
         console.error(e);
-        if (!cancel) setFacErr(e?.message ?? "Tesisler yuklenirken bir hata olustu.");
+        if (!cancel) setFacErr(e?.message ?? "Tesisler yüklenirken bir hata oluştu.");
       } finally {
         if (!cancel) setFacLoading(false);
       }
@@ -221,22 +276,22 @@ export default function ProfilePage() {
     setPasswordSuccess(null);
 
     if (!session?.user?.email) {
-      setPasswordError("Oturum bulunamadi. Lutfen tekrar giris yap.");
+      setPasswordError("Oturum bulunamadı. Lutfen tekrar giriş yap.");
       return;
     }
 
     if (!currentPassword) {
-      setPasswordError("Mevcut sifreni yazmalisin.");
+      setPasswordError("Mevcut şifreni yazmalısın.");
       return;
     }
 
     if (newPassword.length < 8) {
-      setPasswordError("Yeni sifre en az 8 karakter olmali.");
+      setPasswordError("Yeni şifre en az 8 karakter olmalı.");
       return;
     }
 
     if (newPassword !== newPasswordAgain) {
-      setPasswordError("Yeni sifreler birbiriyle ayni degil.");
+      setPasswordError("Yeni şifreler birbiriyle aynı değil.");
       return;
     }
 
@@ -249,7 +304,7 @@ export default function ProfilePage() {
 
       if (signInError) {
         console.error(signInError);
-        setPasswordError("Mevcut sifre hatali.");
+        setPasswordError("Mevcut şifre hatali.");
         setChanging(false);
         return;
       }
@@ -290,7 +345,7 @@ export default function ProfilePage() {
               <div>
                 <h2 className="text-sm font-semibold text-neutral-900">Tesis Nickname&apos;leri</h2>
                 <p className="text-xs text-neutral-400">
-                  Her tesis icin ozel isim tanimlayin
+                  Her tesis için özel tesis tanımlayın
                 </p>
               </div>
             </div>
@@ -300,7 +355,7 @@ export default function ProfilePage() {
             {facLoading && (
               <div className="flex items-center gap-3 py-4">
                 <div className="h-5 w-5 animate-spin rounded-full border-2 border-[#0A66FF] border-t-transparent" />
-                <span className="text-sm text-neutral-500">Tesisler yukleniyor...</span>
+                <span className="text-sm text-neutral-500">Tesisler yükleniyor...</span>
               </div>
             )}
 
@@ -314,7 +369,7 @@ export default function ProfilePage() {
               <div className="text-center py-8">
                 <Building2 className="h-10 w-10 text-neutral-300 mx-auto mb-3" />
                 <p className="text-sm text-neutral-500">
-                  Bu hesaba bagli herhangi bir tesis bulunamadi.
+                  bu hesaba bağlı herhangi bir tesis bulunamadı.
                 </p>
               </div>
             )}
@@ -337,9 +392,17 @@ export default function ProfilePage() {
                           {i + 1}
                         </div>
                         <div className="flex-1 min-w-0">
-                          <div className="font-medium text-neutral-900 text-sm truncate">
-                            {tesisNo}
-                            {title ? ` - ${title}` : ""}
+                          <div className="flex items-center gap-2">
+                            <div className="font-medium text-neutral-900 text-sm truncate">
+                              {tesisNo}
+                              {title ? ` - ${title}` : ""}
+                            </div>
+                            {f.isHidden && (
+                              <span className="inline-flex items-center gap-1 rounded-md bg-neutral-100 px-2 py-0.5 text-[10px] font-medium text-neutral-400 shrink-0">
+                                <EyeOff className="h-3 w-3" />
+                                Gizli
+                              </span>
+                            )}
                           </div>
                           <div className="flex items-center gap-1.5 mt-0.5">
                             <Hash className="h-3 w-3 text-neutral-400" />
@@ -377,12 +440,52 @@ export default function ProfilePage() {
                           )}
                           {isSaving ? "Kaydediliyor..." : "Kaydet"}
                         </button>
+
+                        <button
+                          type="button"
+                          onClick={() => toggleVisibility(f.subscriptionSerNo)}
+                          disabled={!!hiddenSaving[f.subscriptionSerNo]}
+                          className={`inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium border transition-all duration-200 active:scale-[0.97] disabled:opacity-60 ${
+                            f.isHidden
+                              ? "border-neutral-300 bg-neutral-100 text-neutral-500 hover:bg-neutral-200"
+                              : "border-[#0A66FF]/20 bg-[#0A66FF]/5 text-[#0A66FF] hover:bg-[#0A66FF]/10"
+                          }`}
+                          title={f.isHidden ? "Tesisi göster" : "Tesisi gizle"}
+                        >
+                          {hiddenSaving[f.subscriptionSerNo] ? (
+                            <div className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                          ) : f.isHidden ? (
+                            <EyeOff className="h-3.5 w-3.5" />
+                          ) : (
+                            <Eye className="h-3.5 w-3.5" />
+                          )}
+                          {f.isHidden ? "Gizli" : "Görünür"}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => toggleBtv(f.subscriptionSerNo)}
+                          disabled={!!btvSaving[f.subscriptionSerNo]}
+                          className={`inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium border transition-all duration-200 active:scale-[0.97] disabled:opacity-60 ${
+                            f.btvEnabled
+                              ? "border-[#0A66FF]/20 bg-[#0A66FF]/5 text-[#0A66FF] hover:bg-[#0A66FF]/10"
+                              : "border-neutral-300 bg-neutral-100 text-neutral-500 hover:bg-neutral-200"
+                          }`}
+                          title={f.btvEnabled ? "BTV aktif - devre disi birakmak icin tikla" : "BTV devre disi - aktif etmek icin tikla"}
+                        >
+                          {btvSaving[f.subscriptionSerNo] ? (
+                            <div className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                          ) : (
+                            <Zap className="h-3.5 w-3.5" />
+                          )}
+                          {f.btvEnabled ? "BTV Açık" : "BTV Kapalı"}
+                        </button>
                       </div>
 
                       {/* Preview + message */}
                       <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2">
                         <div className="text-xs text-neutral-400">
-                          Dashboard gorunumu:{" "}
+                          Dashboard görünümü:{" "}
                           <span className="font-medium text-neutral-600">
                             {effectiveLabel.get(f.subscriptionSerNo) ?? tesisNo}
                           </span>
@@ -421,9 +524,9 @@ export default function ProfilePage() {
                 <Lock className="h-4.5 w-4.5 text-amber-600" />
               </div>
               <div>
-                <h2 className="text-sm font-semibold text-neutral-900">Sifre Degistir</h2>
+                <h2 className="text-sm font-semibold text-neutral-900">Şifre Değiştir</h2>
                 <p className="text-xs text-neutral-400">
-                  Hesap guvenliginiz icin guclu bir sifre kullanin
+                  Hesap günvenliğiniz için güçlü bir şifre kullanın
                 </p>
               </div>
             </div>
@@ -435,7 +538,7 @@ export default function ProfilePage() {
               <div className="space-y-1.5">
                 <label className="text-xs font-medium text-neutral-600 flex items-center gap-1.5">
                   <Lock className="h-3 w-3" />
-                  Mevcut Sifre
+                  Mevcut Şifre
                 </label>
                 <div className="relative">
                   <input
@@ -461,7 +564,7 @@ export default function ProfilePage() {
               <div className="space-y-1.5">
                 <label className="text-xs font-medium text-neutral-600 flex items-center gap-1.5">
                   <Lock className="h-3 w-3" />
-                  Yeni Sifre
+                  Yeni Şifre
                 </label>
                 <div className="relative">
                   <input
@@ -526,7 +629,7 @@ export default function ProfilePage() {
               <div className="space-y-1.5">
                 <label className="text-xs font-medium text-neutral-600 flex items-center gap-1.5">
                   <Lock className="h-3 w-3" />
-                  Yeni Sifre (Tekrar)
+                  Yeni Şifre (Tekrar)
                 </label>
                 <input
                   type="password"
@@ -537,7 +640,7 @@ export default function ProfilePage() {
                   placeholder="Yeni sifrenizi tekrar girin"
                 />
                 {newPasswordAgain.length > 0 && newPassword !== newPasswordAgain && (
-                  <p className="text-[11px] text-red-500 mt-0.5">Sifreler eslesmiyor</p>
+                  <p className="text-[11px] text-red-500 mt-0.5">Şifreler Eşleşmiyor</p>
                 )}
               </div>
 

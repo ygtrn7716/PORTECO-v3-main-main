@@ -19,6 +19,7 @@ export default function OwnerSubscriptionsAdmin() {
           { key: "meter_serial", label: "meter_serial", type: "text" },
           { key: "title", label: "title", type: "text" },
           { key: "multiplier", label: "multiplier", type: "number" },
+          { key: "btv_enabled", label: "btv_enabled", type: "bool" },
         ],
       }}
     />

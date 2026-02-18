@@ -2,6 +2,8 @@
 import { useEffect, useMemo, useState } from "react";
 import dayjs from "dayjs";
 import { supabase } from "@/lib/supabase";
+import { useSession } from "@/hooks/useSession";
+import { fetchHiddenSernos } from "@/lib/subscriptionVisibility";
 
 type HourRow = {
   ts: string;
@@ -12,9 +14,12 @@ type HourRow = {
   rc: number | null;
 };
 
-type SubRow = { subscription_serno: number; title: string | null };
+type SubRow = { subscription_serno: number; title: string | null; nickname: string | null };
 
 export default function EnergyTable() {
+  const { session } = useSession();
+  const uid = session?.user?.id ?? null;
+
   const [subs, setSubs] = useState<SubRow[]>([]);
   const [selectedSub, setSelectedSub] = useState<"ALL" | number>("ALL");
 
@@ -33,7 +38,7 @@ export default function EnergyTable() {
   const [page, setPage] = useState(0);
   const canLoadMore = useMemo(() => rows.length === (page + 1) * pageSize, [rows, page]);
 
-  // Sadece kendi tesisatları (RLS zaten filtreliyor)
+  // Sadece kendi tesisatları (RLS zaten filtreliyor) + gizli tesisleri cikar
   useEffect(() => {
     (async () => {
       const { data, error } = await supabase
@@ -41,9 +46,38 @@ export default function EnergyTable() {
         .select("subscription_serno, title")
         .order("subscription_serno", { ascending: true });
 
-      if (!error) setSubs(data || []);
+      if (error) return;
+      const rawList = data || [];
+
+      // nickname'leri subscription_settings'ten al
+      const sernos = rawList.map((r: any) => Number(r.subscription_serno)).filter(Number.isFinite);
+      let nickMap = new Map<number, string | null>();
+      if (uid && sernos.length > 0) {
+        const { data: ssData } = await supabase
+          .from("subscription_settings")
+          .select("subscription_serno, nickname")
+          .eq("user_id", uid)
+          .in("subscription_serno", sernos);
+        for (const r of (ssData ?? []) as any[]) {
+          const k = Number(r.subscription_serno);
+          if (Number.isFinite(k)) nickMap.set(k, r.nickname ?? null);
+        }
+      }
+
+      let list: SubRow[] = rawList.map((r: any) => ({
+        subscription_serno: Number(r.subscription_serno),
+        title: r.title ?? null,
+        nickname: nickMap.get(Number(r.subscription_serno)) ?? null,
+      }));
+
+      if (uid) {
+        const hidden = await fetchHiddenSernos(uid);
+        list = list.filter((s) => !hidden.has(s.subscription_serno));
+      }
+
+      setSubs(list);
     })();
-  }, []);
+  }, [uid]);
 
   async function fetchRows(reset = true) {
     setLoading(true); setErr(null);
@@ -118,7 +152,7 @@ export default function EnergyTable() {
             <option value="ALL">Tümü</option>
             {subs.map((s) => (
               <option key={s.subscription_serno} value={s.subscription_serno}>
-                {s.subscription_serno} {s.title ? `— ${s.title}` : ""}
+                {s.subscription_serno} {(s.nickname ?? s.title) ? `— ${s.nickname ?? s.title}` : ""}
               </option>
             ))}
           </select>

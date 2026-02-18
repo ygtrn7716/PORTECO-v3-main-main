@@ -21,6 +21,7 @@ import {
   Receipt,
   AlertTriangle,
   Calculator,
+  Mail,
 } from "lucide-react";
 
 type NavItem = {
@@ -52,6 +53,8 @@ const NAV_CATEGORIES: NavCategory[] = [
       { label: "Notification Channels", to: "/dashboard/admin/notification-channels", icon: <Bell size={16} /> },
       { label: "User Phone Numbers", to: "/dashboard/admin/user-phone-numbers", icon: <Phone size={16} /> },
       { label: "SMS Logs", to: "/dashboard/admin/sms-logs", icon: <MessageSquare size={16} /> },
+      { label: "User Emails", to: "/dashboard/admin/user-emails", icon: <Mail size={16} /> },
+      { label: "Email Logs", to: "/dashboard/admin/email-logs", icon: <Mail size={16} /> },
     ],
   },
   {

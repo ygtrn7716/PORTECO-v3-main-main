@@ -8,7 +8,8 @@ import DashboardShell from "@/components/dashboard/DashboardShell";
 import { upsertInvoiceSnapshot } from "@/components/utils/invoiceSnapshots";
 
 import AlternateTariffInvoiceSection from "@/components/dashboard/invoiceDetail/AlternateTariffInvoiceSection";
-
+import { resolveSelectedSub } from "@/lib/subscriptionVisibility";
+import { fetchAllConsumption } from "@/lib/paginatedFetch";
 
 import {
   calculateInvoice,
@@ -45,6 +46,7 @@ const fmtUnit = (n: number | null | undefined) =>
 type SubscriptionOption = {
   subscriptionSerNo: number;
   title: string | null;
+  nickname: string | null;
 };
 
 type RecommendationStatus =
@@ -82,6 +84,7 @@ interface InvoiceViewData {
   }[];
   yekdemMahsup: number;
   hasYekdemMahsup: boolean;
+  yekdemMissing: "none" | "value" | "final" | "both";
   totalWithMahsup: number;
 
   reactivePenaltyCharge: number;
@@ -113,27 +116,27 @@ async function fetchSubYekdemValue(params: {
 }): Promise<number | null> {
   const { uid, sub, year, month } = params;
 
-  // 1) year/month
+  // 1) period_year/period_month (primary)
   const r1 = await supabase
     .from("subscription_yekdem")
     .select("yekdem_value")
     .eq("user_id", uid)
     .eq("subscription_serno", sub)
-    .eq("year", year)
-    .eq("month", month)
+    .eq("period_year", year)
+    .eq("period_month", month)
     .maybeSingle();
 
   if (!r1.error) return r1.data?.yekdem_value != null ? Number(r1.data.yekdem_value) : null;
 
-  // 2) period_year/period_month
-  if (isMissingColumnError(r1.error, "year") || isMissingColumnError(r1.error, "month")) {
+  // 2) year/month (fallback)
+  if (isMissingColumnError(r1.error, "period_year") || isMissingColumnError(r1.error, "period_month")) {
     const r2 = await supabase
       .from("subscription_yekdem")
       .select("yekdem_value")
       .eq("user_id", uid)
       .eq("subscription_serno", sub)
-      .eq("period_year", year)
-      .eq("period_month", month)
+      .eq("year", year)
+      .eq("month", month)
       .maybeSingle();
 
     if (r2.error) throw r2.error;
@@ -152,14 +155,14 @@ async function fetchSubYekdemForMahsup(params: {
 }): Promise<{ yekdem_value: number | null; yekdem_final: number | null } | null> {
   const { uid, sub, year, month } = params;
 
-  // 1) year/month
+  // 1) period_year/period_month (primary)
   const r1 = await supabase
     .from("subscription_yekdem")
     .select("yekdem_value, yekdem_final")
     .eq("user_id", uid)
     .eq("subscription_serno", sub)
-    .eq("year", year)
-    .eq("month", month)
+    .eq("period_year", year)
+    .eq("period_month", month)
     .maybeSingle();
 
   if (!r1.error) {
@@ -170,15 +173,15 @@ async function fetchSubYekdemForMahsup(params: {
     };
   }
 
-  // 2) period_year/period_month
-  if (isMissingColumnError(r1.error, "year") || isMissingColumnError(r1.error, "month")) {
+  // 2) year/month (fallback)
+  if (isMissingColumnError(r1.error, "period_year") || isMissingColumnError(r1.error, "period_month")) {
     const r2 = await supabase
       .from("subscription_yekdem")
       .select("yekdem_value, yekdem_final")
       .eq("user_id", uid)
       .eq("subscription_serno", sub)
-      .eq("period_year", year)
-      .eq("period_month", month)
+      .eq("year", year)
+      .eq("month", month)
       .maybeSingle();
 
     if (r2.error) throw r2.error;
@@ -268,7 +271,7 @@ export default function InvoiceDetail() {
 
         const { data, error } = await supabase
           .from("subscription_settings")
-          .select("subscription_serno, title")
+          .select("subscription_serno, title, nickname, is_hidden")
           .eq("user_id", uid)
           .order("subscription_serno", { ascending: true });
 
@@ -278,10 +281,13 @@ export default function InvoiceDetail() {
         let list: SubscriptionOption[] = [];
 
         if (data && data.length > 0) {
-          list = data.map((r: any) => ({
-            subscriptionSerNo: Number(r.subscription_serno),
-            title: r.title ?? null,
-          }));
+          list = data
+            .filter((r: any) => !r.is_hidden)
+            .map((r: any) => ({
+              subscriptionSerNo: Number(r.subscription_serno),
+              title: r.title ?? null,
+              nickname: r.nickname ?? null,
+            }));
         } else {
           const { data: osData, error: osErr } = await supabase
             .from("owner_subscriptions")
@@ -295,23 +301,17 @@ export default function InvoiceDetail() {
           list = (osData ?? []).map((r: any) => ({
             subscriptionSerNo: Number(r.subscription_serno),
             title: r.title ?? null,
+            nickname: null,
           }));
         }
 
         setSubs(list);
 
-        if (list.length > 0) {
-          const ok =
-            selectedSub != null &&
-            list.some((s) => s.subscriptionSerNo === selectedSub);
-          const next = ok ? selectedSub! : list[0].subscriptionSerNo;
-
-          setSelectedSub(next);
-          localStorage.setItem(LS_SUB_KEY, String(next));
-        } else {
-          setSelectedSub(null);
-          localStorage.removeItem(LS_SUB_KEY);
-        }
+        const next = resolveSelectedSub(
+          list.map((s) => s.subscriptionSerNo),
+          selectedSub,
+        );
+        setSelectedSub(next);
       } catch (e: any) {
         if (!cancel) {
           console.error("subs load error:", e);
@@ -351,14 +351,15 @@ export default function InvoiceDetail() {
         const periodMonth = prev.month() + 1;
         const monthLabel = prev.format("MMMM YYYY");
 
-        // 1) tüketim
-        const hourly = await supabase
-          .from("consumption_hourly")
-          .select("ts, cn, ri, rc")
-          .eq("user_id", uid)
-          .eq("subscription_serno", selectedSub)
-          .gte("ts", monthStart.toDate().toISOString())
-          .lt("ts", monthEndExclusive.toDate().toISOString());
+        // 1) tüketim (paginated)
+        const hourly = await fetchAllConsumption({
+          supabase,
+          userId: uid,
+          subscriptionSerno: selectedSub,
+          columns: "ts, cn, ri, rc",
+          startIso: monthStart.toDate().toISOString(),
+          endIso: monthEndExclusive.toDate().toISOString(),
+        });
 
         if (hourly.error) throw hourly.error;
 
@@ -418,7 +419,7 @@ export default function InvoiceDetail() {
         // 4) tesis ayarları (KBK + tarife + güç limit) -> SADECE subscription_settings
         const settingsRes = await supabase
           .from("subscription_settings")
-          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, btv_enabled")
+          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -434,8 +435,6 @@ export default function InvoiceDetail() {
         const terim = settingsRes.data.terim ?? null;
         const gerilim = settingsRes.data.gerilim ?? null;
         const tarife = settingsRes.data.tarife ?? null;
-
-        const btvEnabled = settingsRes.data.btv_enabled ?? true;
 
         const contractPowerKw =
           settingsRes.data.guc_bedel_limit != null && Number.isFinite(Number(settingsRes.data.guc_bedel_limit))
@@ -458,7 +457,46 @@ export default function InvoiceDetail() {
 
         const tariffType = mapTermToTariffType(terim);
 
-        // 5) resmi dağıtım/güç tarifesi
+        // 5) multiplier + btv_enabled (owner_subscriptions)
+        let multiplier = 1;
+        let btvEnabled = true;
+
+        // 5a) owner_subscriptions (user_id ile dene)
+        const subRes1 = await supabase
+          .from("owner_subscriptions")
+          .select("multiplier, btv_enabled")
+          .eq("user_id", uid)
+          .eq("subscription_serno", selectedSub)
+          .maybeSingle();
+
+        if (subRes1.error) throw subRes1.error;
+
+        if (
+          subRes1.data?.multiplier != null &&
+          Number.isFinite(Number(subRes1.data.multiplier))
+        ) {
+          multiplier = Number(subRes1.data.multiplier);
+          btvEnabled = subRes1.data.btv_enabled ?? true;
+        } else {
+          // 5b) owner_subscriptions (user_id'siz dene — bazı yapılarda row bu şekilde bulunuyor)
+          const subRes2 = await supabase
+            .from("owner_subscriptions")
+            .select("multiplier, btv_enabled")
+            .eq("subscription_serno", selectedSub)
+            .maybeSingle();
+
+          if (subRes2.error) throw subRes2.error;
+
+          if (
+            subRes2.data?.multiplier != null &&
+            Number.isFinite(Number(subRes2.data.multiplier))
+          ) {
+            multiplier = Number(subRes2.data.multiplier);
+          }
+          btvEnabled = subRes2.data?.btv_enabled ?? true;
+        }
+
+        // 6) resmi dağıtım/güç tarifesi
         const tariffRes = await supabase
           .from("distribution_tariff_official")
           .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel")
@@ -486,7 +524,7 @@ export default function InvoiceDetail() {
 
         const vatRate = tariffRow.kdv != null ? Number(tariffRow.kdv) / 100 : 0;
 
-        // 6) reaktif ceza
+        // 7) reaktif ceza
         const riPercent =
           totalConsumptionKwh > 0 ? (totalRi / totalConsumptionKwh) * 100 : 0;
         const rcPercent =
@@ -500,42 +538,6 @@ export default function InvoiceDetail() {
 
         const penaltyEnergy = riPenaltyEnergy + rcPenaltyEnergy; // kVArh
         const reactivePenaltyCharge = penaltyEnergy * reactiveUnitPrice; // TL (KDV öncesi)
-
-        // 7) multiplier + demand
-        let multiplier = 1;
-
-        // 7a) owner_subscriptions (user_id ile dene)
-        const subRes1 = await supabase
-          .from("owner_subscriptions")
-          .select("multiplier")
-          .eq("user_id", uid)
-          .eq("subscription_serno", selectedSub)
-          .maybeSingle();
-
-        if (subRes1.error) throw subRes1.error;
-
-        if (
-          subRes1.data?.multiplier != null &&
-          Number.isFinite(Number(subRes1.data.multiplier))
-        ) {
-          multiplier = Number(subRes1.data.multiplier);
-        } else {
-          // 7b) owner_subscriptions (user_id’siz dene — bazı yapılarda row bu şekilde bulunuyor)
-          const subRes2 = await supabase
-            .from("owner_subscriptions")
-            .select("multiplier")
-            .eq("subscription_serno", selectedSub)
-            .maybeSingle();
-
-          if (subRes2.error) throw subRes2.error;
-
-          if (
-            subRes2.data?.multiplier != null &&
-            Number.isFinite(Number(subRes2.data.multiplier))
-          ) {
-            multiplier = Number(subRes2.data.multiplier);
-          }
-        }
 
         // demand_monthly
         const dmRes = await supabase
@@ -603,6 +605,7 @@ export default function InvoiceDetail() {
         // 9) YEKDEM mahsup (M-1 için)
         let yekdemMahsupValue = 0;
         let hasYekdemMahsup = false;
+        let yekdemMissing: "none" | "value" | "final" | "both" = "both";
 
         try {
           const billingMonth = dayjsTR().year(periodYear).month(periodMonth - 1); // M
@@ -627,13 +630,14 @@ export default function InvoiceDetail() {
               0
             );
           } else {
-            const hourlyPrev = await supabase
-              .from("consumption_hourly")
-              .select("ts, cn")
-              .eq("user_id", uid)
-              .eq("subscription_serno", selectedSub)
-              .gte("ts", prevStart.toDate().toISOString())
-              .lt("ts", prevEndExclusive.toDate().toISOString());
+            const hourlyPrev = await fetchAllConsumption({
+              supabase,
+              userId: uid,
+              subscriptionSerno: selectedSub,
+              columns: "ts, cn",
+              startIso: prevStart.toDate().toISOString(),
+              endIso: prevEndExclusive.toDate().toISOString(),
+            });
 
             if (!hourlyPrev.error && hourlyPrev.data?.length) {
               prevPeriodKwh = hourlyPrev.data.reduce(
@@ -651,24 +655,28 @@ export default function InvoiceDetail() {
               month: prevForYekdem.month() + 1,
             });
 
-            if (
-              yRow &&
-              yRow.yekdem_value != null &&
-              yRow.yekdem_final != null
-            ) {
-              const yekdemOld = Number(yRow.yekdem_value);
-              const yekdemNew = Number(yRow.yekdem_final);
+            if (yRow) {
+              const hasValue = yRow.yekdem_value != null;
+              const hasFinal = yRow.yekdem_final != null;
 
-              yekdemMahsupValue = calculateYekdemMahsup({
-                totalKwh: prevPeriodKwh,
-                kbk,
-                btvRate,
-                vatRate,
-                yekdemOld,
-                yekdemNew,
-              });
-
-              hasYekdemMahsup = true;
+              if (hasValue && hasFinal) {
+                yekdemMahsupValue = calculateYekdemMahsup({
+                  totalKwh: prevPeriodKwh,
+                  kbk,
+                  btvRate,
+                  vatRate,
+                  yekdemOld: Number(yRow.yekdem_value),
+                  yekdemNew: Number(yRow.yekdem_final),
+                });
+                hasYekdemMahsup = true;
+                yekdemMissing = "none";
+              } else if (!hasValue && !hasFinal) {
+                yekdemMissing = "both";
+              } else if (!hasValue) {
+                yekdemMissing = "value";
+              } else {
+                yekdemMissing = "final";
+              }
             }
           }
         } catch (e) {
@@ -784,6 +792,7 @@ try {
             lastThreeMonths,
             yekdemMahsup: yekdemMahsupValue,
             hasYekdemMahsup,
+            yekdemMissing,
             totalWithMahsup,
             reactivePenaltyCharge,
             reactiveRiPercent: riPercent,
@@ -808,9 +817,11 @@ try {
     };
   }, [uid, sessionLoading, selectedSub]);
 
-  const selectedSubLabel =
-    subs.find((s) => s.subscriptionSerNo === selectedSub)?.title ??
-    (selectedSub != null ? `Tesis ${selectedSub}` : "Tesis seçilmedi");
+  const selectedSubLabel = (() => {
+    const s = subs.find((s) => s.subscriptionSerNo === selectedSub);
+    if (!s) return selectedSub != null ? `Tesis ${selectedSub}` : "Tesis seçilmedi";
+    return s.nickname ?? s.title ?? `Tesis ${s.subscriptionSerNo}`;
+  })();
 
   const demandInfo = useMemo(() => {
     if (!data) return null;
@@ -860,7 +871,7 @@ const isDualTerm = data?.tariffType === "dual";
               {subs.length === 0 && <option value="">Tesis bulunamadı</option>}
               {subs.map((s) => (
                 <option key={s.subscriptionSerNo} value={s.subscriptionSerNo}>
-                  {s.title ?? `Tesis ${s.subscriptionSerNo}`}
+                  {s.nickname ?? s.title ?? `Tesis ${s.subscriptionSerNo}`}
                 </option>
               ))}
             </select>
@@ -1101,7 +1112,7 @@ const isDualTerm = data?.tariffType === "dual";
                     <td className="py-2 pr-4">Dağıtım Bedeli</td>
                     <td className="py-2 pr-4 text-neutral-600">
                       {fmtUnit(data.unitPriceDistribution)} TL/kWh ×{" "}
-                      {fmtKwh(data.totalConsumptionKwh)} kWh
+                      {fmtKwh(data.breakdown.distributionBaseKwh)} kWh
                     </td>
                     <td className="py-2 pr-4 text-right">
                       {fmtMoney2(data.breakdown.distributionCharge)}
@@ -1204,7 +1215,11 @@ const isDualTerm = data?.tariffType === "dual";
                       }
                     >
                       {!data.hasYekdemMahsup
-                        ? "Önceki dönem için yekdem_final girilmemiş."
+                        ? data.yekdemMissing === "value"
+                          ? "Önceki dönem için yekdem_value girilmemiş."
+                          : data.yekdemMissing === "final"
+                          ? "Önceki dönem için yekdem_final girilmemiş."
+                          : "Önceki dönem YEKDEM verileri girilmemiş."
                         : `${data.yekdemMahsup > 0 ? "+" : "-"}${fmtMoney2(Math.abs(data.yekdemMahsup))} TL`}
 
  

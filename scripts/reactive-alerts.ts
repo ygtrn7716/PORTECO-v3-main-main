@@ -14,6 +14,9 @@ const SMS_SENDER = process.env.SMS_SENDER ?? "ECOENERJI";
 const ILETIM_KEY = process.env.ILETIMERKEZI_KEY ?? "";
 const ILETIM_HASH = process.env.ILETIMERKEZI_HASH ?? "";
 
+const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
+const RESEND_FROM = process.env.RESEND_FROM ?? "";
+
 /* ── Supabase Client ── */
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
@@ -112,6 +115,53 @@ async function sendSms(phone: string, text: string): Promise<string | null> {
   return body;
 }
 
+/* ── Email Gonderim (Resend) ── */
+
+async function sendEmail(to: string, subject: string, text: string): Promise<string | null> {
+  if (!RESEND_API_KEY || !RESEND_FROM) return null;
+
+  const resp = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ from: RESEND_FROM, to: [to], subject, text }),
+  });
+
+  const body = await resp.text();
+
+  if (!resp.ok) {
+    throw new Error(`Email error: ${resp.status} ${body}`);
+  }
+
+  return body;
+}
+
+/* ── Email Log ── */
+
+async function logEmail(params: {
+  userId: string;
+  subscriptionSerno: number;
+  emailAddress: string;
+  subject: string;
+  messageBody: string;
+  status: "sent" | "failed";
+  providerResponse?: string | null;
+  errorMessage?: string | null;
+}) {
+  await supabase.from("email_logs").insert({
+    user_id: params.userId,
+    subscription_serno: String(params.subscriptionSerno),
+    email_address: params.emailAddress,
+    subject: params.subject,
+    message_body: params.messageBody,
+    status: params.status,
+    provider_response: params.providerResponse ? { raw: params.providerResponse } : null,
+    error_message: params.errorMessage ?? null,
+  });
+}
+
 /* ── SMS Log ── */
 
 async function logSms(params: {
@@ -151,6 +201,10 @@ async function main() {
     log("WARNING: Missing ILETIMERKEZI credentials - SMS will not be sent");
   }
 
+  if (!RESEND_API_KEY || !RESEND_FROM) {
+    log("WARNING: Missing RESEND credentials - Email will not be sent");
+  }
+
   const periodYM = trYM();
   log(`Period: ${periodYM}`);
 
@@ -178,10 +232,11 @@ async function main() {
   log(`Found ${emailsByUser.size} users with integrations`);
 
   // 2) Her user icin tesisler + ay-to-date reaktif oranlar
-  let sent = 0;
+  let smsSent = 0;
+  let emailSent = 0;
   let errorCount = 0;
 
-  for (const [userId, _toEmails] of emailsByUser.entries()) {
+  for (const [userId] of emailsByUser.entries()) {
     // user_phone_numbers tablosundan aktif telefonlari al
     const { data: phoneRows } = await supabase
       .from("user_phone_numbers")
@@ -195,7 +250,20 @@ async function main() {
       receive_alerts: boolean;
     }[];
 
-    if (phones.length === 0) continue; // Telefon numarasi yoksa atla
+    // user_emails tablosundan aktif emailleri al
+    const { data: emailRows } = await supabase
+      .from("user_emails")
+      .select("email, receive_warnings, receive_alerts")
+      .eq("user_id", userId)
+      .eq("is_active", true);
+
+    const emails = (emailRows ?? []) as {
+      email: string;
+      receive_warnings: boolean;
+      receive_alerts: boolean;
+    }[];
+
+    if (phones.length === 0 && emails.length === 0) continue;
 
     const { data: subs, error: subsErr } = await supabase
       .from("owner_subscriptions")
@@ -302,7 +370,7 @@ async function main() {
               providerResponse: providerResp,
             });
             log(`SMS sent to ${ph.phone_number}`);
-            sent++;
+            smsSent++;
           } catch (e) {
             const errMsg = (e as Error).message;
             log(`SMS failed to ${ph.phone_number}: ${errMsg}`);
@@ -318,11 +386,52 @@ async function main() {
             errorCount++;
           }
         }
+
+        // Email gonder — her aktif email adresine
+        const targetEmails = emails.filter((e) =>
+          nextLevel === "warn" ? e.receive_warnings : e.receive_alerts
+        );
+
+        const subjectPrefix = `${meterSerial ?? ""} ${title ?? ""}`.trim();
+        const emailSubject =
+          nextLevel === "warn"
+            ? `${subjectPrefix} - Reaktif uyari: sinira yaklasiyor`
+            : `${subjectPrefix} - Reaktif uyari: limit asildi`;
+
+        for (const em of targetEmails) {
+          try {
+            const providerResp = await sendEmail(em.email, emailSubject, text);
+            await logEmail({
+              userId,
+              subscriptionSerno: subNo,
+              emailAddress: em.email,
+              subject: emailSubject,
+              messageBody: text,
+              status: "sent",
+              providerResponse: providerResp,
+            });
+            log(`Email sent to ${em.email}`);
+            emailSent++;
+          } catch (e) {
+            const errMsg = (e as Error).message;
+            log(`Email failed to ${em.email}: ${errMsg}`);
+            await logEmail({
+              userId,
+              subscriptionSerno: subNo,
+              emailAddress: em.email,
+              subject: emailSubject,
+              messageBody: text,
+              status: "failed",
+              errorMessage: errMsg,
+            });
+            errorCount++;
+          }
+        }
       }
     }
   }
 
-  log(`Completed. Sent: ${sent}, Errors: ${errorCount}`);
+  log(`Completed. SMS: ${smsSent}, Email: ${emailSent}, Errors: ${errorCount}`);
   process.exit(0);
 }
 

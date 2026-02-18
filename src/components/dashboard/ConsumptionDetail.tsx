@@ -10,6 +10,8 @@ import { exportConsumptionHourlyXlsx } from "@/components/utils/exportConsumptio
 import { computeMonthInvoiceToDate } from "@/components/utils/calculateInvoiceToDate";
 
 import { ChevronDown } from "lucide-react";
+import { fetchAllConsumption } from "@/lib/paginatedFetch";
+import { resolveSelectedSub } from "@/lib/subscriptionVisibility";
 
 type SubscriptionOption = {
   subscriptionSerNo: number;
@@ -117,7 +119,8 @@ export default function ConsumptionDetail() {
             meter_serial,
             subscription_settings:subscription_settings (
               title,
-              nickname
+              nickname,
+              is_hidden
             )
           `
           )
@@ -127,34 +130,34 @@ export default function ConsumptionDetail() {
         if (cancel) return;
         if (error) throw error;
 
-        const list: SubscriptionOption[] = (data ?? []).map((r: any) => {
-          // relationship bazen array dönebilir; normalize edelim
-          const ss = Array.isArray(r.subscription_settings)
-            ? r.subscription_settings?.[0]
-            : r.subscription_settings;
+        const list: SubscriptionOption[] = (data ?? [])
+          .filter((r: any) => {
+            const ss = Array.isArray(r.subscription_settings)
+              ? r.subscription_settings?.[0]
+              : r.subscription_settings;
+            return !(ss?.is_hidden);
+          })
+          .map((r: any) => {
+            const ss = Array.isArray(r.subscription_settings)
+              ? r.subscription_settings?.[0]
+              : r.subscription_settings;
 
-          const nick = (ss?.nickname ?? ss?.title ?? null) as string | null;
+            const nick = (ss?.nickname ?? ss?.title ?? null) as string | null;
 
-          return {
-            subscriptionSerNo: Number(r.subscription_serno),
-            meterSerial: r.meter_serial ?? null,
-            nickname: nick,
-          };
-        });
+            return {
+              subscriptionSerNo: Number(r.subscription_serno),
+              meterSerial: r.meter_serial ?? null,
+              nickname: nick,
+            };
+          });
 
         setSubs(list);
 
-        if (list.length > 0) {
-          const ok =
-            selectedSub != null &&
-            list.some((s) => s.subscriptionSerNo === selectedSub);
-          const next = ok ? selectedSub! : list[0].subscriptionSerNo;
-          setSelectedSub(next);
-          localStorage.setItem(LS_SUB_KEY, String(next));
-        } else {
-          setSelectedSub(null);
-          localStorage.removeItem(LS_SUB_KEY);
-        }
+        const next = resolveSelectedSub(
+          list.map((s) => s.subscriptionSerNo),
+          selectedSub,
+        );
+        setSelectedSub(next);
       } catch (e: any) {
         if (!cancel) {
           console.error("subscription list (consumption) error:", e);
@@ -236,13 +239,14 @@ export default function ConsumptionDetail() {
           return;
         }
 
-        const hourly = await supabase
-          .from("consumption_hourly")
-          .select("ts, cn")
-          .eq("user_id", uid)
-          .eq("subscription_serno", selectedSub)
-          .gte("ts", start.toDate().toISOString())
-          .lt("ts", endCurrentMonth.toDate().toISOString());
+        const hourly = await fetchAllConsumption({
+          supabase,
+          userId: uid,
+          subscriptionSerno: selectedSub,
+          columns: "ts, cn",
+          startIso: start.toDate().toISOString(),
+          endIso: endCurrentMonth.toDate().toISOString(),
+        });
 
         if (cancel) return;
         if (hourly.error) throw hourly.error;
@@ -302,13 +306,15 @@ export default function ConsumptionDetail() {
           return;
         }
 
-        const hourly = await supabase
-          .from("consumption_hourly")
-          .select("ts, cn")
-          .eq("user_id", uid)
-          .eq("subscription_serno", selectedSub)
-          .gte("ts", start.toDate().toISOString())
-          .lte("ts", nowLocal.toDate().toISOString());
+        const hourly = await fetchAllConsumption({
+          supabase,
+          userId: uid,
+          subscriptionSerno: selectedSub,
+          columns: "ts, cn",
+          startIso: start.toDate().toISOString(),
+          endIso: nowLocal.toDate().toISOString(),
+          endInclusive: true,
+        });
 
         if (cancel) return;
         if (hourly.error) throw hourly.error;
@@ -598,7 +604,7 @@ useEffect(() => {
                     <td className="py-2 pr-4">Dağıtım Bedeli</td>
                     <td className="py-2 pr-4 text-neutral-600">
                       {fmtUnit6(invoiceToDate.unitPriceDistribution)} TL/kWh ×{" "}
-                      {fmtKwh(invoiceToDate.totalConsumptionKwh)} kWh
+                      {fmtKwh(invoiceToDate.breakdown.distributionBaseKwh)} kWh
                     </td>
                     <td className="py-2 pr-4 text-right">
                       {fmtMoney2(invoiceToDate.breakdown.distributionCharge)}
@@ -694,7 +700,11 @@ useEffect(() => {
                       }
                     >
                       {!invoiceToDate.hasYekdemMahsup
-                        ? "Önceki dönem için yekdem_final girilmemiş."
+                        ? invoiceToDate.yekdemMissing === "value"
+                          ? "Önceki dönem için yekdem_value girilmemiş."
+                          : invoiceToDate.yekdemMissing === "final"
+                          ? "Önceki dönem için yekdem_final girilmemiş."
+                          : "Önceki dönem YEKDEM verileri girilmemiş."
                         : `${invoiceToDate.yekdemMahsup > 0 ? "+" : "-"}${fmtMoney2(
                             Math.abs(invoiceToDate.yekdemMahsup)
                           )} TL`}

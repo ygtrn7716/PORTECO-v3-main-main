@@ -18,6 +18,7 @@ export default function SubscriptionSettingsAdmin() {
           { key: "user_id", label: "user_id", type: "uuid" },
           { key: "title", label: "title", type: "text" },
           { key: "subscription_serno", label: "subscription_serno", type: "number" },
+          { key: "meter_serial", label: "meter_serial", type: "text", readOnly: true },
           { key: "kbk", label: "kbk", type: "number" },
           { key: "terim", label: "terim", type: "enum", options: ["tek_terim", "cift_terim"] },
           { key: "gerilim", label: "gerilim", type: "enum", options: ["OG", "AG"] },

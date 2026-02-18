@@ -112,7 +112,7 @@ export default function AlternateTariffInvoiceSection(props: {
 
         const { data: settings, error: settingsErr } = await supabase
           .from("subscription_settings")
-          .select("terim, gerilim, tarife, btv_enabled")
+          .select("terim, gerilim, tarife")
           .eq("user_id", uid)
           .eq("subscription_serno", subscriptionSerno)
           .maybeSingle();
@@ -123,12 +123,22 @@ export default function AlternateTariffInvoiceSection(props: {
           throw new Error("Tesis ayarları eksik (terim/gerilim/tarife).");
         }
 
+        // btv_enabled: owner_subscriptions'dan al
+        const { data: osData } = await supabase
+          .from("owner_subscriptions")
+          .select("btv_enabled")
+          .eq("user_id", uid)
+          .eq("subscription_serno", subscriptionSerno)
+          .maybeSingle();
+
+        if (cancel) return;
+        const btvEnabled = osData?.btv_enabled ?? true;
+
         const currentTerm = mapTariffTypeToTerm(tariffType);
         const altTerm = flipTerm(currentTerm);
 
         const gerilim = String(settings.gerilim);
         const tarife = String(settings.tarife);
-        const btvEnabled = settings.btv_enabled ?? true;
 
         const altGerilim = altTerm === "cift_terim" ? ogLike(gerilim) : gerilim;
 
@@ -404,7 +414,7 @@ export default function AlternateTariffInvoiceSection(props: {
                 <tr className="border-b border-neutral-100">
                   <td className="py-2 pr-4">Dağıtım Bedeli</td>
                   <td className="py-2 pr-4 text-neutral-600">
-                    {fmtUnit(altMeta.altUnitPriceDistribution)} TL/kWh × {fmtKwh(totalConsumptionKwh)} kWh
+                    {fmtUnit(altMeta.altUnitPriceDistribution)} TL/kWh × {fmtKwh(altBreakdown.distributionBaseKwh)} kWh
                   </td>
                   <td className="py-2 pr-4 text-right">{fmtMoney2(altBreakdown.distributionCharge)}</td>
                 </tr>
