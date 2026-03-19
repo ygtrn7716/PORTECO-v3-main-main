@@ -14,6 +14,7 @@ import {
   Menu,
   X,
   Zap,
+  Sun,
 } from "lucide-react";
 
 type Item = {
@@ -31,6 +32,12 @@ const NAV_ITEMS: Item[] = [
     to: "/dashboard",
     short: "Panel",
     icon: <LayoutDashboard className={ICON_CLASS} />,
+  },
+  {
+    label: "GES Üretim",
+    to: "/dashboard/ges",
+    short: "GES",
+    icon: <Sun className={ICON_CLASS} />,
   },
   {
     label: "Grafikler",

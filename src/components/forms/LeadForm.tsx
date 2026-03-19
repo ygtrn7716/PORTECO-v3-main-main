@@ -1,65 +1,86 @@
-// ===============================
-// File: src/components/forms/LeadForm.tsx
-// Mini "İletişime Geç" formu – Perakende Satış sayfasında kullanılacak
-// ===============================
-
 import { useState } from "react";
+import { supabase } from "@/lib/supabase";
 import { Button } from "@/components/ui/button";
+import { Loader2 } from "lucide-react";
 
 export default function LeadForm({
   featureSlug,
   featureTitle,
-  submitUrl = "/api/contact.php", // cPanel/public_html altında api/contact.php olacak
 }: {
   featureSlug: string;
   featureTitle: string;
-  submitUrl?: string;
 }) {
-  const [fullName, setFullName] = useState("");
-  const [phone, setPhone] = useState("");
-  const [email, setEmail] = useState("");
-  const [monthlyKwh, setMonthlyKwh] = useState<string>("");
-  const [message, setMessage] = useState("");
-
+  const [form, setForm] = useState({
+    firstName: "",
+    lastName: "",
+    email: "",
+    phone: "",
+    message: "",
+  });
   const [submitting, setSubmitting] = useState(false);
-  const [done, setDone] = useState<null | { ok: boolean; error?: string }>(null);
+  const [result, setResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
-  const emailOk = /.+@.+\..+/.test(email);
+  const set =
+    (key: keyof typeof form) =>
+    (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
+      setForm((f) => ({ ...f, [key]: e.target.value }));
+
+  const emailOk = /.+@.+\..+/.test(form.email);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!fullName.trim() || !phone.trim() || !emailOk) {
-      setDone({ ok: false, error: "Lütfen zorunlu alanları kontrol edin." });
+    setResult(null);
+
+    if (!form.firstName.trim()) {
+      setResult({ ok: false, msg: "Ad alanı zorunludur." });
+      return;
+    }
+    if (!form.phone.trim()) {
+      setResult({ ok: false, msg: "Telefon alanı zorunludur." });
+      return;
+    }
+    if (!emailOk) {
+      setResult({ ok: false, msg: "Geçerli bir e-posta adresi girin." });
+      return;
+    }
+    if (form.message.trim().length > 0 && form.message.trim().length < 10) {
+      setResult({ ok: false, msg: "Mesaj en az 10 karakter olmalıdır." });
       return;
     }
 
     setSubmitting(true);
-    setDone(null);
     try {
-      const res = await fetch(submitUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          feature: featureTitle,
-          featureSlug,
-          fullName,
-          phone,
-          email,
-          monthlyKwh,
-          message,
-        }),
+      const contactRecord = {
+        first_name: form.firstName.trim(),
+        last_name: form.lastName.trim() || null,
+        email: form.email.trim(),
+        phone: form.phone.trim(),
+        message: form.message.trim()
+          ? `[${featureTitle}] ${form.message.trim()}`
+          : `[${featureTitle}] Bilgi talebi`,
+      };
+
+      const { error } = await supabase
+        .from("contact_messages")
+        .insert(contactRecord);
+
+      if (error) throw error;
+
+      setResult({
+        ok: true,
+        msg: "Mesajınız başarıyla gönderildi. En kısa sürede size dönüş yapacağız.",
       });
-      const data = await res.json().catch(() => ({ ok: false }));
-      setDone({ ok: !!data?.ok, error: data?.error });
-      if (data?.ok) {
-        setFullName("");
-        setPhone("");
-        setEmail("");
-        setMonthlyKwh("");
-        setMessage("");
-      }
-    } catch (err) {
-      setDone({ ok: false, error: "Bağlantı hatası" });
+      setForm({ firstName: "", lastName: "", email: "", phone: "", message: "" });
+
+      // Edge Function ile SMS bildirim (fire-and-forget)
+      supabase.functions
+        .invoke("contact-notify", { body: { record: contactRecord } })
+        .catch((err) => console.error("SMS notify failed:", err));
+    } catch {
+      setResult({
+        ok: false,
+        msg: "Mesaj gönderilemedi. Lütfen tekrar deneyin.",
+      });
     } finally {
       setSubmitting(false);
     }
@@ -69,99 +90,123 @@ export default function LeadForm({
     <section id="iletisim-formu" className="mt-8">
       <div className="rounded-2xl border border-black/10 bg-white p-5 md:p-6 shadow-sm">
         <div className="mb-4">
-          <h2 className="text-lg md:text-xl font-semibold text-neutral-900">İletişime Geç</h2>
+          <h2 className="text-lg md:text-xl font-semibold text-neutral-900">
+            İletişime Geç
+          </h2>
           <p className="text-neutral-600 text-sm mt-1">
-            Aşağıdaki formu doldurun, ekibimiz en kısa sürede sizinle iletişime geçsin.
+            Aşağıdaki formu doldurun, ekibimiz en kısa sürede sizinle iletişime
+            geçsin.
           </p>
         </div>
 
-        {done?.ok ? (
+        {result?.ok ? (
           <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-emerald-800">
-            Teşekkürler! Talebiniz bize ulaştı. En kısa sürede dönüş yapacağız.
+            {result.msg}
           </div>
         ) : (
           <form onSubmit={onSubmit} className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {/* İsim Soyisim */}
-            <div className="md:col-span-1">
-              <label className="block text-sm font-medium text-neutral-700">İsim Soyisim *</label>
+            {/* Ad */}
+            <div>
+              <label className="block text-sm font-medium text-neutral-700">
+                Ad *
+              </label>
               <input
                 type="text"
                 required
-                value={fullName}
-                onChange={(e) => setFullName(e.target.value)}
-                placeholder="Adınız Soyadınız"
-                className="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-brand/40"
+                value={form.firstName}
+                onChange={set("firstName")}
+                placeholder="Adınız"
+                className="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-brand-blue/40"
               />
             </div>
 
-            {/* Telefon */}
-            <div className="md:col-span-1">
-              <label className="block text-sm font-medium text-neutral-700">Telefon *</label>
+            {/* Soyad */}
+            <div>
+              <label className="block text-sm font-medium text-neutral-700">
+                Soyad
+              </label>
               <input
-                type="tel"
-                required
-                value={phone}
-                onChange={(e) => setPhone(e.target.value)}
-                placeholder="05xx xxx xx xx"
-                className="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-brand/40"
+                type="text"
+                value={form.lastName}
+                onChange={set("lastName")}
+                placeholder="Soyadınız"
+                className="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-brand-blue/40"
               />
             </div>
 
-            {/* E‑posta */}
-            <div className="md:col-span-1">
-              <label className="block text-sm font-medium text-neutral-700">E‑posta *</label>
+            {/* E-posta */}
+            <div>
+              <label className="block text-sm font-medium text-neutral-700">
+                E-posta *
+              </label>
               <input
                 type="email"
                 required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                value={form.email}
+                onChange={set("email")}
                 placeholder="ornek@firma.com"
-                className="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-brand/40"
+                className="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-brand-blue/40"
               />
-              {!emailOk && email.length > 0 && (
-                <p className="mt-1 text-xs text-red-600">Geçerli bir e‑posta girin.</p>
+              {!emailOk && form.email.length > 0 && (
+                <p className="mt-1 text-xs text-red-600">
+                  Geçerli bir e-posta girin.
+                </p>
               )}
             </div>
 
-            {/* Aylık ort. tüketim */}
-            <div className="md:col-span-1">
-              <label className="block text-sm font-medium text-neutral-700">Aylık Ortalama Tüketim (kWh)</label>
+            {/* Telefon */}
+            <div>
+              <label className="block text-sm font-medium text-neutral-700">
+                Telefon *
+              </label>
               <input
-                type="number"
-                min={0}
-                step={1}
-                inputMode="numeric"
-                value={monthlyKwh}
-                onChange={(e) => setMonthlyKwh(e.target.value)}
-                placeholder="örn. 120000"
-                className="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-brand/40"
+                type="tel"
+                required
+                value={form.phone}
+                onChange={set("phone")}
+                placeholder="05xx xxx xx xx"
+                className="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-brand-blue/40"
               />
             </div>
 
-            {/* Not */}
+            {/* Mesaj */}
             <div className="md:col-span-2">
-              <label className="block text-sm font-medium text-neutral-700">Açıklamak istediğiniz başka bir şey</label>
+              <label className="block text-sm font-medium text-neutral-700">
+                Mesajınız
+              </label>
               <textarea
-                value={message}
-                onChange={(e) => setMessage(e.target.value)}
+                value={form.message}
+                onChange={set("message")}
                 rows={4}
                 placeholder="Kısaca belirtin (opsiyonel)"
-                className="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-brand/40"
+                className="mt-1 w-full rounded-lg border border-neutral-300 bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-brand-blue/40"
               />
             </div>
 
             {/* Hata */}
-            {done && !done.ok && (
+            {result && !result.ok && (
               <div className="md:col-span-2">
                 <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-                  {done.error || "Gönderim sırasında bir sorun oluştu."}
+                  {result.msg}
                 </div>
               </div>
             )}
 
-            <div className=" md:col-span-2 flex justify-end">
-              <Button  type="submit" size="lg" disabled={submitting} className="bg-[#0A59E0] hover:bg-[#0A59E0]/90 text-white focus-visible:ring-2 focus-visible:ring-[#0A59E0]/30">
-                {submitting ? "Gönderiliyor…" : "Gönder"}
+            <div className="md:col-span-2 flex justify-end">
+              <Button
+                type="submit"
+                size="lg"
+                disabled={submitting}
+                className="bg-[#0A59E0] hover:bg-[#0A59E0]/90 text-white focus-visible:ring-2 focus-visible:ring-[#0A59E0]/30"
+              >
+                {submitting ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                    Gönderiliyor…
+                  </>
+                ) : (
+                  "Gönder"
+                )}
               </Button>
             </div>
           </form>
@@ -169,67 +214,4 @@ export default function LeadForm({
       </div>
     </section>
   );
-
 }
-
-// ===============================
-// PATCH: src/pages/FeatureDetail.tsx (ilgili kısım)
-// – import ekleyin ve Perakende Satış sayfasında 2 karttan sonra formu gösterin
-// ===============================
-// import LeadForm from "@/components/forms/LeadForm"; // <— dosyanın tepesine ekleyin
-
-// ... mevcut içerik render'ından sonra, CTA'dan ÖNCE şu blok:
-// {feature.slug === "perakende-satis" && (
-//   <LeadForm
-//     featureSlug={feature.slug}
-//     featureTitle={feature.title}
-//     submitUrl="/api/contact.php" // cPanel'de /public_html/api/contact.php
-//   />
-// )}
-
-
-// ===============================
-// File (server): public_html/api/contact.php  (cPanel'de oluşturun)
-// Basit mail() ile gönderim – SMTP/PHPMailer kuruluysa ona geçebilirsiniz
-// ===============================
-/*
-<?php
-header('Content-Type: application/json; charset=utf-8');
-header('Access-Control-Allow-Methods: POST');
-
-$raw = file_get_contents('php://input');
-$data = json_decode($raw, true);
-
-$fullName   = trim($data['fullName'] ?? '');
-$phone      = trim($data['phone'] ?? '');
-$email      = trim($data['email'] ?? '');
-$monthlyKwh = trim($data['monthlyKwh'] ?? '');
-$message    = trim($data['message'] ?? '');
-$feature    = trim($data['feature'] ?? 'Genel Talep');
-
-if ($fullName === '' || $phone === '' || $email === '') {
-  http_response_code(400);
-  echo json_encode(['ok' => false, 'error' => 'missing_fields']);
-  exit;
-}
-
-$to = 'destek@SENIN-ALANADIN.com'; // TODO: kendi mail adresin
-$subject = 'Yeni Talep – ' . $feature;
-$body = "\n— Yeni Talep —\n" .
-        "Özellik: $feature\n" .
-        "İsim Soyisim: $fullName\n" .
-        "Telefon: $phone\n" .
-        "E-posta: $email\n" .
-        "Aylık Tüketim (kWh): $monthlyKwh\n" .
-        "Mesaj: $message\n" .
-        "Tarih: " . date('Y-m-d H:i:s') . "\n";
-
-$headers = 'From: no-reply@SENIN-ALANADIN.com' . "\r\n" .
-           'Reply-To: ' . $email . "\r\n" .
-           'Content-Type: text/plain; charset=UTF-8' . "\r\n";
-
-$ok = @mail($to, $subject, $body, $headers);
-
-echo json_encode(['ok' => (bool)$ok]);
-?>
-*/

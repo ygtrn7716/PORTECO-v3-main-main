@@ -17,9 +17,12 @@ type SubscriptionOption = {
 
 type Row = {
   ts: string; // ISO
-  kwh: number;
+  kwh: number;         // çekiş (cn)
+  gn: number;          // veriş (gn)
+  gesKwh: number;      // GES saatlik üretim
   ptf_tl_mwh: number | null;
-  tl: number | null; // kwh * ptf / 1000
+  tl: number | null;        // çekiş maliyeti: kwh * ptf / 1000
+  verisTl: number | null;   // veriş geliri: gn * ptf / 1000
 };
 
 const LS_SUB_KEY = "eco_selected_sub";
@@ -87,6 +90,9 @@ export default function PtfDetail() {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // GES
+  const [hasGes, setHasGes] = useState(false);
+
   // export
   const [exporting, setExporting] = useState(false);
   const [exportErr, setExportErr] = useState<string | null>(null);
@@ -96,19 +102,27 @@ export default function PtfDetail() {
     let totalKwh = 0;
     let coveredKwh = 0;
     let totalTl = 0;
+    let totalGn = 0;
+    let totalVerisTl = 0;
+    let totalGesKwh = 0;
 
     for (const r of rows) {
       totalKwh += r.kwh || 0;
+      totalGn += r.gn || 0;
+      totalGesKwh += r.gesKwh || 0;
       if (r.ptf_tl_mwh != null && r.tl != null) {
         coveredKwh += r.kwh || 0;
         totalTl += r.tl || 0;
+      }
+      if (r.ptf_tl_mwh != null && r.verisTl != null) {
+        totalVerisTl += r.verisTl || 0;
       }
     }
 
     const monthlyPtf = coveredKwh > 0 ? totalTl / coveredKwh : null;
     const missingKwh = totalKwh - coveredKwh;
 
-    return { totalKwh, coveredKwh, missingKwh, totalTl, monthlyPtf };
+    return { totalKwh, coveredKwh, missingKwh, totalTl, monthlyPtf, totalGn, totalVerisTl, totalGesKwh };
   }, [rows]);
 
   const monthLabel = useMemo(() => {
@@ -228,14 +242,17 @@ export default function PtfDetail() {
         const start = dayjsTR().year(year).month(month - 1).startOf("month");
         const end = start.clone().add(1, "month");
 
+        const startIso = start.toDate().toISOString();
+        const endIso = end.toDate().toISOString();
+
         // consumption (paginated - PostgREST max_rows limiti aşılmasın)
         const cons = await fetchAllConsumption({
           supabase,
           userId: uid,
           subscriptionSerno: selectedSub,
-          columns: "ts, cn",
-          startIso: start.toDate().toISOString(),
-          endIso: end.toDate().toISOString(),
+          columns: "ts, cn, gn",
+          startIso,
+          endIso,
         });
 
         if (cancel) return;
@@ -245,13 +262,45 @@ export default function PtfDetail() {
         const ptf = await fetchAllPtf({
           supabase,
           columns: "ts, ptf_tl_mwh",
-          startIso: start.toDate().toISOString(),
-          endIso: end.toDate().toISOString(),
+          startIso,
+          endIso,
         });
 
         if (cancel) return;
         if (ptf.error) throw ptf.error;
 
+        // GES saatlik üretim verisi
+        const { data: gesPlants } = await supabase
+          .from("ges_plants")
+          .select("id")
+          .eq("user_id", uid)
+          .eq("is_active", true);
+
+        if (cancel) return;
+
+        const gesHourlyMap = new Map<number, number>();
+        const gesFound = (gesPlants ?? []).length > 0;
+        setHasGes(gesFound);
+
+        if (gesFound) {
+          const plantIds = (gesPlants ?? []).map((p: any) => p.id);
+          const { data: gesHourly } = await supabase
+            .from("ges_production_hourly")
+            .select("ts, energy_kwh")
+            .in("ges_plant_id", plantIds)
+            .gte("ts", startIso)
+            .lt("ts", endIso)
+            .order("ts");
+
+          if (cancel) return;
+
+          for (const row of gesHourly ?? []) {
+            const hk = hourKey(String(row.ts));
+            gesHourlyMap.set(hk, (gesHourlyMap.get(hk) || 0) + (Number(row.energy_kwh) || 0));
+          }
+        }
+
+        // PTF map
         const ptfMap = new Map<number, number>();
         for (const r of (ptf.data ?? []) as any[]) {
           const ts = String(r.ts);
@@ -259,17 +308,21 @@ export default function PtfDetail() {
           if (Number.isFinite(v)) ptfMap.set(hourKey(ts), v);
         }
 
+        // Merge
         const out: Row[] = [];
         for (const r of (cons.data ?? []) as any[]) {
           const ts = String(r.ts);
           const kwh = Number(r.cn) || 0;
+          const gn = Number(r.gn) || 0;
+          const gesKwh = gesHourlyMap.get(hourKey(ts)) || 0;
 
           const p = ptfMap.get(hourKey(ts));
           const ptf_tl_mwh = p != null ? p : null;
 
           const tl = ptf_tl_mwh != null ? (kwh * ptf_tl_mwh) / 1000.0 : null;
+          const verisTl = ptf_tl_mwh != null ? (gn * ptf_tl_mwh) / 1000.0 : null;
 
-          out.push({ ts, kwh, ptf_tl_mwh, tl });
+          out.push({ ts, kwh, gn, gesKwh, ptf_tl_mwh, tl, verisTl });
         }
 
         setRows(out);
@@ -301,17 +354,24 @@ export default function PtfDetail() {
 
       const excelRows = rows.map((r) => {
         const d = dayjsTR(r.ts);
-        return {
+        const base: Record<string, any> = {
           Tarih: d.format("DD.MM.YYYY"),
           Saat: d.format("HH:00"),
-          "Saatlik Tüketim (kWh)": Number(r.kwh) || 0,
-          "EPİAŞ PTF (TL/MWh)":
+          "PTF (TL/MWh)":
             r.ptf_tl_mwh != null && Number.isFinite(Number(r.ptf_tl_mwh))
               ? Number(r.ptf_tl_mwh)
               : null,
-          "kWh × PTF / 1000 (TL)":
-            r.tl != null && Number.isFinite(Number(r.tl)) ? Number(r.tl) : null,
+          "Çekiş (kWh)": Number(r.kwh) || 0,
+          "Veriş (kWh)": Number(r.gn) || 0,
         };
+        if (hasGes) {
+          base["GES Üretim (kWh)"] = Number(r.gesKwh) || 0;
+        }
+        base["Çekiş Maliyeti (TL)"] =
+          r.tl != null && Number.isFinite(Number(r.tl)) ? Number(r.tl) : null;
+        base["Veriş Geliri (Brüt TL)"] =
+          r.verisTl != null && Number.isFinite(Number(r.verisTl)) ? Number(r.verisTl) : null;
+        return base;
       });
 
       const meter = safeName(selectedMeterSerial ?? String(selectedSub));
@@ -436,20 +496,29 @@ export default function PtfDetail() {
         <div className="text-sm text-neutral-700">
         </div>
 
-        <div className="mt-3 grid grid-cols-1 sm:grid-cols-4 gap-4">
+        <div className="mt-3 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
           <div className="rounded-xl border border-neutral-200 p-4">
-            <div className="text-xs text-neutral-500">Toplam(kWh)</div>
-            <div className="text-lg font-semibold text-neutral-900">{fmtInt(summary.totalKwh)}</div>
+            <div className="text-xs text-neutral-500">Toplam Çekiş</div>
+            <div className="text-lg font-semibold text-neutral-900">{fmtInt(summary.totalKwh)} <span className="text-xs font-normal text-neutral-500">kWh</span></div>
           </div>
           <div className="rounded-xl border border-neutral-200 p-4">
-            <div className="text-xs text-neutral-500">Kapsanan kWh</div>
-            <div className="text-lg font-semibold text-neutral-900">{fmtInt(summary.coveredKwh)}</div>
+            <div className="text-xs text-neutral-500">Toplam Veriş</div>
+            <div className="text-lg font-semibold text-emerald-700">{fmtInt(summary.totalGn)} <span className="text-xs font-normal text-neutral-500">kWh</span></div>
+          </div>
+          {hasGes && (
+            <div className="rounded-xl border border-neutral-200 p-4">
+              <div className="text-xs text-neutral-500">Toplam GES Üretim</div>
+              <div className="text-lg font-semibold text-emerald-700">{fmtInt(summary.totalGesKwh)} <span className="text-xs font-normal text-neutral-500">kWh</span></div>
+            </div>
+          )}
+          <div className="rounded-xl border border-neutral-200 p-4">
+            <div className="text-xs text-neutral-500">Çekiş Maliyeti</div>
+            <div className="text-lg font-semibold text-red-600">{fmt2(summary.totalTl)} <span className="text-xs font-normal text-neutral-500">TL</span></div>
           </div>
           <div className="rounded-xl border border-neutral-200 p-4">
-            <div className="text-xs text-neutral-500">Σ(TL)</div>
-            <div className="text-lg font-semibold text-neutral-900">{fmt2(summary.totalTl)}</div>
+            <div className="text-xs text-neutral-500">Veriş Geliri (Brüt TL)</div>
+            <div className="text-lg font-semibold text-emerald-700">{fmt2(summary.totalVerisTl)} <span className="text-xs font-normal text-neutral-500">TL</span></div>
           </div>
-
         </div>
 
         {summary.missingKwh > 0 && (
@@ -480,21 +549,34 @@ export default function PtfDetail() {
           <table className="min-w-full text-sm">
             <thead>
               <tr className="border-b">
-                <th className="py-2 pr-4 text-left text-xs font-medium text-neutral-500">Gün</th>
-                <th className="py-2 pr-4 text-left text-xs font-medium text-neutral-500">Saat</th>
-                <th className="py-2 pr-4 text-right text-xs font-medium text-neutral-500">
-                  Saatlik Tüketim (kWh)
+                <th className="py-2 pr-3 text-left text-xs font-medium text-neutral-500">Gün</th>
+                <th className="py-2 pr-3 text-left text-xs font-medium text-neutral-500">Saat</th>
+                <th className="py-2 pr-3 text-right text-xs font-medium text-neutral-500">
+                  PTF (TL/MWh)
                 </th>
-                <th className="py-2 pr-4 text-right text-xs font-medium text-neutral-500">
-                  EPİAŞ Saatlik PTF (TL/MWh)
+                <th className="py-2 pr-3 text-right text-xs font-medium text-neutral-500">
+                  ↓ Çekiş (kWh)
                 </th>
-
+                <th className="py-2 pr-3 text-right text-xs font-medium text-neutral-500">
+                  ↑ Veriş (kWh)
+                </th>
+                {hasGes && (
+                  <th className="py-2 pr-3 text-right text-xs font-medium text-neutral-500">
+                    ☀ GES Üretim (kWh)
+                  </th>
+                )}
+                <th className="py-2 pr-3 text-right text-xs font-medium text-neutral-500">
+                  Çekiş Maliyeti (TL)
+                </th>
+                <th className="py-2 pr-3 text-right text-xs font-medium text-neutral-500">
+                  Veriş Geliri (Brüt TL)
+                </th>
               </tr>
             </thead>
             <tbody>
               {rows.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="py-4 text-sm text-neutral-500">
+                  <td colSpan={hasGes ? 8 : 7} className="py-4 text-sm text-neutral-500">
                     Veri yok.
                   </td>
                 </tr>
@@ -502,17 +584,45 @@ export default function PtfDetail() {
                 rows.map((r) => {
                   const d = dayjsTR(r.ts);
                   return (
-                    <tr key={r.ts} className="border-b last:border-0">
-                      <td className="py-2 pr-4">{d.format("DD.MM.YYYY")}</td>
-                      <td className="py-2 pr-4">{d.format("HH:00")}</td>
-                      <td className="py-2 pr-4 text-right">{fmtInt(r.kwh)}</td>
-                      <td className="py-2 pr-4 text-right">{fmt2(r.ptf_tl_mwh)}</td>
-                      
+                    <tr key={r.ts} className="border-b last:border-0 hover:bg-neutral-50/60">
+                      <td className="py-2 pr-3">{d.format("DD.MM.YYYY")}</td>
+                      <td className="py-2 pr-3">{d.format("HH:00")}</td>
+                      <td className="py-2 pr-3 text-right">{fmt2(r.ptf_tl_mwh)}</td>
+                      <td className="py-2 pr-3 text-right">{fmtInt(r.kwh)}</td>
+                      <td className={`py-2 pr-3 text-right ${r.gn > 0 ? "text-emerald-700 bg-emerald-50/50" : ""}`}>
+                        {r.gn > 0 ? fmtInt(r.gn) : "—"}
+                      </td>
+                      {hasGes && (
+                        <td className={`py-2 pr-3 text-right ${r.gesKwh > 0 ? "text-emerald-700 bg-emerald-50/40" : ""}`}>
+                          {r.gesKwh > 0 ? fmt2(r.gesKwh) : "—"}
+                        </td>
+                      )}
+                      <td className={`py-2 pr-3 text-right ${r.tl != null && r.tl > 0 ? "text-red-600" : ""}`}>
+                        {fmt2(r.tl)}
+                      </td>
+                      <td className={`py-2 pr-3 text-right ${r.verisTl != null && r.verisTl > 0 ? "text-emerald-700" : ""}`}>
+                        {r.gn > 0 ? fmt2(r.verisTl) : "—"}
+                      </td>
                     </tr>
                   );
                 })
               )}
             </tbody>
+            {rows.length > 0 && (
+              <tfoot>
+                <tr className="border-t-2 border-neutral-200 font-semibold">
+                  <td className="py-2 pr-3" colSpan={2}>Toplam</td>
+                  <td className="py-2 pr-3 text-right">—</td>
+                  <td className="py-2 pr-3 text-right">{fmtInt(summary.totalKwh)}</td>
+                  <td className="py-2 pr-3 text-right text-emerald-700">{fmtInt(summary.totalGn)}</td>
+                  {hasGes && (
+                    <td className="py-2 pr-3 text-right text-emerald-700">{fmt2(summary.totalGesKwh)}</td>
+                  )}
+                  <td className="py-2 pr-3 text-right text-red-600">{fmt2(summary.totalTl)}</td>
+                  <td className="py-2 pr-3 text-right text-emerald-700">{fmt2(summary.totalVerisTl)}</td>
+                </tr>
+              </tfoot>
+            )}
           </table>
         </div>
       </div>

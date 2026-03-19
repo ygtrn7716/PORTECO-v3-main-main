@@ -11,7 +11,7 @@ export default function PartnersSection() {
   return (
     <section id="partners" className="bg-gradient-to-b from-[#F6F8FB] to-white">
       <Container className="py-10 md:py-20">
-        {/* BASLIK */}
+        {/* BAŞLIK */}
         <motion.div
           className="text-center max-w-2xl mx-auto"
           initial={{ opacity: 0, y: 30 }}
@@ -20,10 +20,10 @@ export default function PartnersSection() {
           transition={{ duration: 0.5 }}
         >
           <h2 className="text-2xl md:text-3xl font-semibold text-neutral-dark">
-            Birlikte Calistigimiz Kurumlar
+            Birlikte Çalıştığımız Kurumlar
           </h2>
           <p className="mt-2 text-neutral-gray">
-            Enerji verimliligi yolculugunda PortEco ayircaligina sahip is ortaklarimiz.
+            Enerji verimliliği yolculuğunda PortEco ayrıcalığına sahip iş ortaklarımız.
           </p>
         </motion.div>
 

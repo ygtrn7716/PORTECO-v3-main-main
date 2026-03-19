@@ -16,34 +16,58 @@ export default function ContactUs() {
   const [sending, setSending] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
-  const set = (key: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
-    setForm((f) => ({ ...f, [key]: e.target.value }));
+  const set =
+    (key: keyof typeof form) =>
+    (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) =>
+      setForm((f) => ({ ...f, [key]: e.target.value }));
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setResult(null);
 
-    if (!form.firstName.trim() || !form.email.trim()) {
-      setResult({ ok: false, msg: "Ad ve e-posta alanlari zorunludur." });
+    if (!form.firstName.trim()) {
+      setResult({ ok: false, msg: "Ad alanı zorunludur." });
+      return;
+    }
+    if (!form.email.trim() || !/.+@.+\..+/.test(form.email)) {
+      setResult({ ok: false, msg: "Geçerli bir e-posta adresi girin." });
+      return;
+    }
+    if (!form.phone.trim()) {
+      setResult({ ok: false, msg: "Telefon alanı zorunludur." });
+      return;
+    }
+    if (form.message.trim().length > 0 && form.message.trim().length < 10) {
+      setResult({ ok: false, msg: "Mesaj en az 10 karakter olmalıdır." });
       return;
     }
 
     setSending(true);
     try {
-      const { error } = await supabase.from("contact_messages").insert({
+      const contactRecord = {
         first_name: form.firstName.trim(),
         last_name: form.lastName.trim() || null,
         email: form.email.trim(),
         phone: form.phone.trim() || null,
         message: form.message.trim() || null,
-      });
+      };
+
+      const { error } = await supabase.from("contact_messages").insert(contactRecord);
 
       if (error) throw error;
 
-      setResult({ ok: true, msg: "Mesajiniz basariyla gonderildi!" });
+      setResult({
+        ok: true,
+        msg: "Mesajınız başarıyla gönderildi. En kısa sürede size dönüş yapacağız.",
+      });
       setForm({ firstName: "", lastName: "", email: "", phone: "", message: "" });
+
+      // Edge Function ile SMS bildirim (fire-and-forget)
+      supabase.functions
+        .invoke("contact-notify", { body: { record: contactRecord } })
+        .catch((err) => console.error("SMS notify failed:", err));
     } catch {
-      setResult({ ok: false, msg: "Gonderim sirasinda bir hata olustu. Lutfen tekrar deneyin." });
+      setResult({ ok: false, msg: "Mesaj gönderilemedi. Lütfen tekrar deneyin." });
     } finally {
       setSending(false);
     }
@@ -63,10 +87,10 @@ export default function ContactUs() {
           viewport={{ once: true, margin: "-80px" }}
           transition={{ duration: 0.5 }}
         >
-          <h2 className="text-3xl md:text-4xl font-bold text-neutral-900">Iletisime Gec</h2>
+          <h2 className="text-3xl md:text-4xl font-bold text-neutral-900">İletişime Geç</h2>
           <p className="mt-3 text-neutral-600">
-            Hizmetlerimizden yararlanmak ve detaylari dinlemek icin asagidan
-            iletisime gecmeyi unutmayin!
+            Hizmetlerimizden yararlanmak ve detayları dinlemek için aşağıdan iletişime geçmeyi
+            unutmayın!
           </p>
         </motion.div>
 
@@ -85,12 +109,12 @@ export default function ContactUs() {
               {[
                 {
                   label: "Telefon",
-                  value: "+90 555 200 3300 - Murat Bahcivanci",
+                  value: "+90 555 200 3300 - Murat Bahçıvancı",
                   href: "tel:+905552003300",
                   icon: <Phone className="h-5 w-5" />,
                 },
                 {
-                  label: "Email",
+                  label: "E-posta",
                   value: "muratbahcivanci@ecoenerji.net.tr",
                   href: "mailto:muratbahcivanci@ecoenerji.net.tr",
                   icon: <Mail className="h-5 w-5" />,
@@ -122,7 +146,7 @@ export default function ContactUs() {
                   <label className="block text-xs text-white/70 mb-1">Ad *</label>
                   <input
                     className={inputClass}
-                    placeholder="Adiniz"
+                    placeholder="Adınız"
                     value={form.firstName}
                     onChange={set("firstName")}
                     required
@@ -132,7 +156,7 @@ export default function ContactUs() {
                   <label className="block text-xs text-white/70 mb-1">Soyad</label>
                   <input
                     className={inputClass}
-                    placeholder="Soyadiniz"
+                    placeholder="Soyadınız"
                     value={form.lastName}
                     onChange={set("lastName")}
                   />
@@ -140,7 +164,7 @@ export default function ContactUs() {
               </div>
 
               <div className="mt-4">
-                <label className="block text-xs text-white/70 mb-1">E-mail Adresi *</label>
+                <label className="block text-xs text-white/70 mb-1">E-posta Adresi *</label>
                 <input
                   type="email"
                   inputMode="email"
@@ -153,7 +177,7 @@ export default function ContactUs() {
               </div>
 
               <div className="mt-4">
-                <label className="block text-xs text-white/70 mb-1">Telefon Numarasi</label>
+                <label className="block text-xs text-white/70 mb-1">Telefon Numarası</label>
                 <input
                   type="tel"
                   inputMode="tel"
@@ -165,11 +189,11 @@ export default function ContactUs() {
               </div>
 
               <div className="mt-4">
-                <label className="block text-xs text-white/70 mb-1">Mesajiniz</label>
+                <label className="block text-xs text-white/70 mb-1">Mesajınız</label>
                 <textarea
                   className={`${inputClass} resize-none`}
                   rows={3}
-                  placeholder="Mesajinizi buraya yazin..."
+                  placeholder="Mesajınızı buraya yazın..."
                   value={form.message}
                   onChange={set("message")}
                 />
@@ -192,12 +216,8 @@ export default function ContactUs() {
                 disabled={sending}
                 className="mt-5 w-full inline-flex items-center justify-center gap-2 rounded-lg bg-[#0A66FF] px-4 py-3 text-sm sm:text-base font-medium text-white hover:bg-[#0a59e0] transition-all duration-200 shadow-[0_6px_20px_rgba(10,102,255,0.35)] disabled:opacity-60 active:scale-[0.98]"
               >
-                {sending ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <Send className="h-4 w-4" />
-                )}
-                {sending ? "Gonderiliyor..." : "Mesaj Gonder"}
+                {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                {sending ? "Gönderiliyor..." : "Mesaj Gönder"}
               </button>
             </form>
           </div>

@@ -13,7 +13,8 @@ module.exports = {
         brand: {
           blue: "#00AEEF",       // Ana mavi
           blueLight: "#40CFFF",  // Hover / açık mavi
-          blueDark: "#005B96"    // Başlık / koyu mavi
+          blueDark: "#005B96",   // Başlık / koyu mavi
+          dark: "#0F1C2E"        // Koyu metin (neutral-dark ile aynı)
         },
         neutral: {
           dark: "#0F1C2E",       // Koyu arka plan

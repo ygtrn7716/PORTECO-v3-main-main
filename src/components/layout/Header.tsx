@@ -14,12 +14,13 @@ export default function Header() {
   const { pathname } = useLocation();
   const isHome = pathname === "/";
   const isHow = pathname.startsWith("/how");
+  const isContact = pathname === "/iletisim";
   const [open, setOpen] = useState(false);
 
   const { session, loading } = useSession();
   const isLoggedIn = !!session;
 
-  const hasDarkHero = isHome || isHow;
+  const hasDarkHero = isHome || isHow || isContact;
 
   const HEADER_H = 64;
   const FADE_SPAN = 32;
@@ -157,6 +158,9 @@ export default function Header() {
             <NavLink to="/blog" className={linkClass} onClick={() => setOpen(false)}>
               Blog
             </NavLink>
+            <NavLink to="/iletisim" className={linkClass} onClick={() => setOpen(false)}>
+              İletişim
+            </NavLink>
             {!loading && isLoggedIn && (
               <NavLink to="/dashboard" className={linkClass} onClick={() => setOpen(false)}>
                 Panel
@@ -235,6 +239,9 @@ export default function Header() {
             </Link>
             <NavLink to="/blog" className={linkClass} onClick={() => setOpen(false)}>
               Blog
+            </NavLink>
+            <NavLink to="/iletisim" className={linkClass} onClick={() => setOpen(false)}>
+              İletişim
             </NavLink>
             {!loading && isLoggedIn && (
               <NavLink to="/dashboard" className={linkClass} onClick={() => setOpen(false)}>

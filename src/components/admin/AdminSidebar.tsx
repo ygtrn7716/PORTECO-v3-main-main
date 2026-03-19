@@ -22,6 +22,7 @@ import {
   AlertTriangle,
   Calculator,
   Mail,
+  Sun,
 } from "lucide-react";
 
 type NavItem = {
@@ -80,6 +81,17 @@ const NAV_CATEGORIES: NavCategory[] = [
       { label: "Invoice Snapshots", to: "/dashboard/admin/invoice-snapshots", icon: <Receipt size={16} /> },
       { label: "Reactive Alerts", to: "/dashboard/admin/reactive-alerts", icon: <AlertTriangle size={16} /> },
       { label: "Aylık Özet", to: "/dashboard/admin/monthly-overview", icon: <Calculator size={16} /> },
+    ],
+  },
+  {
+    title: "GES Yönetimi",
+    icon: <Sun size={18} />,
+    items: [
+      { label: "GES Sağlayıcılar", to: "/dashboard/admin/ges-providers", icon: <Sun size={16} /> },
+      { label: "GES Hesaplar", to: "/dashboard/admin/ges-credentials", icon: <Users size={16} /> },
+      { label: "GES Tesisler", to: "/dashboard/admin/ges-plants", icon: <Building2 size={16} /> },
+      { label: "GES Üretim Verisi", to: "/dashboard/admin/ges-production", icon: <BarChart3 size={16} /> },
+      { label: "GES Sync Logları", to: "/dashboard/admin/ges-sync-logs", icon: <Clock size={16} /> },
     ],
   },
   {

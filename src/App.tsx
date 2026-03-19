@@ -9,6 +9,7 @@ import Login from "./pages/Login";
 import ForgotPassword from "./pages/ForgotPassword";
 import BlogPage from "@/pages/BlogPage";
 import BlogDetailPage from "@/pages/BlogDetailPage";
+import ContactPage from "@/pages/ContactPage";
 
 import ProtectedRoute from "./components/auth/ProtectedRoute";
 import AdminRoute from "@/components/auth/AdminRoute";
@@ -50,6 +51,14 @@ import ContactMessagesAdmin from "@/pages/admin/ContactMessagesAdmin";
 import UserEmailsAdmin from "@/pages/admin/UserEmailsAdmin";
 import EmailLogsAdmin from "@/pages/admin/EmailLogsAdmin";
 
+// GES pages
+import GesDetail from "@/components/dashboard/GesDetail";
+import GesProvidersAdmin from "@/pages/admin/GesProvidersAdmin";
+import GesCredentialsAdmin from "@/pages/admin/GesCredentialsAdmin";
+import GesPlantsAdmin from "@/pages/admin/GesPlantsAdmin";
+import GesProductionAdmin from "@/pages/admin/GesProductionAdmin";
+import GesSyncLogAdmin from "@/pages/admin/GesSyncLogAdmin";
+
 export default function App() {
   const { pathname } = useLocation();
   const isHome = pathname === "/";
@@ -71,6 +80,7 @@ export default function App() {
           <Route path="/forgot-password" element={<ForgotPassword />} />
           <Route path="/blog" element={<BlogPage />} />
           <Route path="/blog/:slug" element={<BlogDetailPage />} />
+          <Route path="/iletisim" element={<ContactPage />} />
 
           {/* Protected */}
           <Route element={<ProtectedRoute />}>
@@ -86,6 +96,7 @@ export default function App() {
             <Route path="/dashboard/yekdem-mahsup" element={<YekdemMahsupDetail />} />
             <Route path="/dashboard/charts" element={<ChartsPage />} />
             <Route path="/dashboard/alerts" element={<AlertsPage />} />
+            <Route path="/dashboard/ges" element={<GesDetail />} />
 
             {/* Admin parent route */}
             <Route path="/dashboard/admin" element={<AdminRoute />}>
@@ -107,6 +118,11 @@ export default function App() {
               <Route path="contact-messages" element={<ContactMessagesAdmin />} />
               <Route path="user-emails" element={<UserEmailsAdmin />} />
               <Route path="email-logs" element={<EmailLogsAdmin />} />
+              <Route path="ges-providers" element={<GesProvidersAdmin />} />
+              <Route path="ges-credentials" element={<GesCredentialsAdmin />} />
+              <Route path="ges-plants" element={<GesPlantsAdmin />} />
+              <Route path="ges-production" element={<GesProductionAdmin />} />
+              <Route path="ges-sync-logs" element={<GesSyncLogAdmin />} />
             </Route>
           </Route>
         </Routes>

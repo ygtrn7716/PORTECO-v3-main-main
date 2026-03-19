@@ -98,7 +98,7 @@ export default function Footer({ variant = "light", className = "" }: FooterProp
                 </Link>
               </li>
               <li>
-                <Link to="/#contact" className={subLinkClass}>
+                <Link to="/iletisim" className={subLinkClass}>
                   İletişime Geç
                 </Link>
               </li>

@@ -4,8 +4,8 @@ import { Monitor, Smartphone, BarChart3 } from "lucide-react";
 import { motion } from "framer-motion";
 
 const FEATURES_TRIO = [
-  { icon: Monitor, label: "Anlik Reaktif Takip" },
-  { icon: Smartphone, label: "Uyari Sistemi" },
+  { icon: Monitor, label: "Anlık Reaktif Takip" },
+  { icon: Smartphone, label: "Uyarı Sistemi" },
   { icon: BarChart3, label: "Dashboard & Raporlama" },
 ];
 
@@ -22,10 +22,11 @@ export default function SmartPortal() {
             transition={{ duration: 0.6 }}
           >
             <h2 className="text-3xl md:text-4xl font-bold text-neutral-900">
-              PortECO ile enerji maliyetlerini kontrol altina alin.
+              PortECO ile enerji maliyetlerini kontrol altına alın.
             </h2>
             <p className="mt-3 text-neutral-600 max-w-xl">
-              Akilli enerji portali PortECO sizin yerinize panelinizi kontrol eder ve asimlari engeller.
+              Akıllı enerji portalı PortECO sizin yerinize panelinizi kontrol eder ve aşımları
+              engeller.
             </p>
 
             {/* Feature trio */}
@@ -52,7 +53,7 @@ export default function SmartPortal() {
                 to="/#features"
                 className="inline-flex items-center rounded-md bg-[#0A66FF] px-5 py-3 text-sm font-medium text-white hover:bg-[#0a59e0] transition shadow-sm shadow-[#0A66FF]/20"
               >
-                Nasil Calisir ?
+                Nasıl Çalışır?
               </Link>
             </div>
           </motion.div>
@@ -69,7 +70,11 @@ export default function SmartPortal() {
               <div className="relative w-full overflow-hidden rounded-lg bg-neutral-100">
                 {/* 16:9 ratio box */}
                 <div className="pt-[60%]" />
-                <img src="/features/smartportal.png" alt="PortECO Smart Portal" className="absolute inset-0 h-full w-full object-cover" />
+                <img
+                  src="/features/smartportal.png"
+                  alt="PortECO Smart Portal"
+                  className="absolute inset-0 h-full w-full object-cover"
+                />
               </div>
             </div>
           </motion.div>

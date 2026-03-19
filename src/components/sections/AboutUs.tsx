@@ -4,20 +4,20 @@ import { motion } from "framer-motion";
 
 const features = [
   {
-    title: "Olculebilir Tasarruf",
-    desc: "Faturalarinizi ve tuketim verinizi analiz ederek en uygun tarife/tedarik modelini belirleriz. Verimlilik firsatlarini VAP/etut ile somutlastirir, gereksiz bedel ve cezalari onleriz.",
+    title: "Ölçülebilir Tasarruf",
+    desc: "Faturalarınızı ve tüketim verinizi analiz ederek en uygun tarife/tedarik modelini belirleriz. Verimlilik fırsatlarını VAP/etüt ile somutlaştırır, gereksiz bedel ve cezaları önleriz.",
     icon: Target,
     color: "from-[#0A66FF] to-[#3B82F6]",
   },
   {
-    title: "Guvenilir Veri & Proaktif Izleme",
-    desc: "OSOS/EPIAS ve ERP entegrasyonlariyla verilerinizi otomatik toplar, PORTECO uzerinden anlik takip ve uyarilar saglar, raporlamayi standartlastiririz. ISO 50001 yaklasimimizla surecleriniz seffaf ve denetlenebilir olur.",
+    title: "Güvenilir Veri & Proaktif İzleme",
+    desc: "OSOS/EPİAŞ ve ERP entegrasyonlarıyla verilerinizi otomatik toplar, PORTECO üzerinden anlık takip ve uyarılar sağlar, raporlamayı standartlaştırırız. ISO 50001 yaklaşımımızla süreçleriniz şeffaf ve denetlenebilir olur.",
     icon: Shield,
     color: "from-emerald-500 to-emerald-600",
   },
   {
     title: "7/24 Online Takip",
-    desc: "Kurulumdan sozlesmeye, saha operasyonundan yonetim sunumlarina kadar yaninizdayiz. SLA'li destek; WhatsApp/telefon/e-posta kanallarindan hizli geri donus.",
+    desc: "Kurulumdan sözleşmeye, saha operasyonundan yönetim sunumlarına kadar yanınızdayız. SLA’lı destek; WhatsApp/telefon/e-posta kanallarından hızlı geri dönüş.",
     icon: Clock,
     color: "from-amber-500 to-orange-500",
   },
@@ -34,9 +34,12 @@ export default function AboutUs() {
           viewport={{ once: true, margin: "-80px" }}
           transition={{ duration: 0.5 }}
         >
-          <h2 className="text-3xl md:text-4xl font-bold text-neutral-900">Neden ECO Enerji?</h2>
+          <h2 className="text-3xl md:text-4xl font-bold text-neutral-900">
+            Neden ECO Enerji?
+          </h2>
           <p className="mt-3 text-neutral-600">
-            Enerji maliyetinizi dusururken surdurulebilirlik hedeflerinizi guvenle yonetin: analiz, tedarik, izleme ve raporlama tek cati altinda.
+            Enerji maliyetinizi düşürürken sürdürülebilirlik hedeflerinizi güvenle
+            yönetin: analiz, tedarik, izleme ve raporlama tek çatı altında.
           </p>
         </motion.div>
 
@@ -52,10 +55,14 @@ export default function AboutUs() {
                 viewport={{ once: true, margin: "-60px" }}
                 transition={{ duration: 0.5, delay: i * 0.1 }}
               >
-                <span className={`inline-flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br ${f.color} text-white shadow-md group-hover:scale-110 transition-transform duration-300`}>
+                <span
+                  className={`inline-flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br ${f.color} text-white shadow-md group-hover:scale-110 transition-transform duration-300`}
+                >
                   <Icon className="h-5 w-5" />
                 </span>
-                <h3 className="mt-4 text-lg font-semibold text-neutral-900">{f.title}</h3>
+                <h3 className="mt-4 text-lg font-semibold text-neutral-900">
+                  {f.title}
+                </h3>
                 <p className="mt-1 text-neutral-600">{f.desc}</p>
               </motion.div>
             );

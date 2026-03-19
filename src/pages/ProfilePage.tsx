@@ -14,6 +14,7 @@ import {
   Hash,
   Tag,
   Zap,
+  Sun,
 } from "lucide-react";
 import { setSubscriptionHidden } from "@/lib/subscriptionVisibility";
 import { setBtvEnabled } from "@/lib/btvToggle";
@@ -258,6 +259,155 @@ export default function ProfilePage() {
       setNickSaving((p) => ({ ...p, [serno]: false }));
     }
   };
+
+  // ====== GES Hesapları ======
+  type GesProvider = { id: number; name: string; display_name: string };
+  type GesCredential = {
+    id: string;
+    provider_id: number;
+    username: string;
+    is_active: boolean;
+    sync_status: string;
+    last_sync_at: string | null;
+    sync_error: string | null;
+    provider_display_name?: string;
+    plant_count?: number;
+  };
+
+  const [gesProviders, setGesProviders] = useState<GesProvider[]>([]);
+  const [gesCredentials, setGesCredentials] = useState<GesCredential[]>([]);
+  const [gesLoading, setGesLoading] = useState(false);
+
+  // GES form state
+  const [gesSelectedProvider, setGesSelectedProvider] = useState<number | null>(null);
+  const [gesUsername, setGesUsername] = useState("");
+  const [gesPassword, setGesPassword] = useState("");
+  const [gesShowPw, setGesShowPw] = useState(false);
+  const [gesSaving, setGesSaving] = useState(false);
+  const [gesMsg, setGesMsg] = useState<string | null>(null);
+  const [gesMsgType, setGesMsgType] = useState<"success" | "error">("success");
+
+  // GES verilerini yükle
+  useEffect(() => {
+    if (!uid) return;
+    let cancel = false;
+
+    (async () => {
+      setGesLoading(true);
+      try {
+        // Providers
+        const { data: provs } = await supabase
+          .from("ges_providers")
+          .select("id, name, display_name")
+          .eq("is_active", true)
+          .order("display_name");
+
+        if (cancel) return;
+        setGesProviders(provs ?? []);
+        if (provs?.length && !gesSelectedProvider) {
+          setGesSelectedProvider(provs[0].id);
+        }
+
+        // Credentials (password_enc hariç)
+        const { data: creds } = await supabase
+          .from("ges_credentials")
+          .select("id, provider_id, username, is_active, sync_status, last_sync_at, sync_error")
+          .eq("user_id", uid)
+          .order("created_at", { ascending: false });
+
+        if (cancel) return;
+
+        // Her credential için plant sayısı ve provider adını bul
+        const enriched: GesCredential[] = [];
+        for (const c of creds ?? []) {
+          const prov = (provs ?? []).find((p: GesProvider) => p.id === c.provider_id);
+          const { count } = await supabase
+            .from("ges_plants")
+            .select("*", { count: "exact", head: true })
+            .eq("credential_id", c.id)
+            .eq("is_active", true);
+
+          if (cancel) return;
+          enriched.push({
+            ...c,
+            provider_display_name: prov?.display_name ?? `Provider #${c.provider_id}`,
+            plant_count: count ?? 0,
+          });
+        }
+
+        setGesCredentials(enriched);
+      } catch (e: any) {
+        console.error("GES credentials load error:", e);
+      } finally {
+        if (!cancel) setGesLoading(false);
+      }
+    })();
+
+    return () => { cancel = true; };
+  }, [uid]);
+
+  // GES credential kaydetme
+  const handleGesCredentialSave = async () => {
+    if (!uid || !gesSelectedProvider || !gesUsername.trim() || !gesPassword.trim()) return;
+
+    // Aynı provider'da zaten hesap var mı?
+    if (gesCredentials.some((c) => c.provider_id === gesSelectedProvider)) {
+      setGesMsg("Bu sağlayıcıda zaten bir hesabınız var.");
+      setGesMsgType("error");
+      return;
+    }
+
+    setGesSaving(true);
+    setGesMsg(null);
+
+    try {
+      const { error } = await supabase.from("ges_credentials").insert({
+        user_id: uid,
+        provider_id: gesSelectedProvider,
+        username: gesUsername.trim(),
+        password_enc: btoa(gesPassword), // base64 encode — ileride pgcrypto
+      });
+
+      if (error) throw error;
+
+      setGesMsg("Hesabınız kaydedildi. Santralleriniz yakında otomatik olarak senkronize edilecektir.");
+      setGesMsgType("success");
+      setGesUsername("");
+      setGesPassword("");
+
+      // Listeyi yeniden yükle
+      const { data: creds } = await supabase
+        .from("ges_credentials")
+        .select("id, provider_id, username, is_active, sync_status, last_sync_at, sync_error")
+        .eq("user_id", uid)
+        .order("created_at", { ascending: false });
+
+      const enriched: GesCredential[] = [];
+      for (const c of creds ?? []) {
+        const prov = gesProviders.find((p) => p.id === c.provider_id);
+        const { count } = await supabase
+          .from("ges_plants")
+          .select("*", { count: "exact", head: true })
+          .eq("credential_id", c.id)
+          .eq("is_active", true);
+        enriched.push({
+          ...c,
+          provider_display_name: prov?.display_name ?? `Provider #${c.provider_id}`,
+          plant_count: count ?? 0,
+        });
+      }
+      setGesCredentials(enriched);
+    } catch (e: any) {
+      setGesMsg(e?.message ?? "Kayıt sırasında hata oluştu.");
+      setGesMsgType("error");
+    } finally {
+      setGesSaving(false);
+    }
+  };
+
+  const gesProviderAlreadyExists = gesSelectedProvider
+    ? gesCredentials.some((c) => c.provider_id === gesSelectedProvider)
+    : false;
 
   // Sifre formu
   const [currentPassword, setCurrentPassword] = useState("");
@@ -514,6 +664,170 @@ export default function ProfilePage() {
 
         {/* ====== SMS Notification Settings ====== */}
         <PhoneNumberManager />
+
+        {/* ====== GES Hesapları ====== */}
+        <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm overflow-hidden">
+          <div className="px-6 py-4 border-b border-neutral-100 bg-gradient-to-r from-neutral-50/80 to-white">
+            <div className="flex items-center gap-3">
+              <div className="h-9 w-9 rounded-xl bg-emerald-500/10 flex items-center justify-center">
+                <Sun className="h-4.5 w-4.5 text-emerald-600" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-neutral-900">GES Hesapları</h2>
+                <p className="text-xs text-neutral-400">
+                  Güneş enerji santrali API hesaplarınız
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="p-6 space-y-6">
+            {/* Mevcut credentials listesi */}
+            {gesLoading ? (
+              <p className="text-sm text-neutral-500">Yükleniyor…</p>
+            ) : gesCredentials.length > 0 ? (
+              <div className="space-y-3">
+                {gesCredentials.map((cred) => (
+                  <div
+                    key={cred.id}
+                    className="flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border border-neutral-200/60 bg-neutral-50/50 p-4"
+                  >
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-neutral-900">
+                        {cred.provider_display_name}
+                      </p>
+                      <p className="text-xs text-neutral-500 mt-0.5">
+                        Kullanıcı: {cred.username}
+                      </p>
+                      {cred.last_sync_at && (
+                        <p className="text-[11px] text-neutral-400 mt-0.5">
+                          Son sync: {new Date(cred.last_sync_at).toLocaleString("tr-TR")}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={[
+                          "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium",
+                          cred.sync_status === "success"
+                            ? "bg-emerald-100 text-emerald-700"
+                            : cred.sync_status === "failed"
+                            ? "bg-red-100 text-red-700"
+                            : "bg-amber-100 text-amber-700",
+                        ].join(" ")}
+                      >
+                        {cred.sync_status === "success"
+                          ? "Başarılı"
+                          : cred.sync_status === "failed"
+                          ? "Hata"
+                          : "Bekliyor"}
+                      </span>
+                      <span className="text-[11px] text-neutral-400">
+                        {cred.plant_count ?? 0} santral
+                      </span>
+                    </div>
+                  </div>
+                ))}
+                <p className="text-[11px] text-neutral-400 mt-2">
+                  Hesap bilgilerinizi değiştirmek için yöneticiyle iletişime geçin.
+                </p>
+              </div>
+            ) : (
+              <p className="text-sm text-neutral-400">Henüz bir GES hesabı eklenmemiş.</p>
+            )}
+
+            {/* Yeni credential ekleme formu */}
+            <div className="border-t border-neutral-100 pt-5">
+              <h3 className="text-xs font-semibold text-neutral-700 mb-3">Yeni GES Hesabı Ekle</h3>
+
+              <div className="space-y-3 max-w-lg">
+                {/* Provider seçici */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium text-neutral-600">Sağlayıcı</label>
+                  <select
+                    value={gesSelectedProvider ?? ""}
+                    onChange={(e) => setGesSelectedProvider(e.target.value ? Number(e.target.value) : null)}
+                    className="w-full rounded-lg border border-neutral-200 bg-neutral-50/50 px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#0A66FF]/40 focus:border-[#0A66FF]/40 focus:bg-white transition-all"
+                  >
+                    <option value="">Sağlayıcı seçin</option>
+                    {gesProviders.map((p) => (
+                      <option key={p.id} value={p.id}>{p.display_name}</option>
+                    ))}
+                  </select>
+                  {gesProviderAlreadyExists && (
+                    <p className="text-[11px] text-amber-600">
+                      Bu sağlayıcıda zaten bir hesabınız var.
+                    </p>
+                  )}
+                </div>
+
+                {/* Username */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium text-neutral-600">Kullanıcı Adı</label>
+                  <input
+                    type="text"
+                    value={gesUsername}
+                    onChange={(e) => setGesUsername(e.target.value)}
+                    placeholder="API kullanıcı adınız"
+                    className="w-full rounded-lg border border-neutral-200 bg-neutral-50/50 px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-[#0A66FF]/40 focus:border-[#0A66FF]/40 focus:bg-white transition-all"
+                  />
+                </div>
+
+                {/* Password */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium text-neutral-600">Şifre</label>
+                  <div className="relative">
+                    <input
+                      type={gesShowPw ? "text" : "password"}
+                      value={gesPassword}
+                      onChange={(e) => setGesPassword(e.target.value)}
+                      placeholder="API şifreniz"
+                      className="w-full rounded-lg border border-neutral-200 bg-neutral-50/50 px-3 py-2.5 pr-10 text-sm focus:outline-none focus:ring-2 focus:ring-[#0A66FF]/40 focus:border-[#0A66FF]/40 focus:bg-white transition-all"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setGesShowPw((v) => !v)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-neutral-600 transition-colors"
+                      tabIndex={-1}
+                    >
+                      {gesShowPw ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Mesaj */}
+                {gesMsg && (
+                  <div
+                    className={[
+                      "rounded-lg border px-4 py-2.5 text-xs flex items-center gap-2",
+                      gesMsgType === "success"
+                        ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                        : "border-red-200 bg-red-50 text-red-700",
+                    ].join(" ")}
+                  >
+                    {gesMsgType === "success" && <Check className="h-3.5 w-3.5 shrink-0" />}
+                    {gesMsg}
+                  </div>
+                )}
+
+                {/* Kaydet butonu */}
+                <button
+                  type="button"
+                  onClick={handleGesCredentialSave}
+                  disabled={gesSaving || !gesSelectedProvider || !gesUsername.trim() || !gesPassword.trim() || gesProviderAlreadyExists}
+                  className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 px-5 py-2.5 text-sm font-medium text-white shadow-sm shadow-emerald-600/20 disabled:opacity-60 transition-all duration-200 active:scale-[0.97]"
+                >
+                  {gesSaving ? (
+                    <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                  ) : (
+                    <Save className="h-3.5 w-3.5" />
+                  )}
+                  {gesSaving ? "Kaydediliyor…" : "Kaydet"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
 
         {/* ====== Change Password ====== */}
         <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm overflow-hidden">

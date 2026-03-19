@@ -176,6 +176,7 @@ function StatCard({
   badgeText,
   badgeClassName,
   totalLine,
+  compact,
 }: {
   title: string;
   value: string;
@@ -186,6 +187,7 @@ function StatCard({
   badgeText?: string;
   badgeClassName?: string;
   totalLine?: string;
+  compact?: boolean;
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
   const [tilt, setTilt] = useState({ x: 0, y: 0 });
@@ -247,19 +249,21 @@ function StatCard({
       </div>
 
       {img && (
-        <img
-          src={img.src}
-          alt=""
-          aria-hidden="true"
-          className="absolute top-0 left-0 select-none pointer-events-none transition-transform duration-500 ease-out group-hover:scale-110"
-          style={{
-            width: `${img.width}px`,
-            height: `${img.height}px`,
-            transform: `translate(${img.x}px, ${img.y}px) rotate(${
-              img.rotate ?? 0
-            }deg)`,
-          }}
-        />
+        <div className="absolute inset-0 overflow-hidden rounded-2xl pointer-events-none">
+          <img
+            src={img.src}
+            alt=""
+            aria-hidden="true"
+            className="absolute top-0 left-0 select-none pointer-events-none transition-transform duration-500 ease-out group-hover:scale-110"
+            style={{
+              width: `${img.width * (compact ? 0.65 : 1)}px`,
+              height: `${img.height * (compact ? 0.65 : 1)}px`,
+              transform: `translate(${(typeof img.x === "number" ? img.x : parseInt(img.x)) * (compact ? 0.65 : 1) + (compact ? 25 : 0)}px, ${(typeof img.y === "number" ? img.y : parseInt(img.y)) * (compact ? 0.65 : 1) + (compact ? 40 : 0)}px) rotate(${
+                img.rotate ?? 0
+              }deg)`,
+            }}
+          />
+        </div>
       )}
 
       <div className="relative z-10 flex items-start justify-between h-full">
@@ -368,6 +372,12 @@ export default function Dashboard() {
   const [allSubsTotalKwh, setAllSubsTotalKwh] = useState<number | null>(null);
   const [allSubsTotalInvoice, setAllSubsTotalInvoice] = useState<number | null>(null);
   const [allSubsTotalMahsup, setAllSubsTotalMahsup] = useState<number | null>(null);
+
+  // ✅ GES üretim (bağımsız — selectedSub'dan etkilenmez)
+  const [hasGes, setHasGes] = useState(false);
+  const [gesMonthlyKwh, setGesMonthlyKwh] = useState<number | null>(null);
+  const [gesLoading, setGesLoading] = useState(false);
+  const [gesErr, setGesErr] = useState<string | null>(null);
 
   // ---------------------------
   // 0) Tesisleri çek (dashboard label: meter_serial - nickname/title)
@@ -1317,6 +1327,71 @@ export default function Dashboard() {
   }, [uid, sessionLoading, subs]);
 
   // ---------------------------
+  // 7) GES üretim — bağımsız, selectedSub'dan ETKİLENMEZ
+  // ---------------------------
+  useEffect(() => {
+    if (sessionLoading || !uid) return;
+    let cancel = false;
+
+    (async () => {
+      try {
+        setGesLoading(true);
+        setGesErr(null);
+
+        // 1. Kullanıcının aktif GES plant'lerini çek
+        const { data: plants, error: plantsErr } = await supabase
+          .from("ges_plants")
+          .select("id")
+          .eq("user_id", uid)
+          .eq("is_active", true);
+
+        if (cancel) return;
+        if (plantsErr) throw plantsErr;
+
+        const userHasGes = (plants?.length || 0) > 0;
+        setHasGes(userHasGes);
+
+        if (!userHasGes) {
+          setGesMonthlyKwh(null);
+          return;
+        }
+
+        // 2. Bu ayın toplam üretimini çek
+        const plantIds = plants.map((p: { id: string }) => p.id);
+        const startOfMonth = dayjsTR().startOf("month").format("YYYY-MM-DD");
+        const endOfMonth = dayjsTR().endOf("month").format("YYYY-MM-DD");
+
+        const { data, error } = await supabase
+          .from("ges_production_daily")
+          .select("energy_kwh")
+          .in("ges_plant_id", plantIds)
+          .gte("date", startOfMonth)
+          .lte("date", endOfMonth);
+
+        if (cancel) return;
+        if (error) throw error;
+
+        const total = (data || []).reduce(
+          (s: number, r: { energy_kwh: number }) => s + (Number(r.energy_kwh) || 0),
+          0
+        );
+        setGesMonthlyKwh(total);
+      } catch (e: any) {
+        if (!cancel) {
+          setGesErr(e?.message ?? "GES verisi yüklenemedi");
+          setGesMonthlyKwh(null);
+        }
+      } finally {
+        if (!cancel) setGesLoading(false);
+      }
+    })();
+
+    return () => {
+      cancel = true;
+    };
+  }, [uid, sessionLoading]);
+
+  // ---------------------------
   // Kart değerleri + renkler + subtitle override
   // ---------------------------
   const valuesByKey: Record<string, string> = useMemo(() => {
@@ -1343,8 +1418,14 @@ export default function Dashboard() {
             Math.abs(yekdemMahsup)
           )} TL`;
 
+    const gesText =
+      gesMonthlyKwh != null
+        ? gesMonthlyKwh.toLocaleString("tr-TR", { maximumFractionDigits: 0 })
+        : "—";
+
     return {
       consumption: consumptionText,
+      ges: gesText,
       cost: ptfText,
       ptf: ptfText,
       yekdem: yekdemText,
@@ -1354,6 +1435,7 @@ export default function Dashboard() {
     };
   }, [
     prevMonthKwh,
+    gesMonthlyKwh,
     monthlyPTF,
     monthlyYekdem,
     monthlyKbk,
@@ -1416,6 +1498,8 @@ export default function Dashboard() {
     switch (key) {
       case "consumption":
         return { src: "/dashboard-icons/bolt.png", x: 120, y: -120, width: 466, height: 401 };
+      case "ges":
+        return { src: "/dashboard-icons/sun.png", x: 140, y: -60, width: 350, height: 280, rotate: 5 }; // placeholder — sun.png ile değiştirilecek
       case "cost":
         return { src: "/dashboard-icons/try.png", x: 125, y: -75, width: 419, height: 335 };
       case "yekdem":
@@ -1501,7 +1585,7 @@ export default function Dashboard() {
       </div>
 
       {/* Hatalar */}
-      {(subsErr || prevErr || ptfErr || yekdemErr || kbkErr || invoiceErr) && (
+      {(subsErr || prevErr || ptfErr || yekdemErr || kbkErr || invoiceErr || gesErr) && (
         <div className="mb-4 rounded border border-red-300 bg-red-50 p-3 text-sm text-red-700">
           {subsErr && (
             <>
@@ -1533,7 +1617,13 @@ export default function Dashboard() {
               <br />
             </>
           )}
-          {invoiceErr && <>Fatura: {invoiceErr}</>}
+          {invoiceErr && (
+            <>
+              Fatura: {invoiceErr}
+              <br />
+            </>
+          )}
+          {gesErr && <>GES: {gesErr}</>}
         </div>
       )}
 
@@ -1543,39 +1633,116 @@ export default function Dashboard() {
         ptfLoading ||
         yekdemLoading ||
         kbkLoading ||
-        invoiceLoading) && (
+        invoiceLoading ||
+        gesLoading) && (
         <div className="mb-4 text-sm text-neutral-500">Veriler yükleniyor…</div>
       )}
 
-      {/* Kartlar */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-5 mb-6">
-        {DASH_CARDS.map((c) => (
-          <StatCard
-            key={c.key}
-            title={c.title}
-            value={valuesByKey[c.key] ?? "—"}
-            sub={
-              c.key === "yekdem"
-                ? yekdemSubtitle
-                : c.key === "files"
-                ? filesSubtitle
-                : c.subtitle
-            }
-            valueClassName={c.key === "files" ? filesValueClass : undefined}
-            badgeText={c.key === "files" ? filesBadgeText : undefined}
-            badgeClassName={c.key === "files" ? filesBadgeClass : undefined}
-            totalLine={totalLineByKey[c.key]}
-            onClick={c.key === "valley" ? undefined : () => {
-              if (c.key === "files") {
-                navigate("/dashboard/yekdem-mahsup");
-                return;
-              }
-              navigate(c.path);
-            }}
-            img={imgForKey(c.key)}
-          />
-        ))}
-      </div>
+      {/* Kartlar — koşullu düzen */}
+      {hasGes ? (
+        <>
+          {/* DURUM B: GES var → Üst 3 + Alt 4 */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6">
+            {/* Tüketim, GES, Fatura */}
+            {(["consumption", "ges", "anomaly"] as const).map((key) => {
+              const c = DASH_CARDS.find((d) => d.key === key)!;
+              return (
+                <StatCard
+                  key={c.key}
+                  title={c.title}
+                  value={valuesByKey[c.key] ?? "—"}
+                  sub={c.key === "ges" ? "kWh" : c.subtitle}
+                  badgeText={c.key === "ges" ? "Özet" : undefined}
+                  totalLine={totalLineByKey[c.key]}
+                  onClick={() => {
+                    if (c.key === "anomaly") { navigate(c.path); return; }
+                    navigate(c.path);
+                  }}
+                  img={imgForKey(c.key)}
+                />
+              );
+            })}
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6 mt-4 md:mt-6 mb-6">
+            {/* PTF, YEKDEM, Birim Fiyat, Mahsup */}
+            {(["cost", "yekdem", "valley", "files"] as const).map((key) => {
+              const c = DASH_CARDS.find((d) => d.key === key)!;
+              return (
+                <StatCard
+                  key={c.key}
+                  title={c.title}
+                  value={valuesByKey[c.key] ?? "—"}
+                  sub={
+                    c.key === "yekdem"
+                      ? yekdemSubtitle
+                      : c.key === "files"
+                      ? filesSubtitle
+                      : c.subtitle
+                  }
+                  valueClassName={c.key === "files" ? filesValueClass : undefined}
+                  badgeText={c.key === "files" ? filesBadgeText : undefined}
+                  badgeClassName={c.key === "files" ? filesBadgeClass : undefined}
+                  totalLine={totalLineByKey[c.key]}
+                  onClick={c.key === "valley" ? undefined : () => {
+                    if (c.key === "files") { navigate("/dashboard/yekdem-mahsup"); return; }
+                    navigate(c.path);
+                  }}
+                  img={imgForKey(c.key)}
+                  compact
+                />
+              );
+            })}
+          </div>
+        </>
+      ) : (
+        <>
+          {/* DURUM A: GES yok → 3 + 3 (mevcut 6 kart) */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6">
+            {/* Tüketim, PTF, YEKDEM */}
+            {(["consumption", "cost", "yekdem"] as const).map((key) => {
+              const c = DASH_CARDS.find((d) => d.key === key)!;
+              return (
+                <StatCard
+                  key={c.key}
+                  title={c.title}
+                  value={valuesByKey[c.key] ?? "—"}
+                  sub={c.key === "yekdem" ? yekdemSubtitle : c.subtitle}
+                  totalLine={totalLineByKey[c.key]}
+                  onClick={() => navigate(c.path)}
+                  img={imgForKey(c.key)}
+                />
+              );
+            })}
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6 mt-4 md:mt-6 mb-6">
+            {/* Birim Fiyat, Fatura, Mahsup */}
+            {(["valley", "anomaly", "files"] as const).map((key) => {
+              const c = DASH_CARDS.find((d) => d.key === key)!;
+              return (
+                <StatCard
+                  key={c.key}
+                  title={c.title}
+                  value={valuesByKey[c.key] ?? "—"}
+                  sub={
+                    c.key === "files"
+                      ? filesSubtitle
+                      : c.subtitle
+                  }
+                  valueClassName={c.key === "files" ? filesValueClass : undefined}
+                  badgeText={c.key === "files" ? filesBadgeText : undefined}
+                  badgeClassName={c.key === "files" ? filesBadgeClass : undefined}
+                  totalLine={totalLineByKey[c.key]}
+                  onClick={c.key === "valley" ? undefined : () => {
+                    if (c.key === "files") { navigate("/dashboard/yekdem-mahsup"); return; }
+                    navigate(c.path);
+                  }}
+                  img={imgForKey(c.key)}
+                />
+              );
+            })}
+          </div>
+        </>
+      )}
 
       {/* Reaktif bölümler */}
       <ReactiveSection subscriptionSerNo={selectedSub} />

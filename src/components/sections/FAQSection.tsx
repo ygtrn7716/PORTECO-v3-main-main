@@ -14,7 +14,7 @@ export default function FAQSection() {
   return (
     <section id="faq" className="bg-gradient-to-b from-white to-[#F6F8FB]">
       <Container className="py-10 md:py-20">
-        {/* BASLIK */}
+        {/* BAŞLIK */}
         <motion.div
           className="text-center max-w-2xl mx-auto"
           initial={{ opacity: 0, y: 30 }}
@@ -23,14 +23,14 @@ export default function FAQSection() {
           transition={{ duration: 0.5 }}
         >
           <h2 className="text-3xl md:text-4xl font-semibold text-neutral-dark">
-            Sik Sorulan Sorular
+            Sık Sorulan Sorular
           </h2>
           <p className="mt-2 text-neutral-gray">
-            ECO Enerji cozumleri hakkinda en cok merak edilen sorulari derledik.
+            ECO Enerji çözümleri hakkında en çok merak edilen soruları derledik.
           </p>
         </motion.div>
 
-        {/* SORU LISTESI */}
+        {/* SORU LİSTESİ */}
         <div className="mt-8 space-y-4">
           {FAQ_ITEMS.map((faq, i) => {
             const isOpen = faq.id === openId;
@@ -88,7 +88,7 @@ export default function FAQSection() {
                         to={`/blog/${faq.blogSlug}`}
                         className="inline-flex items-center gap-1.5 text-sm font-medium text-brand-blue hover:text-brand-blueDark transition-colors"
                       >
-                        Daha fazlasini blog yazisinda oku
+                        Daha fazlasını blog yazısında oku
                         <ExternalLink className="h-3.5 w-3.5" />
                       </Link>
                     </div>
@@ -99,7 +99,7 @@ export default function FAQSection() {
           })}
         </div>
 
-        {/* DIGER YAZILAR BUTONU */}
+        {/* DİĞER YAZILAR BUTONU */}
         <motion.div
           className="mt-8 text-center"
           initial={{ opacity: 0, y: 20 }}
@@ -111,7 +111,7 @@ export default function FAQSection() {
             to="/blog"
             className="inline-flex items-center gap-2 rounded-full border border-brand-blue px-5 py-2.5 text-sm md:text-base font-medium text-brand-blue hover:bg-[#0A66FF]/5 transition-colors"
           >
-            Diger yazilari oku
+            Diğer yazıları oku
             <ChevronRight className="h-4 w-4" />
           </Link>
         </motion.div>
