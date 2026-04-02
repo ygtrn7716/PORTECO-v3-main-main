@@ -7,6 +7,7 @@ import { dayjsTR } from "@/lib/dayjs";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { downloadXlsx } from "@/components/utils/xlsx";
 import EnergySoldCard from "@/components/dashboard/EnergySoldCard";
+import { HelpCircle } from "lucide-react";
 import GesHourlyView from "@/components/dashboard/GesHourlyView";
 import {
   ResponsiveContainer,
@@ -93,6 +94,19 @@ export default function GesDetail() {
   const [tableYear, setTableYear] = useState(dayjsTR().year());
   const [tableMonth, setTableMonth] = useState(dayjsTR().month() + 1);
   const [dailyData, setDailyData] = useState<DailyRow[]>([]);
+
+  // Grafik sekmesi
+  const [chartTab, setChartTab] = useState<'production' | 'sold'>('production');
+
+  // Günlük grafik (tablo state'inden bağımsız)
+  const [dailyChartYear, setDailyChartYear] = useState(dayjsTR().year());
+  const [dailyChartMonth, setDailyChartMonth] = useState(dayjsTR().month() + 1);
+  const [dailyChartData, setDailyChartData] = useState<DailyRow[]>([]);
+
+  // Satış hakkı
+  const [maxSatisKwh, setMaxSatisKwh] = useState<number | null>(null);
+  const [yearlyTotal, setYearlyTotal] = useState<number | null>(null);
+  const [satisTooltipOpen, setSatisTooltipOpen] = useState(false);
 
   // Görünüm modu (günlük / saatlik)
   const [viewMode, setViewMode] = useState<ViewMode>("daily");
@@ -328,6 +342,113 @@ export default function GesDetail() {
     return () => { cancel = true; };
   }, [plants, selectedPlantId, tableYear, tableMonth]);
 
+  // 5b) Günlük grafik verisi (grafik sekmesi için — tablodan bağımsız)
+  useEffect(() => {
+    if (!plants.length || !activePlantIds.length) {
+      setDailyChartData([]);
+      return;
+    }
+    let cancel = false;
+
+    (async () => {
+      const daysInMonth = dayjsTR()
+        .year(dailyChartYear)
+        .month(dailyChartMonth - 1)
+        .daysInMonth();
+      const startDate = `${dailyChartYear}-${String(dailyChartMonth).padStart(2, "0")}-01`;
+      const endDate = `${dailyChartYear}-${String(dailyChartMonth).padStart(2, "0")}-${String(daysInMonth).padStart(2, "0")}`;
+
+      const { data, error } = await supabase
+        .from("ges_production_daily")
+        .select("date, energy_kwh")
+        .in("ges_plant_id", activePlantIds)
+        .gte("date", startDate)
+        .lte("date", endDate)
+        .order("date");
+
+      if (cancel) return;
+      if (error) return;
+
+      const byDate: Record<string, number> = {};
+      for (const row of data ?? []) {
+        byDate[row.date] = (byDate[row.date] || 0) + (Number(row.energy_kwh) || 0);
+      }
+
+      const rows: DailyRow[] = Object.entries(byDate)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([date, kwh]) => ({ date, energy_kwh: kwh }));
+
+      setDailyChartData(rows);
+    })();
+
+    return () => { cancel = true; };
+  }, [plants, selectedPlantId, dailyChartYear, dailyChartMonth]);
+
+  // 6) Satış hakkı limiti
+  useEffect(() => {
+    if (!uid || !plants.length || !activePlantIds.length) {
+      setMaxSatisKwh(null);
+      return;
+    }
+    const linkedSernos = plants
+      .filter((p) => activePlantIds.includes(p.id) && p.linked_serno != null)
+      .map((p) => p.linked_serno!);
+
+    if (!linkedSernos.length) {
+      setMaxSatisKwh(null);
+      return;
+    }
+    let cancel = false;
+
+    (async () => {
+      const { data, error } = await supabase
+        .from("ges_satis_hakki")
+        .select("max_satis_kwh")
+        .eq("user_id", uid)
+        .in("subscription_serno", linkedSernos);
+
+      if (cancel) return;
+      if (error || !data?.length) {
+        setMaxSatisKwh(null);
+        return;
+      }
+
+      const total = data.reduce((s, r) => s + (Number(r.max_satis_kwh) || 0), 0);
+      setMaxSatisKwh(total > 0 ? total : null);
+    })();
+
+    return () => { cancel = true; };
+  }, [plants, selectedPlantId, uid]);
+
+  // 7) Yıllık toplam üretim (year-to-date)
+  useEffect(() => {
+    if (!plants.length || !activePlantIds.length) {
+      setYearlyTotal(null);
+      return;
+    }
+    let cancel = false;
+
+    (async () => {
+      const startDate = `${dayjsTR().year()}-01-01`;
+      const endDate = dayjsTR().format("YYYY-MM-DD");
+
+      const { data, error } = await supabase
+        .from("ges_production_daily")
+        .select("energy_kwh")
+        .in("ges_plant_id", activePlantIds)
+        .gte("date", startDate)
+        .lte("date", endDate);
+
+      if (cancel) return;
+      if (error) return;
+
+      const total = (data || []).reduce((s, r) => s + (Number(r.energy_kwh) || 0), 0);
+      setYearlyTotal(total);
+    })();
+
+    return () => { cancel = true; };
+  }, [plants, selectedPlantId]);
+
   // XLSX export
   const handleExport = () => {
     if (!dailyData.length) return;
@@ -360,6 +481,12 @@ export default function GesDetail() {
   };
 
   const currentYear = dayjsTR().year();
+
+  // Günlük grafik barları
+  const dailyChartBars = dailyChartData.map((r) => ({
+    day: new Date(r.date).getDate(),
+    kwh: Math.round(r.energy_kwh * 10) / 10,
+  }));
 
   const navigate = useNavigate();
 
@@ -450,48 +577,192 @@ export default function GesDetail() {
             />
           </div>
 
-          {/* B) Aylık Üretim + Devlete Satılan Enerji — yan yana */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 md:gap-6 mb-8">
-            {/* SOL: Mevcut aylık üretim grafiği */}
-            <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm p-6">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-sm font-semibold text-neutral-900">Aylık Üretim Grafiği</h2>
-                <select
-                  value={chartYear}
-                  onChange={(e) => setChartYear(Number(e.target.value))}
-                  className="h-8 rounded-lg border border-neutral-300 bg-white px-2 text-xs text-neutral-800"
+          {/* B) Üretim Grafiği / Satılan Üretim — sekmeli */}
+          <div className="mb-8">
+            {/* Tab Toggle */}
+            <div className="mb-4">
+              <div className="inline-flex rounded-lg border border-neutral-200 overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setChartTab('production')}
+                  className={`px-3 py-1.5 text-xs font-medium transition-colors ${
+                    chartTab === 'production'
+                      ? "bg-emerald-600 text-white"
+                      : "bg-white text-neutral-600 hover:bg-neutral-50"
+                  }`}
                 >
-                  <option value={currentYear}>{currentYear}</option>
-                  <option value={currentYear - 1}>{currentYear - 1}</option>
-                </select>
+                  Üretim Grafiği
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setChartTab('sold')}
+                  className={`px-3 py-1.5 text-xs font-medium transition-colors ${
+                    chartTab === 'sold'
+                      ? "bg-emerald-600 text-white"
+                      : "bg-white text-neutral-600 hover:bg-neutral-50"
+                  }`}
+                >
+                  Satılan Üretim
+                </button>
               </div>
+            </div>
 
-              {monthlyData.length > 0 ? (
-                <ResponsiveContainer width="100%" height={300}>
-                  <BarChart data={monthlyData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                    <XAxis dataKey="label" tick={{ fontSize: 12 }} />
-                    <YAxis tick={{ fontSize: 12 }} />
-                    <Tooltip
-                      formatter={(value: number | undefined) => [
-                        `${(value ?? 0).toLocaleString("tr-TR", { maximumFractionDigits: 1 })} kWh`,
-                        "Üretim",
-                      ]}
-                    />
-                    <Bar dataKey="kwh" fill="#22c55e" radius={[4, 4, 0, 0]} name="Üretim (kWh)" />
-                  </BarChart>
-                </ResponsiveContainer>
-              ) : (
-                <p className="text-sm text-neutral-400 text-center py-12">
-                  {chartYear} yılı için üretim verisi bulunamadı.
-                </p>
-              )}
-            </section>
+            {/* Üretim Grafiği Tab İçeriği */}
+            {chartTab === 'production' && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
+                {/* SOL: Aylık Üretim Grafiği */}
+                <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm p-6">
+                  <div className="flex items-center justify-between mb-4">
+                    <h2 className="text-sm font-semibold text-neutral-900">Aylık Üretim Grafiği</h2>
+                    <select
+                      value={chartYear}
+                      onChange={(e) => setChartYear(Number(e.target.value))}
+                      className="h-8 rounded-lg border border-neutral-300 bg-white px-2 text-xs text-neutral-800"
+                    >
+                      <option value={currentYear}>{currentYear}</option>
+                      <option value={currentYear - 1}>{currentYear - 1}</option>
+                    </select>
+                  </div>
 
-            {/* SAĞ: Devlete Satılan Enerji Bedeli */}
-            <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm p-6">
-              <EnergySoldCard />
-            </section>
+                  {monthlyData.length > 0 ? (
+                    <ResponsiveContainer width="100%" height={300}>
+                      <BarChart data={monthlyData}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+                        <XAxis dataKey="label" tick={{ fontSize: 12 }} />
+                        <YAxis tick={{ fontSize: 12 }} />
+                        <Tooltip
+                          formatter={(value: number | undefined) => [
+                            `${(value ?? 0).toLocaleString("tr-TR", { maximumFractionDigits: 1 })} kWh`,
+                            "Üretim",
+                          ]}
+                        />
+                        <Bar dataKey="kwh" fill="#22c55e" radius={[4, 4, 0, 0]} name="Üretim (kWh)" />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <p className="text-sm text-neutral-400 text-center py-12">
+                      {chartYear} yılı için üretim verisi bulunamadı.
+                    </p>
+                  )}
+                </section>
+
+                {/* SAĞ: Günlük Üretim Grafiği */}
+                <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm p-6">
+                  <div className="flex items-center justify-between mb-4">
+                    <h2 className="text-sm font-semibold text-neutral-900">Günlük Üretim Grafiği</h2>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={dailyChartMonth}
+                        onChange={(e) => setDailyChartMonth(Number(e.target.value))}
+                        className="h-8 rounded-lg border border-neutral-300 bg-white px-2 text-xs text-neutral-800"
+                      >
+                        {MONTH_NAMES.map((name, i) => (
+                          <option key={i} value={i + 1}>{name}</option>
+                        ))}
+                      </select>
+                      <select
+                        value={dailyChartYear}
+                        onChange={(e) => setDailyChartYear(Number(e.target.value))}
+                        className="h-8 rounded-lg border border-neutral-300 bg-white px-2 text-xs text-neutral-800"
+                      >
+                        <option value={currentYear}>{currentYear}</option>
+                        <option value={currentYear - 1}>{currentYear - 1}</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {!plants.length || !activePlantIds.length ? (
+                    <p className="text-sm text-neutral-400 text-center py-12">
+                      Lütfen bir tesis seçin
+                    </p>
+                  ) : dailyChartBars.length > 0 ? (
+                    <ResponsiveContainer width="100%" height={300}>
+                      <BarChart data={dailyChartBars}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+                        <XAxis dataKey="day" tick={{ fontSize: 12 }} />
+                        <YAxis tick={{ fontSize: 12 }} />
+                        <Tooltip
+                          formatter={(value: number | undefined) => [
+                            `${(value ?? 0).toLocaleString("tr-TR", { maximumFractionDigits: 1 })} kWh`,
+                            "Üretim",
+                          ]}
+                        />
+                        <Bar dataKey="kwh" fill="#22c55e" radius={[4, 4, 0, 0]} name="Üretim (kWh)" />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  ) : (
+                    <p className="text-sm text-neutral-400 text-center py-12">
+                      {MONTH_NAMES[dailyChartMonth - 1]} {dailyChartYear} için üretim verisi bulunamadı.
+                    </p>
+                  )}
+                </section>
+              </div>
+            )}
+
+            {/* Satılan Üretim Tab İçeriği */}
+            {chartTab === 'sold' && (
+              <>
+                {/* Yıllık Satış Hakkı Banner */}
+                {maxSatisKwh != null && yearlyTotal != null && (() => {
+                  const pct = maxSatisKwh > 0 ? (yearlyTotal / maxSatisKwh) * 100 : 0;
+                  const barColor = pct <= 70 ? "bg-emerald-500" : pct <= 90 ? "bg-amber-500" : "bg-red-500";
+                  return (
+                    <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm p-5 mb-4">
+                      <div className="flex items-center justify-between mb-3">
+                        <h3 className="text-sm font-semibold text-neutral-900 flex items-center gap-1.5">
+                          <span>⚡</span> Yıllık Satış Hakkı Kullanımı
+                        </h3>
+                        <div className="relative">
+                          <button
+                            type="button"
+                            onClick={() => setSatisTooltipOpen((v) => !v)}
+                            className="text-neutral-400 hover:text-neutral-600 transition-colors"
+                          >
+                            <HelpCircle size={16} />
+                          </button>
+                          {satisTooltipOpen && (
+                            <div className="absolute right-0 top-8 z-10 w-72 rounded-xl border border-neutral-200 bg-white shadow-lg p-4 text-xs text-neutral-600 leading-relaxed">
+                              Yıllık GES satış hakkı, ilgili mevzuat kapsamında belirlenen
+                              maksimum şebekeye veriş miktarıdır. Limit aşımında ek
+                              yaptırımlar uygulanabilir. Limitinizi güncellemek için
+                              yöneticinizle iletişime geçin.
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      <p className="text-sm text-neutral-600 mb-3">
+                        Kullanılan:{" "}
+                        <span className="font-semibold text-neutral-900">
+                          {fmtKwh(yearlyTotal)} kWh
+                        </span>
+                        {"  /  "}
+                        Limit:{" "}
+                        <span className="font-semibold text-neutral-900">
+                          {fmtKwh(maxSatisKwh)} kWh
+                        </span>
+                      </p>
+
+                      <div className="flex items-center gap-3">
+                        <div className="flex-1 h-2.5 rounded-full bg-neutral-100">
+                          <div
+                            className={`h-full rounded-full transition-all ${barColor}`}
+                            style={{ width: `${Math.min(pct, 100)}%` }}
+                          />
+                        </div>
+                        <span className="text-xs font-semibold text-neutral-700 w-14 text-right">
+                          %{pct.toFixed(1)}
+                        </span>
+                      </div>
+                    </section>
+                  );
+                })()}
+
+                <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm p-6">
+                  <EnergySoldCard />
+                </section>
+              </>
+            )}
           </div>
 
           {/* C) Üretim Verileri — Günlük / Saatlik Toggle */}

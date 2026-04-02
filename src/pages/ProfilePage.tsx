@@ -15,6 +15,7 @@ import {
   Tag,
   Zap,
   Sun,
+  Activity,
 } from "lucide-react";
 import { setSubscriptionHidden } from "@/lib/subscriptionVisibility";
 import { setBtvEnabled } from "@/lib/btvToggle";
@@ -43,6 +44,17 @@ export default function ProfilePage() {
   const [nickMsg, setNickMsg] = useState<Record<number, string | null>>({});
   const [hiddenSaving, setHiddenSaving] = useState<Record<number, boolean>>({});
   const [btvSaving, setBtvSaving] = useState<Record<number, boolean>>({});
+
+  // Reaktif görünüm tercihi
+  const [reactiveDisplayMode, setReactiveDisplayMode] = useState<"toggle" | "pill">(() => {
+    if (typeof window === "undefined") return "toggle";
+    const raw = localStorage.getItem("eco_reactive_display_mode");
+    return raw === "pill" ? "pill" : "toggle";
+  });
+  const handleReactiveDisplayChange = (mode: "toggle" | "pill") => {
+    setReactiveDisplayMode(mode);
+    localStorage.setItem("eco_reactive_display_mode", mode);
+  };
 
   const toggleVisibility = async (serno: number) => {
     if (!uid) return;
@@ -825,6 +837,78 @@ export default function ProfilePage() {
                   {gesSaving ? "Kaydediliyor…" : "Kaydet"}
                 </button>
               </div>
+            </div>
+          </div>
+        </section>
+
+        {/* ====== Reaktif Görünüm ====== */}
+        <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm overflow-hidden">
+          {/* Section header */}
+          <div className="px-6 py-4 border-b border-neutral-100 bg-gradient-to-r from-neutral-50/80 to-white">
+            <div className="flex items-center gap-3">
+              <div className="h-9 w-9 rounded-xl bg-violet-500/10 flex items-center justify-center">
+                <Activity className="h-4.5 w-4.5 text-violet-600" />
+              </div>
+              <div>
+                <h2 className="text-sm font-semibold text-neutral-900">Reaktif Görünüm</h2>
+                <p className="text-xs text-neutral-400">
+                  Reaktif bölümünün dashboard&apos;da nasıl görüneceğini seçin.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="p-6 max-w-lg">
+            <div className="space-y-3">
+              {/* Toggle seçeneği */}
+              <label
+                className={
+                  "flex items-start gap-3 rounded-xl border p-4 cursor-pointer transition-all " +
+                  (reactiveDisplayMode === "toggle"
+                    ? "border-[#0A66FF]/30 bg-[#0A66FF]/5 ring-1 ring-[#0A66FF]/20"
+                    : "border-neutral-200 hover:border-neutral-300")
+                }
+              >
+                <input
+                  type="radio"
+                  name="reactive_display"
+                  value="toggle"
+                  checked={reactiveDisplayMode === "toggle"}
+                  onChange={() => handleReactiveDisplayChange("toggle")}
+                  className="mt-0.5 accent-[#0A66FF]"
+                />
+                <div>
+                  <div className="text-sm font-medium text-neutral-900">Toggle</div>
+                  <div className="text-xs text-neutral-500 mt-0.5">
+                    Çekiş ve veriş arasında geçiş yapın
+                  </div>
+                </div>
+              </label>
+
+              {/* Özet seçeneği */}
+              <label
+                className={
+                  "flex items-start gap-3 rounded-xl border p-4 cursor-pointer transition-all " +
+                  (reactiveDisplayMode === "pill"
+                    ? "border-[#0A66FF]/30 bg-[#0A66FF]/5 ring-1 ring-[#0A66FF]/20"
+                    : "border-neutral-200 hover:border-neutral-300")
+                }
+              >
+                <input
+                  type="radio"
+                  name="reactive_display"
+                  value="pill"
+                  checked={reactiveDisplayMode === "pill"}
+                  onChange={() => handleReactiveDisplayChange("pill")}
+                  className="mt-0.5 accent-[#0A66FF]"
+                />
+                <div>
+                  <div className="text-sm font-medium text-neutral-900">Özet</div>
+                  <div className="text-xs text-neutral-500 mt-0.5">
+                    Limit aşımı yoksa kompakt göster
+                  </div>
+                </div>
+              </label>
             </div>
           </div>
         </section>

@@ -327,6 +327,12 @@ export default function Dashboard() {
     return nickEffective ? `${tesisNo} - ${nickEffective}` : tesisNo;
   };
 
+  const [reactiveDisplayMode] = useState<"toggle" | "pill">(() => {
+    if (typeof window === "undefined") return "toggle";
+    const raw = localStorage.getItem("eco_reactive_display_mode");
+    return raw === "pill" ? "pill" : "toggle";
+  });
+
   const [subsLoading, setSubsLoading] = useState(false);
   const [subsErr, setSubsErr] = useState<string | null>(null);
 
@@ -1745,7 +1751,11 @@ export default function Dashboard() {
       )}
 
       {/* Reaktif bölümler */}
-      <ReactiveSection subscriptionSerNo={selectedSub} />
+      <ReactiveSection
+        subscriptionSerNo={selectedSub}
+        hasGes={hasGes}
+        displayMode={reactiveDisplayMode}
+      />
     </DashboardShell>
   );
 }

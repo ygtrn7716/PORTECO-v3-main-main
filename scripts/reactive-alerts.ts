@@ -48,38 +48,46 @@ function pct(num: number, den: number) {
 
 type Level = "ok" | "warn" | "limit";
 
-function levelFor(kind: "ri" | "rc", valuePct: number): Level {
-  if (kind === "ri") {
+function levelFor(kind: "ri" | "rc" | "rio" | "rco", valuePct: number): Level {
+  if (kind === "ri" || kind === "rio") {
     if (valuePct >= 20) return "limit";
     if (valuePct >= 18) return "warn";
     return "ok";
   }
-  // rc — warn esigi %13, limit %15
+  // rc / rco — warn esigi %13, limit %15
   if (valuePct >= 15) return "limit";
   if (valuePct >= 13) return "warn";
   return "ok";
 }
 
 function msgText(params: {
-  kind: "ri" | "rc";
+  kind: "ri" | "rc" | "rio" | "rco";
   level: Level;
   meterSerial: string | null;
   title: string | null;
   valuePct: number;
 }) {
   const prefix = `${params.meterSerial ?? ""} ${params.title ?? ""}`.trim();
-  const kindName = params.kind === "ri" ? "Reaktif Induktif" : "Reaktif Kapasitif";
+
+  const kindNames: Record<string, string> = {
+    ri:  "Reaktif Induktif",
+    rc:  "Reaktif Kapasitif",
+    rio: "Reaktif Induktif (Veris)",
+    rco: "Reaktif Kapasitif (Veris)",
+  };
+  const kindName = kindNames[params.kind] ?? params.kind;
+  const isInductive = params.kind === "ri" || params.kind === "rio";
 
   if (params.level === "warn") {
-    const thr = params.kind === "ri" ? 18 : 13;
-    const lim = params.kind === "ri" ? 20 : 15;
+    const thr = isInductive ? 18 : 13;
+    const lim = isInductive ? 20 : 15;
     return `${prefix}: Dikkat! ${kindName} degeri %${thr} seviyesine ulasti (Su an: %${params.valuePct.toFixed(
       1
     )}). Sinira yaklastiniz. Limit: %${lim}.`;
   }
 
   if (params.level === "limit") {
-    const lim = params.kind === "ri" ? 20 : 15;
+    const lim = isInductive ? 20 : 15;
     return `${prefix}: Uyari! ${kindName} degeri %${lim} limitini asti (Su an: %${params.valuePct.toFixed(
       1
     )}). Asimdasiniz, kullaniminizi kontrol altina alin.`;
@@ -297,6 +305,9 @@ async function main() {
       const active = Number(row?.active_kwh ?? 0);
       const ri = Number(row?.ri_kvarh ?? 0);
       const rc = Number(row?.rc_kvarh ?? 0);
+      const gn  = Number(row?.gn_kwh ?? 0);
+      const rio = Number(row?.rio_kvarh ?? 0);
+      const rco = Number(row?.rco_kvarh ?? 0);
 
       if (!(active > 0)) continue;
 
@@ -425,6 +436,131 @@ async function main() {
               errorMessage: errMsg,
             });
             errorCount++;
+          }
+        }
+      }
+
+      // ── Veriş reaktif (GES varsa) ──
+      if (gn > 0) {
+        const rioPct = pct(rio, gn);
+        const rcoPct = pct(rco, gn);
+
+        for (const kind of ["rio", "rco"] as const) {
+          const valuePct = kind === "rio" ? rioPct : rcoPct;
+          const nextLevel = levelFor(kind, valuePct);
+
+          // state oku
+          const { data: st } = await supabase
+            .from("reactive_alert_state")
+            .select("status")
+            .eq("user_id", userId)
+            .eq("subscription_serno", subNo)
+            .eq("kind", kind)
+            .eq("period_ym", periodYM)
+            .maybeSingle();
+
+          const prevLevel = (st as any)?.status ?? "ok";
+
+          const shouldSend =
+            (nextLevel === "warn" && prevLevel === "ok") ||
+            (nextLevel === "limit" && prevLevel !== "limit");
+
+          // state upsert
+          await supabase.from("reactive_alert_state").upsert(
+            {
+              user_id: userId,
+              subscription_serno: subNo,
+              kind,
+              period_ym: periodYM,
+              status: nextLevel,
+              last_value_pct: valuePct,
+              last_sent_at: shouldSend ? new Date().toISOString() : undefined,
+            },
+            { onConflict: "user_id,subscription_serno,kind,period_ym" }
+          );
+
+          if (!shouldSend || nextLevel === "ok") continue;
+
+          const text = msgText({ kind, level: nextLevel, meterSerial, title, valuePct });
+          const messageType =
+            nextLevel === "warn" ? `reactive_${kind}_warn` : `reactive_${kind}_limit`;
+
+          log(`ALERT: ${meterSerial ?? subNo} ${kind.toUpperCase()} ${nextLevel} (${valuePct.toFixed(1)}%)`);
+
+          // SMS gonder
+          const targetPhones = phones.filter((p) =>
+            nextLevel === "warn" ? p.receive_warnings : p.receive_alerts
+          );
+
+          for (const ph of targetPhones) {
+            try {
+              const providerResp = await sendSms(ph.phone_number, text);
+              await logSms({
+                userId,
+                subscriptionSerno: subNo,
+                phoneNumber: ph.phone_number,
+                messageType,
+                messageBody: text,
+                status: "sent",
+                providerResponse: providerResp,
+              });
+              log(`SMS sent to ${ph.phone_number}`);
+              smsSent++;
+            } catch (e) {
+              const errMsg = (e as Error).message;
+              log(`SMS failed to ${ph.phone_number}: ${errMsg}`);
+              await logSms({
+                userId,
+                subscriptionSerno: subNo,
+                phoneNumber: ph.phone_number,
+                messageType,
+                messageBody: text,
+                status: "failed",
+                errorMessage: errMsg,
+              });
+              errorCount++;
+            }
+          }
+
+          // Email gonder
+          const targetEmails = emails.filter((e) =>
+            nextLevel === "warn" ? e.receive_warnings : e.receive_alerts
+          );
+
+          const subjectPrefix = `${meterSerial ?? ""} ${title ?? ""}`.trim();
+          const emailSubject =
+            nextLevel === "warn"
+              ? `${subjectPrefix} - Reaktif uyari (veris): sinira yaklasiyor`
+              : `${subjectPrefix} - Reaktif uyari (veris): limit asildi`;
+
+          for (const em of targetEmails) {
+            try {
+              const providerResp = await sendEmail(em.email, emailSubject, text);
+              await logEmail({
+                userId,
+                subscriptionSerno: subNo,
+                emailAddress: em.email,
+                subject: emailSubject,
+                messageBody: text,
+                status: "sent",
+                providerResponse: providerResp,
+              });
+              log(`Email sent to ${em.email}`);
+              emailSent++;
+            } catch (e) {
+              const errMsg = (e as Error).message;
+              log(`Email failed to ${em.email}: ${errMsg}`);
+              await logEmail({
+                userId,
+                subscriptionSerno: subNo,
+                emailAddress: em.email,
+                subject: emailSubject,
+                messageBody: text,
+                status: "failed",
+                errorMessage: errMsg,
+              });
+              errorCount++;
+            }
           }
         }
       }

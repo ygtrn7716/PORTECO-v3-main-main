@@ -58,6 +58,7 @@ import GesCredentialsAdmin from "@/pages/admin/GesCredentialsAdmin";
 import GesPlantsAdmin from "@/pages/admin/GesPlantsAdmin";
 import GesProductionAdmin from "@/pages/admin/GesProductionAdmin";
 import GesSyncLogAdmin from "@/pages/admin/GesSyncLogAdmin";
+import GesSatisHakkiAdmin from "@/pages/admin/GesSatisHakkiAdmin";
 
 export default function App() {
   const { pathname } = useLocation();
@@ -123,6 +124,7 @@ export default function App() {
               <Route path="ges-plants" element={<GesPlantsAdmin />} />
               <Route path="ges-production" element={<GesProductionAdmin />} />
               <Route path="ges-sync-logs" element={<GesSyncLogAdmin />} />
+              <Route path="ges-satis-hakki" element={<GesSatisHakkiAdmin />} />
             </Route>
           </Route>
         </Routes>

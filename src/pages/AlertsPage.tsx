@@ -22,7 +22,7 @@ import { fetchHiddenSernos } from "@/lib/subscriptionVisibility";
 
 type AlertStateRow = {
   subscription_serno: number;
-  kind: "ri" | "rc";
+  kind: "ri" | "rc" | "rio" | "rco";
   period_ym: string;
   status: "ok" | "warn" | "limit";
   last_value_pct: number | null;
@@ -105,6 +105,22 @@ function periodLabel(ym: string) {
     "Temmuz", "Agustos", "Eylul", "Ekim", "Kasim", "Aralik",
   ];
   return `${months[Number(m)] ?? m} ${y}`;
+}
+
+const KIND_LABELS: Record<string, string> = {
+  ri:  "RI Çekiş",
+  rc:  "RC Çekiş",
+  rio: "RI Veriş",
+  rco: "RC Veriş",
+};
+
+function formatMessageType(mt: string): string {
+  const match = mt.match(/^reactive_(\w+?)_(warn|limit)$/);
+  if (!match) return mt;
+  const [, kind, level] = match;
+  const kindLabel = KIND_LABELS[kind] ?? kind.toUpperCase();
+  const levelLabel = level === "warn" ? "Uyari" : "Limit";
+  return `${kindLabel} ${levelLabel}`;
 }
 
 export default function AlertsPage() {
@@ -282,6 +298,77 @@ export default function AlertsPage() {
 
                 const riAlert = latestAlerts.find((r) => r.kind === "ri");
                 const rcAlert = latestAlerts.find((r) => r.kind === "rc");
+                const rioAlert = latestAlerts.find((r) => r.kind === "rio");
+                const rcoAlert = latestAlerts.find((r) => r.kind === "rco");
+                const hasVeris = !!(rioAlert || rcoAlert);
+
+                const renderStatusRow = (items: { label: string; alert: AlertStateRow | undefined; limit: number }[]) => (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 divide-y sm:divide-y-0 sm:divide-x divide-neutral-100">
+                    {items.map(({ label, alert, limit }) => {
+                      const status = alert?.status ?? "ok";
+                      const cfg = STATUS_CONFIG[status];
+                      const Icon = cfg.icon;
+                      const pct = alert?.last_value_pct;
+
+                      return (
+                        <div key={label} className="p-5">
+                          <div className="flex items-center justify-between mb-3">
+                            <span className="text-sm font-medium text-neutral-700">{label}</span>
+                            <span
+                              className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium ${cfg.bg} ${cfg.color} ${cfg.border} border`}
+                            >
+                              <Icon className={`h-3.5 w-3.5 ${cfg.iconColor}`} />
+                              {cfg.label}
+                            </span>
+                          </div>
+
+                          {pct != null && (
+                            <div className="space-y-2">
+                              <div className="flex items-baseline gap-1">
+                                <span className="text-2xl font-bold text-neutral-900">
+                                  {pct.toFixed(1)}
+                                </span>
+                                <span className="text-sm text-neutral-400">%</span>
+                              </div>
+
+                              {/* Progress bar */}
+                              <div className="relative h-2.5 w-full rounded-full bg-neutral-100 overflow-hidden">
+                                <div
+                                  className={`h-full rounded-full transition-all duration-500 ${
+                                    status === "limit"
+                                      ? "bg-gradient-to-r from-red-400 to-red-500"
+                                      : status === "warn"
+                                      ? "bg-gradient-to-r from-amber-400 to-amber-500"
+                                      : "bg-gradient-to-r from-emerald-400 to-emerald-500"
+                                  }`}
+                                  style={{ width: `${Math.min(pct, 100)}%` }}
+                                />
+                                <div
+                                  className="absolute top-0 h-full w-0.5 bg-neutral-600/50"
+                                  style={{ left: `${limit}%` }}
+                                />
+                              </div>
+
+                              <div className="flex items-center justify-between text-xs text-neutral-400">
+                                <span>Limit: %{limit}</span>
+                                {alert?.last_sent_at && (
+                                  <span className="flex items-center gap-1">
+                                    <Clock className="h-3 w-3" />
+                                    {formatDate(alert.last_sent_at)}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          )}
+
+                          {pct == null && (
+                            <p className="text-xs text-neutral-400">Veri bulunamadi</p>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
 
                 return (
                   <div
@@ -305,75 +392,31 @@ export default function AlertsPage() {
                       </div>
                     </div>
 
-                    {/* RI + RC Status */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 divide-y sm:divide-y-0 sm:divide-x divide-neutral-100">
-                      {[
-                        { label: "Reaktif Induktif (RI)", alert: riAlert, limit: 20, warn: 18 },
-                        { label: "Reaktif Kapasitif (RC)", alert: rcAlert, limit: 15, warn: 13 },
-                      ].map(({ label, alert, limit }) => {
-                        const status = alert?.status ?? "ok";
-                        const cfg = STATUS_CONFIG[status];
-                        const Icon = cfg.icon;
-                        const pct = alert?.last_value_pct;
-
-                        return (
-                          <div key={label} className="p-5">
-                            <div className="flex items-center justify-between mb-3">
-                              <span className="text-sm font-medium text-neutral-700">{label}</span>
-                              <span
-                                className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium ${cfg.bg} ${cfg.color} ${cfg.border} border`}
-                              >
-                                <Icon className={`h-3.5 w-3.5 ${cfg.iconColor}`} />
-                                {cfg.label}
-                              </span>
-                            </div>
-
-                            {pct != null && (
-                              <div className="space-y-2">
-                                <div className="flex items-baseline gap-1">
-                                  <span className="text-2xl font-bold text-neutral-900">
-                                    {pct.toFixed(1)}
-                                  </span>
-                                  <span className="text-sm text-neutral-400">%</span>
-                                </div>
-
-                                {/* Progress bar */}
-                                <div className="relative h-2.5 w-full rounded-full bg-neutral-100 overflow-hidden">
-                                  <div
-                                    className={`h-full rounded-full transition-all duration-500 ${
-                                      status === "limit"
-                                        ? "bg-gradient-to-r from-red-400 to-red-500"
-                                        : status === "warn"
-                                        ? "bg-gradient-to-r from-amber-400 to-amber-500"
-                                        : "bg-gradient-to-r from-emerald-400 to-emerald-500"
-                                    }`}
-                                    style={{ width: `${Math.min(pct, 100)}%` }}
-                                  />
-                                  <div
-                                    className="absolute top-0 h-full w-0.5 bg-neutral-600/50"
-                                    style={{ left: `${limit}%` }}
-                                  />
-                                </div>
-
-                                <div className="flex items-center justify-between text-xs text-neutral-400">
-                                  <span>Limit: %{limit}</span>
-                                  {alert?.last_sent_at && (
-                                    <span className="flex items-center gap-1">
-                                      <Clock className="h-3 w-3" />
-                                      {formatDate(alert.last_sent_at)}
-                                    </span>
-                                  )}
-                                </div>
-                              </div>
-                            )}
-
-                            {pct == null && (
-                              <p className="text-xs text-neutral-400">Veri bulunamadi</p>
-                            )}
-                          </div>
-                        );
-                      })}
+                    {/* Çekiş */}
+                    <div className="px-5 pt-3 pb-0">
+                      <span className="text-xs font-semibold text-neutral-400 uppercase tracking-wide">
+                        Çekiş
+                      </span>
                     </div>
+                    {renderStatusRow([
+                      { label: "Reaktif Induktif (RI)", alert: riAlert, limit: 20 },
+                      { label: "Reaktif Kapasitif (RC)", alert: rcAlert, limit: 15 },
+                    ])}
+
+                    {/* Veriş — yalnızca GES varsa */}
+                    {hasVeris && (
+                      <>
+                        <div className="border-t border-neutral-100 px-5 pt-3 pb-0">
+                          <span className="text-xs font-semibold text-neutral-400 uppercase tracking-wide">
+                            Veriş
+                          </span>
+                        </div>
+                        {renderStatusRow([
+                          { label: "Reaktif Induktif (RIO)", alert: rioAlert, limit: 20 },
+                          { label: "Reaktif Kapasitif (RCO)", alert: rcoAlert, limit: 15 },
+                        ])}
+                      </>
+                    )}
                   </div>
                 );
               })}
@@ -441,11 +484,7 @@ export default function AlertsPage() {
                                 : "bg-amber-50 text-amber-700"
                             }`}
                           >
-                            {log.message_type === "reactive_warn"
-                              ? "Uyari"
-                              : log.message_type === "reactive_limit"
-                              ? "Limit"
-                              : log.message_type}
+                            {formatMessageType(log.message_type)}
                           </span>
                         </td>
                         <td className="px-4 py-3 text-neutral-600 whitespace-nowrap font-mono text-xs">
