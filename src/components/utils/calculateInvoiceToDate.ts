@@ -213,6 +213,7 @@ export type MonthInvoiceToDateResult = {
   rangeEndIso: string;
 
   totalConsumptionKwh: number; // ptf ile eşleşen saatlerin tüketimi
+  totalProductionKwh: number;  // veriş (gn) toplam kWh
   skippedKwh: number;          // ptf olmayan saatler varsa
 
   monthlyPTF_tl_kwh: number;   // tüketim-ağırlıklı ort PTF
@@ -310,7 +311,7 @@ export async function computeMonthInvoiceToDate(params: {
     supabase,
     userId: uid,
     subscriptionSerno: subscriptionSerNo,
-    columns: "ts, cn, ri, rc",
+    columns: "ts, cn, ri, rc, gn",
     startIso: monthStartIso,
     endIso: cutoffIso,
     endInclusive: true,
@@ -325,14 +326,17 @@ export async function computeMonthInvoiceToDate(params: {
 
   let totalRi = 0;
   let totalRc = 0;
+  let totalGn = 0;
 
   for (const row of cons.data ?? []) {
     const cn = num((row as any).cn, 0);
     const ri = num((row as any).ri, 0);
     const rc = num((row as any).rc, 0);
+    const gn = num((row as any).gn, 0);
 
     totalRi += ri;
     totalRc += rc;
+    totalGn += gn;
 
     if (!(cn > 0)) continue;
 
@@ -479,6 +483,7 @@ export async function computeMonthInvoiceToDate(params: {
     powerExcessPrice,
     reactivePenaltyCharge,
     trafoDegeri,
+    totalProductionKwh: totalGn,
   });
 
   // YEKDEM mahsup: M-1 (tam ay)  — InvoiceDetail ile aynı mantık
@@ -575,6 +580,7 @@ export async function computeMonthInvoiceToDate(params: {
     rangeEndIso: cutoffIso,
 
     totalConsumptionKwh: billableKwh,
+    totalProductionKwh: totalGn,
     skippedKwh,
 
     monthlyPTF_tl_kwh: monthlyPTF,

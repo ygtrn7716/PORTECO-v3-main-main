@@ -344,6 +344,7 @@ export default function Dashboard() {
   // ✅ reaktif toplamlar (kVArh)
   const [prevMonthRi, setPrevMonthRi] = useState<number | null>(null);
   const [prevMonthRc, setPrevMonthRc] = useState<number | null>(null);
+  const [prevMonthGn, setPrevMonthGn] = useState<number | null>(null);
 
   // 2) Geçen ay ortalama PTF (TL/kWh)
   const [monthlyPTF, setMonthlyPTF] = useState<number | null>(null);
@@ -524,7 +525,7 @@ export default function Dashboard() {
           supabase,
           userId: uid,
           subscriptionSerno: selectedSub,
-          columns: "ts, cn, ri, rc",
+          columns: "ts, cn, ri, rc, gn",
           startIso: start.toDate().toISOString(),
           endIso: end.toDate().toISOString(),
         });
@@ -535,16 +536,19 @@ export default function Dashboard() {
         let sumCn = 0;
         let sumRi = 0;
         let sumRc = 0;
+        let sumGn = 0;
 
         for (const r of (hourly.data ?? []) as any[]) {
           sumCn += Number(r.cn) || 0;
           sumRi += Number(r.ri) || 0;
           sumRc += Number(r.rc) || 0;
+          sumGn += Number(r.gn) || 0;
         }
 
         setPrevMonthKwh(sumCn);
         setPrevMonthRi(sumRi);
         setPrevMonthRc(sumRc);
+        setPrevMonthGn(sumGn);
       } catch (e: any) {
         if (!cancel) {
           console.error("prev month kWh error:", e);
@@ -552,6 +556,7 @@ export default function Dashboard() {
           setPrevMonthKwh(null);
           setPrevMonthRi(null);
           setPrevMonthRc(null);
+          setPrevMonthGn(null);
         }
       } finally {
         if (!cancel) setPrevLoading(false);
@@ -921,6 +926,7 @@ export default function Dashboard() {
           powerExcessPrice,
           reactivePenaltyCharge,
           trafoDegeri,
+          totalProductionKwh: prevMonthGn ?? 0,
         });
 
         // ✅ YEKDEM mahsup (M-1)
@@ -1046,6 +1052,7 @@ export default function Dashboard() {
     prevMonthKwh,
     prevMonthRi,
     prevMonthRc,
+    prevMonthGn,
     monthlyPTF,
     monthlyYekdem,
     monthlyKbk,
@@ -1094,7 +1101,7 @@ export default function Dashboard() {
             supabase,
             userId: uid,
             subscriptionSerno: serno,
-            columns: "cn, ri, rc",
+            columns: "cn, ri, rc, gn",
             startIso: start.toDate().toISOString(),
             endIso: end.toDate().toISOString(),
           });
@@ -1102,10 +1109,12 @@ export default function Dashboard() {
           let subKwh = 0;
           let subRi = 0;
           let subRc = 0;
+          let subGn = 0;
           for (const r of (hourlyRes.data ?? []) as any[]) {
             subKwh += Number(r.cn) || 0;
             subRi += Number(r.ri) || 0;
             subRc += Number(r.rc) || 0;
+            subGn += Number(r.gn) || 0;
           }
           grandTotalKwh += subKwh;
 
@@ -1251,6 +1260,7 @@ export default function Dashboard() {
             powerExcessPrice,
             reactivePenaltyCharge,
             trafoDegeri,
+            totalProductionKwh: subGn,
           });
 
           // YEKDEM Mahsup (M-1)

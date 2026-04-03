@@ -67,6 +67,7 @@ interface PowerRecommendation {
 interface InvoiceViewData {
   breakdown: InvoiceBreakdown;
   totalConsumptionKwh: number;
+  totalProductionKwh: number;
   unitPriceEnergy: number;
   unitPriceDistribution: number;
   btvRate: number;
@@ -356,7 +357,7 @@ export default function InvoiceDetail() {
           supabase,
           userId: uid,
           subscriptionSerno: selectedSub,
-          columns: "ts, cn, ri, rc",
+          columns: "ts, cn, ri, rc, gn",
           startIso: monthStart.toDate().toISOString(),
           endIso: monthEndExclusive.toDate().toISOString(),
         });
@@ -366,11 +367,13 @@ export default function InvoiceDetail() {
         let totalConsumptionKwh = 0;
         let totalRi = 0;
         let totalRc = 0;
+        let totalGn = 0;
 
         for (const row of (hourly.data ?? []) as any[]) {
           totalConsumptionKwh += Number(row.cn) || 0;
           totalRi += Number(row.ri) || 0;
           totalRc += Number(row.rc) || 0;
+          totalGn += Number(row.gn) || 0;
         }
 
         // 2) PTF – TL/kWh
@@ -591,6 +594,7 @@ export default function InvoiceDetail() {
             reactivePenaltyCharge,
 
             trafoDegeri, // ✅
+            totalProductionKwh: totalGn,
           });
 
        //ara taşak madde ekliyom  buraya
@@ -767,7 +771,7 @@ try {
     trafoDegeri,
     trafoCharge: breakdown.trafoCharge,
     digerDegerler,
-    
+    totalProductionKwh: totalGn,
 
   });
 } catch (e) {
@@ -798,7 +802,8 @@ try {
             reactiveRiPercent: riPercent,
             reactiveRcPercent: rcPercent,          
             trafoDegeri, // ✅ ekle
-            digerDegerler
+            digerDegerler,
+            totalProductionKwh: totalGn,
           });
         }
       } catch (e: any) {
@@ -1113,6 +1118,11 @@ const isDualTerm = data?.tariffType === "dual";
                     <td className="py-2 pr-4 text-neutral-600">
                       {fmtUnit(data.unitPriceDistribution)} TL/kWh ×{" "}
                       {fmtKwh(data.breakdown.distributionBaseKwh)} kWh
+                      {data.breakdown.distributionAdjustment > 0 && (
+                        <span className="block text-xs text-amber-600 mt-0.5">
+                          + Veriş düzeltmesi: {fmtMoney2(data.breakdown.distributionAdjustment)} TL
+                        </span>
+                      )}
                     </td>
                     <td className="py-2 pr-4 text-right">
                       {fmtMoney2(data.breakdown.distributionCharge)}

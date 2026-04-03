@@ -51,6 +51,8 @@ export type InvoiceSnapshotRow = {
 
   diger_degerler: number | null;
 
+  total_production_kwh: number | null;
+  distribution_adjustment: number | null;
 };
 
 export async function upsertInvoiceSnapshot(params: {
@@ -90,7 +92,7 @@ export async function upsertInvoiceSnapshot(params: {
 
   digerDegerler: number; // ✅ ekle
 
-
+  totalProductionKwh?: number;
 }) {
   const invoiceType = params.invoiceType ?? "billed";
 
@@ -138,6 +140,8 @@ export async function upsertInvoiceSnapshot(params: {
 
     diger_degerler: params.digerDegerler,
 
+    total_production_kwh: params.totalProductionKwh ?? 0,
+    distribution_adjustment: params.breakdown.distributionAdjustment ?? 0,
   };
 
   const { error } = await supabase

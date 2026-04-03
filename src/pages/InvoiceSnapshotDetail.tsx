@@ -183,6 +183,11 @@ const yekdemCell = useMemo(() => {
                     <td className="py-2 pr-4">Dağıtım Bedeli</td>
                     <td className="py-2 pr-4 text-neutral-600">
                       {fmtUnit(row.unit_price_distribution)} TL/kWh × {fmtKwh(Number(row.total_consumption_kwh ?? 0) + Number(row.trafo_degeri ?? 0))} kWh
+                      {Number(row.distribution_adjustment ?? 0) > 0 && (
+                        <span className="block text-xs text-amber-600 mt-0.5">
+                          + Veriş düzeltmesi: {fmtMoney2(row.distribution_adjustment)} TL
+                        </span>
+                      )}
                     </td>
                     <td className="py-2 pr-4 text-right">{fmtMoney2(row.distribution_charge)}</td>
                   </tr>

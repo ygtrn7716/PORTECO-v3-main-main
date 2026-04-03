@@ -30,12 +30,15 @@ export interface InvoiceInput {
     // ✅ Trafo (kWh gibi düşün) – opsiyonel
   trafoDegeri?: number; // null/0 ise yok
 
+  // Veriş (gn) toplam kWh — pozitif değer; 0/undefined ise adj=0
+  totalProductionKwh?: number;
 }
 
 export interface InvoiceBreakdown {
   energyCharge: number;
   distributionCharge: number;
   distributionBaseKwh: number; // totalConsumptionKwh + trafoKwh
+  distributionAdjustment: number; // Veriş kaynaklı dağıtım düzeltmesi (her zaman >= 0)
   btvCharge: number;
 
   powerBaseCharge: number;
@@ -68,6 +71,7 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
     reactivePenaltyCharge: reactivePenaltyInput,
 
     trafoDegeri, // ✅
+    totalProductionKwh,
   } = input;
 
   // 1) Enerji + dağıtım
@@ -82,7 +86,18 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
   const trafoCharge = unitPriceEnergy * trafoKwh;
 
   const distributionBaseKwh = totalConsumptionKwh + trafoKwh;
-  const distributionCharge = unitPriceDistribution * distributionBaseKwh;
+
+  // Veriş düzeltmesi: gn pozitif gelir, formül için negatife çevir
+  const rawProduction = totalProductionKwh ?? 0;
+  const verisNeg = rawProduction > 0 ? -rawProduction : rawProduction;
+
+  const baseDagitim = unitPriceDistribution * distributionBaseKwh;
+
+  const netKwh = totalConsumptionKwh + verisNeg;
+  const distributionAdjustment =
+    netKwh !== 0 ? Math.abs((verisNeg * baseDagitim) / 2 / netKwh) : 0;
+
+  const distributionCharge = baseDagitim + distributionAdjustment;
 
   // 2) BTV (enerji üzerinden)
   // ✅ İstersen trafoyu da enerji sayıp BTV'ye dahil ediyoruz:
@@ -127,6 +142,7 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
     trafoCharge, // ✅
     distributionCharge,
     distributionBaseKwh,
+    distributionAdjustment,
     btvCharge,
     powerBaseCharge,
     powerExcessCharge,
