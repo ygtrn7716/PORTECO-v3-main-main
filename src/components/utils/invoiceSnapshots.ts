@@ -53,6 +53,8 @@ export type InvoiceSnapshotRow = {
 
   total_production_kwh: number | null;
   distribution_adjustment: number | null;
+  veris_kwh: number | null;
+  effective_distribution_unit_price: number | null;
 };
 
 export async function upsertInvoiceSnapshot(params: {
@@ -142,6 +144,8 @@ export async function upsertInvoiceSnapshot(params: {
 
     total_production_kwh: params.totalProductionKwh ?? 0,
     distribution_adjustment: params.breakdown.distributionAdjustment ?? 0,
+    veris_kwh: params.breakdown.verisKwh ?? 0,
+    effective_distribution_unit_price: params.breakdown.effectiveDistributionUnitPrice ?? 0,
   };
 
   const { error } = await supabase

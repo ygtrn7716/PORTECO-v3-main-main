@@ -59,19 +59,23 @@ import GesPlantsAdmin from "@/pages/admin/GesPlantsAdmin";
 import GesProductionAdmin from "@/pages/admin/GesProductionAdmin";
 import GesSyncLogAdmin from "@/pages/admin/GesSyncLogAdmin";
 import GesSatisHakkiAdmin from "@/pages/admin/GesSatisHakkiAdmin";
+import AdminUsersPage from "@/pages/admin/AdminUsersPage";
+import IntakeFormPage from "@/pages/IntakeFormPage";
+import IntakeFormsAdmin from "@/pages/admin/IntakeFormsAdmin";
 
 export default function App() {
   const { pathname } = useLocation();
   const isHome = pathname === "/";
 
+  const isBasvuru = pathname === "/basvuru";
   const hideFooter =
-    pathname.startsWith("/dashboard") || pathname.startsWith("/upload");
+    pathname.startsWith("/dashboard") || pathname.startsWith("/upload") || isBasvuru;
 
   return (
     <div className="min-h-screen flex flex-col">
-      <Header />
+      {!isBasvuru && <Header />}
 
-      <main className={`flex-1 ${isHome ? "" : "bg-[#F6F8FB]"}`}>
+      <main className={`flex-1 ${isHome || isBasvuru ? "" : "bg-[#F6F8FB]"}`}>
         <ScrollToTop />
 
         <Routes>
@@ -82,6 +86,7 @@ export default function App() {
           <Route path="/blog" element={<BlogPage />} />
           <Route path="/blog/:slug" element={<BlogDetailPage />} />
           <Route path="/iletisim" element={<ContactPage />} />
+          <Route path="/basvuru" element={<IntakeFormPage />} />
 
           {/* Protected */}
           <Route element={<ProtectedRoute />}>
@@ -125,6 +130,8 @@ export default function App() {
               <Route path="ges-production" element={<GesProductionAdmin />} />
               <Route path="ges-sync-logs" element={<GesSyncLogAdmin />} />
               <Route path="ges-satis-hakki" element={<GesSatisHakkiAdmin />} />
+              <Route path="kullanıcılar" element={<AdminUsersPage />} />
+              <Route path="tanimlama" element={<IntakeFormsAdmin />} />
             </Route>
           </Route>
         </Routes>

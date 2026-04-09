@@ -5,6 +5,8 @@ import { Users, Building2, ArrowDownWideNarrow } from "lucide-react";
 import { fetchAllConsumptionAdmin } from "@/lib/paginatedFetch";
 
 const quickLinks = [
+  { title: "Kullanıcı Yönetimi", to: "/dashboard/admin/kullanıcılar" },
+  { title: "Tanımlama Başvuruları", to: "/dashboard/admin/tanimlama" },
   { title: "Arıl Hesap Bilgileri", to: "/dashboard/admin/user-integrations" },
   { title: "Tesis Tarifeleri", to: "/dashboard/admin/subscription-settings" },
   { title: "Tesis Aylık YEKDEM", to: "/dashboard/admin/subscription-yekdem" },

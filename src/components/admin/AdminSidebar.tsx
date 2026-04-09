@@ -23,6 +23,7 @@ import {
   Calculator,
   Mail,
   Sun,
+  ClipboardList,
 } from "lucide-react";
 
 type NavItem = {
@@ -49,6 +50,7 @@ const NAV_CATEGORIES: NavCategory[] = [
     title: "Kullanıcılar",
     icon: <Users size={18} />,
     items: [
+      { label: "Kullanıcı Yönetimi", to: "/dashboard/admin/kullanıcılar", icon: <Users size={16} /> },
       { label: "User Integrations", to: "/dashboard/admin/user-integrations", icon: <Users size={16} /> },
       { label: "Owner Subscriptions", to: "/dashboard/admin/owner-subscriptions", icon: <Building2 size={16} /> },
       { label: "Notification Channels", to: "/dashboard/admin/notification-channels", icon: <Bell size={16} /> },
@@ -101,6 +103,7 @@ const NAV_CATEGORIES: NavCategory[] = [
     items: [
       { label: "Blog Posts", to: "/dashboard/admin/posts", icon: <FileText size={16} /> },
       { label: "İletişim Mesajları", to: "/dashboard/admin/contact-messages", icon: <MessageSquare size={16} /> },
+      { label: "Tanımlama Başvuruları", to: "/dashboard/admin/tanimlama", icon: <ClipboardList size={16} /> },
     ],
   },
   {

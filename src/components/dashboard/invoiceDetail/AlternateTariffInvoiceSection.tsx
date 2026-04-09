@@ -358,7 +358,7 @@ export default function AlternateTariffInvoiceSection(props: {
         if (diff > 0) {
           return (
             <div className="mt-1 text-xs font-medium text-emerald-700">
-              Tek terime geçilince tasarruf: {fmtMoney2(diff)} TL
+              {altTermText}e geçilince tasarruf: {fmtMoney2(diff)} TL
             </div>
           );
         }

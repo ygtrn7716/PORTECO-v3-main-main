@@ -603,13 +603,8 @@ useEffect(() => {
                   <tr className="border-b border-neutral-100">
                     <td className="py-2 pr-4">Dağıtım Bedeli</td>
                     <td className="py-2 pr-4 text-neutral-600">
-                      {fmtUnit6(invoiceToDate.unitPriceDistribution)} TL/kWh ×{" "}
-                      {fmtKwh(invoiceToDate.breakdown.distributionBaseKwh)} kWh
-                      {invoiceToDate.breakdown.distributionAdjustment > 0 && (
-                        <span className="block text-xs text-amber-600 mt-0.5">
-                          + Veriş düzeltmesi: {fmtMoney2(invoiceToDate.breakdown.distributionAdjustment)} TL
-                        </span>
-                      )}
+                      {fmtUnit6(invoiceToDate.breakdown.effectiveDistributionUnitPrice)} TL/kWh ×{" "}
+                      {fmtKwh(invoiceToDate.totalConsumptionKwh - invoiceToDate.breakdown.verisKwh)} kWh
                     </td>
                     <td className="py-2 pr-4 text-right">
                       {fmtMoney2(invoiceToDate.breakdown.distributionCharge)}

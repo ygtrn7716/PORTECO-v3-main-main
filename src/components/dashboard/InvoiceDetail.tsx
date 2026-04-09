@@ -1116,13 +1116,8 @@ const isDualTerm = data?.tariffType === "dual";
                   <tr className="border-b border-neutral-100">
                     <td className="py-2 pr-4">Dağıtım Bedeli</td>
                     <td className="py-2 pr-4 text-neutral-600">
-                      {fmtUnit(data.unitPriceDistribution)} TL/kWh ×{" "}
-                      {fmtKwh(data.breakdown.distributionBaseKwh)} kWh
-                      {data.breakdown.distributionAdjustment > 0 && (
-                        <span className="block text-xs text-amber-600 mt-0.5">
-                          + Veriş düzeltmesi: {fmtMoney2(data.breakdown.distributionAdjustment)} TL
-                        </span>
-                      )}
+                      {fmtUnit(data.breakdown.effectiveDistributionUnitPrice)} TL/kWh ×{" "}
+                      {fmtKwh(data.totalConsumptionKwh - data.breakdown.verisKwh)} kWh
                     </td>
                     <td className="py-2 pr-4 text-right">
                       {fmtMoney2(data.breakdown.distributionCharge)}
