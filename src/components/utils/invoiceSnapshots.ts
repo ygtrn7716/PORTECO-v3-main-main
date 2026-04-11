@@ -55,6 +55,9 @@ export type InvoiceSnapshotRow = {
   distribution_adjustment: number | null;
   veris_kwh: number | null;
   effective_distribution_unit_price: number | null;
+  on_yil: boolean | null;
+  veris_satis_bedeli: number | null;
+  perakende_enerji_bedeli: number | null;
 };
 
 export async function upsertInvoiceSnapshot(params: {
@@ -95,6 +98,8 @@ export async function upsertInvoiceSnapshot(params: {
   digerDegerler: number; // ✅ ekle
 
   totalProductionKwh?: number;
+  onYil?: boolean;
+  perakendeEnerjiBedeli?: number;
 }) {
   const invoiceType = params.invoiceType ?? "billed";
 
@@ -146,6 +151,9 @@ export async function upsertInvoiceSnapshot(params: {
     distribution_adjustment: params.breakdown.distributionAdjustment ?? 0,
     veris_kwh: params.breakdown.verisKwh ?? 0,
     effective_distribution_unit_price: params.breakdown.effectiveDistributionUnitPrice ?? 0,
+    on_yil: params.onYil ?? null,
+    veris_satis_bedeli: params.breakdown.verisSatisBedeli ?? 0,
+    perakende_enerji_bedeli: params.perakendeEnerjiBedeli ?? null,
   };
 
   const { error } = await supabase

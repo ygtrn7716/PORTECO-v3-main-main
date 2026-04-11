@@ -1,5 +1,5 @@
 //src/components/dashboard/InvoiceDetail.tsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef, useCallback } from "react";
 import { dayjsTR, TR_TZ } from "@/lib/dayjs";
 import { useSession } from "@/hooks/useSession";
 import { supabase } from "@/lib/supabase";
@@ -10,6 +10,8 @@ import { upsertInvoiceSnapshot } from "@/components/utils/invoiceSnapshots";
 import AlternateTariffInvoiceSection from "@/components/dashboard/invoiceDetail/AlternateTariffInvoiceSection";
 import { resolveSelectedSub } from "@/lib/subscriptionVisibility";
 import { fetchAllConsumption } from "@/lib/paginatedFetch";
+import { calculateGesOlmasaydi, type GesOlmasaydiResult } from "@/components/utils/calculateGesOlmasaydi";
+import GesOlmasaydiPanel from "@/components/dashboard/GesOlmasaydiPanel";
 
 import {
   calculateInvoice,
@@ -96,6 +98,8 @@ interface InvoiceViewData {
 
    digerDegerler: number;
 
+   onYil: boolean;
+   perakendeEnerjiBedeli: number;
 }
 
 function mapTermToTariffType(term: string | null | undefined): TariffType {
@@ -257,6 +261,15 @@ export default function InvoiceDetail() {
 
   const REACTIVE_LIMIT_RI = 20;
   const REACTIVE_LIMIT_RC = 15;
+
+  // ---- GES Olmasaydı panel
+  const [gesOlmasaydiOpen, setGesOlmasaydiOpen] = useState(false);
+  const [gesOlmasaydiResult, setGesOlmasaydiResult] = useState<GesOlmasaydiResult | null>(null);
+  const [gesOlmasaydiLoading, setGesOlmasaydiLoading] = useState(false);
+  const [gesOlmasaydiErr, setGesOlmasaydiErr] = useState<string | null>(null);
+  const [hasGes, setHasGes] = useState(false);
+  const gesOlmasaydiParamsRef = useRef<any>(null);
+  const gesOlmasaydiCalced = useRef(false);
 
   // 0) tesisleri çek
   useEffect(() => {
@@ -422,7 +435,7 @@ export default function InvoiceDetail() {
         // 4) tesis ayarları (KBK + tarife + güç limit) -> SADECE subscription_settings
         const settingsRes = await supabase
           .from("subscription_settings")
-          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri")
+          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -443,6 +456,8 @@ export default function InvoiceDetail() {
           settingsRes.data.guc_bedel_limit != null && Number.isFinite(Number(settingsRes.data.guc_bedel_limit))
             ? Number(settingsRes.data.guc_bedel_limit)
             : 0;
+
+        const onYil = settingsRes.data.on_yil ?? false;
 
         const missing: string[] = [];
         if (!terim) missing.push("terim");
@@ -502,7 +517,7 @@ export default function InvoiceDetail() {
         // 6) resmi dağıtım/güç tarifesi
         const tariffRes = await supabase
           .from("distribution_tariff_official")
-          .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel")
+          .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, perakende_enerji_bedeli")
           .eq("terim", terim)
           .eq("gerilim", gerilim)
           .eq("tarife", tarife)
@@ -516,6 +531,8 @@ export default function InvoiceDetail() {
 
         const unitPriceDistribution =
           tariffRow.dagitim_bedeli != null ? Number(tariffRow.dagitim_bedeli) : 0;
+        const perakendeEnerjiBedeli =
+          tariffRow.perakende_enerji_bedeli != null ? Number(tariffRow.perakende_enerji_bedeli) : 0;
         const powerPrice =
           tariffRow.guc_bedeli != null ? Number(tariffRow.guc_bedeli) : 0;
         const powerExcessPrice =
@@ -595,6 +612,8 @@ export default function InvoiceDetail() {
 
             trafoDegeri, // ✅
             totalProductionKwh: totalGn,
+            onYil,
+            perakendeEnerjiBedeli,
           });
 
        //ara taşak madde ekliyom  buraya
@@ -772,7 +791,8 @@ try {
     trafoCharge: breakdown.trafoCharge,
     digerDegerler,
     totalProductionKwh: totalGn,
-
+    onYil,
+    perakendeEnerjiBedeli,
   });
 } catch (e) {
   console.error("upsertInvoiceSnapshot error:", e);
@@ -804,7 +824,43 @@ try {
             trafoDegeri, // ✅ ekle
             digerDegerler,
             totalProductionKwh: totalGn,
+            onYil,
+            perakendeEnerjiBedeli,
           });
+
+          // GES olmasaydı — parametreleri sakla + GES kontrolü
+          gesOlmasaydiParamsRef.current = {
+            selectedSub,
+            periodYear,
+            periodMonth,
+            mevcutFatura: totalWithMahsup,
+            mevcutBirimFiyat: unitPriceEnergy,
+            mevcutTuketimKwh: totalConsumptionKwh,
+            monthlyYekdem,
+            kbk: kbk,
+            unitPriceDistribution,
+            btvRate,
+            vatRate,
+            tariffType,
+            contractPowerKw,
+            monthFinalDemandKw,
+            powerPrice,
+            powerExcessPrice,
+            reactivePenaltyCharge,
+            trafoDegeri,
+            onYil,
+            perakendeEnerjiBedeli,
+          };
+          gesOlmasaydiCalced.current = false;
+          setGesOlmasaydiResult(null);
+
+          // GES plant kontrolü
+          const { data: gesPlants } = await supabase
+            .from("ges_plants")
+            .select("id")
+            .eq("user_id", uid)
+            .eq("is_active", true);
+          setHasGes((gesPlants?.length ?? 0) > 0);
         }
       } catch (e: any) {
         if (!cancel) {
@@ -821,6 +877,48 @@ try {
       cancel = true;
     };
   }, [uid, sessionLoading, selectedSub]);
+
+  const handleGesOlmasaydiOpen = useCallback(async () => {
+    setGesOlmasaydiOpen(true);
+    if (gesOlmasaydiCalced.current) return;
+    const p = gesOlmasaydiParamsRef.current;
+    if (!p || !uid) return;
+
+    setGesOlmasaydiLoading(true);
+    setGesOlmasaydiErr(null);
+    try {
+      const result = await calculateGesOlmasaydi({
+        supabase,
+        userId: uid,
+        subscriptionSerno: p.selectedSub,
+        periodYear: p.periodYear,
+        periodMonth: p.periodMonth,
+        mevcutFatura: p.mevcutFatura,
+        mevcutBirimFiyat: p.mevcutBirimFiyat,
+        mevcutTuketimKwh: p.mevcutTuketimKwh,
+        monthlyYekdem: p.monthlyYekdem,
+        kbk: p.kbk,
+        unitPriceDistribution: p.unitPriceDistribution,
+        btvRate: p.btvRate,
+        vatRate: p.vatRate,
+        tariffType: p.tariffType,
+        contractPowerKw: p.contractPowerKw,
+        monthFinalDemandKw: p.monthFinalDemandKw,
+        powerPrice: p.powerPrice,
+        powerExcessPrice: p.powerExcessPrice,
+        reactivePenaltyCharge: p.reactivePenaltyCharge,
+        trafoDegeri: p.trafoDegeri,
+        onYil: p.onYil,
+        perakendeEnerjiBedeli: p.perakendeEnerjiBedeli,
+      });
+      setGesOlmasaydiResult(result);
+      gesOlmasaydiCalced.current = true;
+    } catch (e: any) {
+      setGesOlmasaydiErr(e?.message ?? "Hesaplama hatası");
+    } finally {
+      setGesOlmasaydiLoading(false);
+    }
+  }, [uid]);
 
   const selectedSubLabel = (() => {
     const s = subs.find((s) => s.subscriptionSerNo === selectedSub);
@@ -1066,6 +1164,9 @@ const isDualTerm = data?.tariffType === "dual";
             currentTotalWithMahsup={data.totalWithMahsup}
             hasYekdemMahsup={data.hasYekdemMahsup}
             yekdemMahsup={data.yekdemMahsup}
+            totalProductionKwh={data.totalProductionKwh}
+            onYil={data.onYil}
+            perakendeEnerjiBedeli={data.perakendeEnerjiBedeli}
           />
 
 
@@ -1168,6 +1269,32 @@ const isDualTerm = data?.tariffType === "dual";
                     </td>
                   </tr>
 
+                  {/* Veriş Mahsup — çekişi geçmeyen kısım (birim fiyatla) */}
+                  {data.breakdown.verisMahsupKwh > 0 && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4 text-emerald-700">Veriş Mahsup (Birim Fiyat)</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        {fmtUnit(data.unitPriceEnergy)} TL/kWh × {fmtKwh(data.breakdown.verisMahsupKwh)} kWh
+                      </td>
+                      <td className="py-2 pr-4 text-right text-emerald-700">
+                        −{fmtMoney2(data.breakdown.verisMahsupKwh * data.unitPriceEnergy)}
+                      </td>
+                    </tr>
+                  )}
+
+                  {/* Veriş Fazla — çekişi geçen kısım (perakende ile) */}
+                  {data.breakdown.verisFazlaKwh > 0 && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4 text-emerald-700">Veriş Satış (Perakende)</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        {fmtUnit(data.perakendeEnerjiBedeli)} TL/kWh × {fmtKwh(data.breakdown.verisFazlaKwh)} kWh
+                      </td>
+                      <td className="py-2 pr-4 text-right text-emerald-700">
+                        −{fmtMoney2(data.breakdown.verisFazlaKwh * data.perakendeEnerjiBedeli)}
+                      </td>
+                    </tr>
+                  )}
+
                   <tr className="border-t border-neutral-200">
                     <td className="py-2 pr-4 font-semibold">KDV Hariç Toplam</td>
                     <td className="py-2 pr-4 text-neutral-600">Ara toplam</td>
@@ -1261,6 +1388,24 @@ const isDualTerm = data?.tariffType === "dual";
           </div>
         </>
       )}
+      {/* GES Olmasaydı tetik butonu */}
+      {hasGes && data && (
+        <button
+          onClick={handleGesOlmasaydiOpen}
+          className="fixed bottom-6 right-6 z-30 flex items-center gap-2 rounded-full bg-amber-500 px-5 py-3 text-sm font-medium text-white shadow-lg hover:bg-amber-600 transition-colors"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+          GES Olmasaydı?
+        </button>
+      )}
+
+      <GesOlmasaydiPanel
+        open={gesOlmasaydiOpen}
+        onClose={() => setGesOlmasaydiOpen(false)}
+        loading={gesOlmasaydiLoading}
+        result={gesOlmasaydiResult}
+        error={gesOlmasaydiErr}
+      />
     </DashboardShell>
   );
 }

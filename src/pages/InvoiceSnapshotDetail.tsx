@@ -227,6 +227,18 @@ const yekdemCell = useMemo(() => {
                     </tr>
                   )}
 
+                  {Number(row.veris_satis_bedeli ?? 0) > 0 && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4 text-emerald-700">Veriş Satış Bedeli (Mahsup)</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        {fmtKwh(Number(row.veris_kwh ?? row.total_production_kwh ?? 0))} kWh veriş
+                      </td>
+                      <td className="py-2 pr-4 text-right text-emerald-700">
+                        −{fmtMoney2(row.veris_satis_bedeli)}
+                      </td>
+                    </tr>
+                  )}
+
                   <tr className="border-t border-neutral-200">
                     <td className="py-2 pr-4 font-semibold">KDV Hariç Toplam</td>
                     <td className="py-2 pr-4 text-neutral-600">Ara toplam</td>

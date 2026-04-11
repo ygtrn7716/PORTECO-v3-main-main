@@ -788,7 +788,7 @@ export default function Dashboard() {
         // 5.1) settings
         const { data: settings, error: settingsErr } = await supabase
           .from("subscription_settings")
-          .select("terim, gerilim, tarife, guc_bedel_limit, trafo_degeri")
+          .select("terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -805,6 +805,7 @@ export default function Dashboard() {
         const terim = settings.terim ?? null;
         const gerilim = settings.gerilim ?? null;
         const tarife = settings.tarife ?? null;
+        const onYil = settings.on_yil ?? false;
 
         const trafoDegeri =
           settings.trafo_degeri != null && Number.isFinite(Number(settings.trafo_degeri))
@@ -824,7 +825,7 @@ export default function Dashboard() {
         // 5.2) tariff (+ reaktif_bedel)
         const { data: tariffRow, error: tariffErr } = await supabase
           .from("distribution_tariff_official")
-          .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel")
+          .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, perakende_enerji_bedeli")
           .eq("terim", terim)
           .eq("gerilim", gerilim)
           .eq("tarife", tarife)
@@ -880,6 +881,9 @@ export default function Dashboard() {
         const unitPriceDistribution =
           tariffRow.dagitim_bedeli != null ? Number(tariffRow.dagitim_bedeli) : 0;
 
+        const perakendeEnerjiBedeli =
+          tariffRow.perakende_enerji_bedeli != null ? Number(tariffRow.perakende_enerji_bedeli) : 0;
+
         const powerPrice =
           tariffRow.guc_bedeli != null ? Number(tariffRow.guc_bedeli) : 0;
 
@@ -927,6 +931,8 @@ export default function Dashboard() {
           reactivePenaltyCharge,
           trafoDegeri,
           totalProductionKwh: prevMonthGn ?? 0,
+          onYil,
+          perakendeEnerjiBedeli,
         });
 
         // ✅ YEKDEM mahsup (M-1)
@@ -1173,7 +1179,7 @@ export default function Dashboard() {
           // KBK
           const { data: kbkData } = await supabase
             .from("subscription_settings")
-            .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri")
+            .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil")
             .eq("user_id", uid)
             .eq("subscription_serno", serno)
             .maybeSingle();
@@ -1188,12 +1194,13 @@ export default function Dashboard() {
           if (!terim || !gerilim || !tarife) continue;
 
           const trafoDegeri = kbkData.trafo_degeri != null && Number.isFinite(Number(kbkData.trafo_degeri)) ? Number(kbkData.trafo_degeri) : 0;
+          const subOnYil = kbkData.on_yil ?? false;
           const gucLimit = kbkData.guc_bedel_limit != null ? Number(kbkData.guc_bedel_limit) : 0;
 
           // Tariff
           const { data: tariffRow } = await supabase
             .from("distribution_tariff_official")
-            .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel")
+            .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, perakende_enerji_bedeli")
             .eq("terim", terim)
             .eq("gerilim", gerilim)
             .eq("tarife", tarife)
@@ -1247,6 +1254,8 @@ export default function Dashboard() {
           const rcPenaltyEnergy = rcPercent > REACTIVE_LIMIT_RC ? subRc : 0;
           const reactivePenaltyCharge = (riPenaltyEnergy + rcPenaltyEnergy) * reactiveUnitPrice;
 
+          const subPerakende = tariffRow.perakende_enerji_bedeli != null ? Number(tariffRow.perakende_enerji_bedeli) : 0;
+
           const breakdown = calculateInvoice({
             totalConsumptionKwh: subKwh,
             unitPriceEnergy,
@@ -1261,6 +1270,8 @@ export default function Dashboard() {
             reactivePenaltyCharge,
             trafoDegeri,
             totalProductionKwh: subGn,
+            onYil: subOnYil,
+            perakendeEnerjiBedeli: subPerakende,
           });
 
           // YEKDEM Mahsup (M-1)

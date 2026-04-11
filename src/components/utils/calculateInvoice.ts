@@ -32,6 +32,10 @@ export interface InvoiceInput {
 
   // Veriş (gn) toplam kWh — pozitif değer; 0/undefined ise adj=0
   totalProductionKwh?: number;
+
+  // GES lisans durumu
+  onYil?: boolean;               // true = 10+ yıl (PTF ile satış), false = ulusal tarife
+  perakendeEnerjiBedeli?: number; // TL/kWh, distribution_tariff_official'dan
 }
 
 export interface InvoiceBreakdown {
@@ -49,6 +53,11 @@ export interface InvoiceBreakdown {
 
   // 🔥 Reaktif ceza (KDV öncesi)
   reactivePenaltyCharge: number;
+
+  // Veriş satış bedeli (ulusal tarife mahsubu)
+  verisMahsupKwh: number;   // min(verisKwh, totalConsumptionKwh) — birim fiyatla mahsup edilen
+  verisFazlaKwh: number;    // max(0, verisKwh - totalConsumptionKwh) — perakende ile satılan
+  verisSatisBedeli: number; // toplam: (mahsup×unitPrice) + (fazla×perakende)
 
   subtotalBeforeVat: number;
   vatCharge: number;
@@ -131,6 +140,22 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
       ? reactivePenaltyInput
       : 0;
 
+  // 4.5) Veriş satış bedeli (ulusal tarife mahsubu — iki katmanlı)
+  const onYil = input.onYil ?? true;
+  const perakendeEnerjiBedeli = input.perakendeEnerjiBedeli ?? 0;
+
+  // Çekişi geçmeyen kısım → o ayın birim fiyatıyla mahsup
+  // Çekişi geçen kısım → perakende enerji bedeliyle satılır
+  const verisMahsupKwh = !onYil && verisKwh > 0
+    ? Math.min(verisKwh, totalConsumptionKwh)
+    : 0;
+  const verisFazlaKwh = !onYil && verisKwh > 0
+    ? Math.max(0, verisKwh - totalConsumptionKwh)
+    : 0;
+  const verisSatisBedeli = !onYil && verisKwh > 0
+    ? (verisMahsupKwh * unitPriceEnergy) + (verisFazlaKwh * perakendeEnerjiBedeli)
+    : 0;
+
   // 5) Ara toplam + KDV
   const subtotalBeforeVat =
     energyCharge +
@@ -138,7 +163,8 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
     distributionCharge +
     btvCharge +
     powerTotalCharge +
-    reactivePenaltyCharge;
+    reactivePenaltyCharge -
+    verisSatisBedeli;
 
   const vatCharge = subtotalBeforeVat * vatRate;
   const totalInvoice = subtotalBeforeVat + vatCharge;
@@ -156,6 +182,9 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
     powerExcessCharge,
     powerTotalCharge,
     reactivePenaltyCharge,
+    verisMahsupKwh,
+    verisFazlaKwh,
+    verisSatisBedeli,
     subtotalBeforeVat,
     vatCharge,
     totalInvoice,

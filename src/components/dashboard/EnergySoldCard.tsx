@@ -93,7 +93,7 @@ export default function EnergySoldCard() {
           supabase,
           userId: uid,
           subscriptionSerno: selectedSerno,
-          columns: "ts, gn",
+          columns: "ts, gn, cn",
           startIso,
           endIso,
           endInclusive: true,
@@ -138,8 +138,10 @@ export default function EnergySoldCard() {
         // Adım 3: Saat bazında eşleştirme ve brüt gelir hesaplama
         let brutGelir = 0;
         let toplamVerisKwh = 0;
+        let toplamCekisKwh = 0;
 
         for (const hour of hourlyData) {
+          toplamCekisKwh += Number((hour as any).cn) || 0;
           const gn = Number(hour.gn) || 0;
           if (gn <= 0) continue;
 
@@ -157,7 +159,7 @@ export default function EnergySoldCard() {
         // Adım 4: Dağıtım bedeli kesintisi
         const { data: settings, error: settingsErr } = await supabase
           .from("subscription_settings")
-          .select("terim, gerilim, tarife")
+          .select("terim, gerilim, tarife, on_yil")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSerno)
           .single();
@@ -172,7 +174,7 @@ export default function EnergySoldCard() {
 
           const { data: tariff } = await supabase
             .from("distribution_tariff_official")
-            .select("dagitim_bedeli")
+            .select("dagitim_bedeli, perakende_enerji_bedeli")
             .eq("terim", terim)
             .eq("gerilim", gerilim)
             .eq("tarife", tarife)
@@ -183,6 +185,37 @@ export default function EnergySoldCard() {
           if (tariff) {
             dagitimBedeli = Number(tariff.dagitim_bedeli) || 0;
             dagitimKesintisi = toplamVerisKwh * (dagitimBedeli / 2);
+
+            // on_yil=false ise iki katmanlı hesap:
+            // çekişi geçmeyen kısım → PTF brüt gelir (zaten hesaplandı) yerine birim fiyat ile
+            // çekişi geçen kısım → perakende enerji bedeli ile
+            const settingsOnYil = (settings as any).on_yil ?? false;
+            if (!settingsOnYil) {
+              const perakendeRate = Number(tariff.perakende_enerji_bedeli) || 0;
+              // PTF-bazlı brutGelir zaten hesaplandı; onu override ediyoruz
+              // Burada birim fiyat bilgisi yok — ama brutGelir PTF ile hesaplandığı için
+              // çekiş kısmı zaten PTF geliri olarak doğru.
+              // Sadece fazla kısım perakende ile hesaplanacak.
+              const mahsupKwh = Math.min(toplamVerisKwh, toplamCekisKwh);
+              const fazlaKwh = Math.max(0, toplamVerisKwh - toplamCekisKwh);
+
+              if (fazlaKwh > 0 && perakendeRate > 0) {
+                // PTF gelirini yeniden hesapla: sadece mahsup kısmı PTF ile
+                let ptfGelirMahsup = 0;
+                let kalan = mahsupKwh;
+                for (const hour of hourlyData) {
+                  const gn = Number(hour.gn) || 0;
+                  if (gn <= 0 || kalan <= 0) continue;
+                  const kullan = Math.min(gn, kalan);
+                  const key = dayjsTR(hour.ts).format("YYYY-MM-DD HH");
+                  const ptfMwh = ptfMap.get(key);
+                  if (ptfMwh != null) ptfGelirMahsup += kullan * (ptfMwh / 1000);
+                  kalan -= kullan;
+                }
+                brutGelir = ptfGelirMahsup + (fazlaKwh * perakendeRate);
+              }
+              // fazlaKwh = 0 ise tümü PTF ile → mevcut brutGelir doğru
+            }
           }
         }
 

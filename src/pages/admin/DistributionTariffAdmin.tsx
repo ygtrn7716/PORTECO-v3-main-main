@@ -22,6 +22,7 @@ export default function DistributionTariffAdmin() {
           { key: "reaktif_bedel", label: "reaktif_bedel", type: "number" },
           { key: "kdv", label: "kdv", type: "number" },
           { key: "btv", label: "btv", type: "number" },
+          { key: "perakende_enerji_bedeli", label: "perakende_enerji_bedeli", type: "number" },
         ],
       }}
     />

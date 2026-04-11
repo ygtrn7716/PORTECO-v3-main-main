@@ -28,6 +28,7 @@ type SettingsForm = {
   guc_bedel_limit: number | null;
   trafo_degeri: number | null;
   nickname: string | null;
+  on_yil: boolean;
 };
 
 type YekdemMonth = {
@@ -47,6 +48,7 @@ const EMPTY_SETTINGS: SettingsForm = {
   guc_bedel_limit: null,
   trafo_degeri: null,
   nickname: null,
+  on_yil: false,
 };
 
 const MONTH_NAMES = [
@@ -199,7 +201,7 @@ export default function AdminUsersPage() {
     (async () => {
       const { data } = await supabase
         .from("subscription_settings")
-        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname")
+        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil")
         .eq("user_id", selectedUserId)
         .eq("subscription_serno", selectedSerno)
         .maybeSingle();
@@ -615,6 +617,19 @@ export default function AdminUsersPage() {
                         onChange={(e) => setSettings((p) => ({ ...p, trafo_degeri: numOrNull(e.target.value) }))}
                         className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
                       />
+                    </label>
+
+                    {/* 10 Yıl Üstü Lisans */}
+                    <label className="flex items-center gap-2 mt-1">
+                      <input
+                        type="checkbox"
+                        checked={settings.on_yil ?? false}
+                        onChange={(e) => setSettings((p) => ({ ...p, on_yil: e.target.checked }))}
+                        className="rounded border-neutral-300"
+                      />
+                      <span className="text-xs font-medium text-neutral-600">
+                        10 Yıl Üstü Lisans (PTF ile Satış)
+                      </span>
                     </label>
 
                     {/* Save */}

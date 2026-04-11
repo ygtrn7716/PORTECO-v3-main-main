@@ -359,7 +359,7 @@ export async function computeMonthInvoiceToDate(params: {
   // settings: KBK, terim, gerilim, tarife, güç limit, trafo
   const settingsRes = await supabase
     .from("subscription_settings")
-    .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri")
+    .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil")
     .eq("user_id", uid)
     .eq("subscription_serno", subscriptionSerNo)
     .maybeSingle();
@@ -374,6 +374,7 @@ export async function computeMonthInvoiceToDate(params: {
 
   const contractPowerKw = num(settingsRes.data.guc_bedel_limit, 0);
   const trafoDegeri = num(settingsRes.data.trafo_degeri, 0);
+  const onYil = settingsRes.data.on_yil ?? false;
 
   if (!terim || !gerilim || !tarife) return null;
 
@@ -411,7 +412,7 @@ export async function computeMonthInvoiceToDate(params: {
   // resmi dağıtım/güç tarifesi
   const tariffRes = await supabase
     .from("distribution_tariff_official")
-    .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel")
+    .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, perakende_enerji_bedeli")
     .eq("terim", terim)
     .eq("gerilim", gerilim)
     .eq("tarife", tarife)
@@ -422,6 +423,7 @@ export async function computeMonthInvoiceToDate(params: {
   if (!t) return null;
 
   const unitPriceDistribution = num(t.dagitim_bedeli, 0);
+  const perakendeEnerjiBedeli = num((t as any).perakende_enerji_bedeli, 0);
   const powerPrice = num(t.guc_bedeli, 0);
   const powerExcessPrice = num(t.guc_bedeli_asim, 0);
 
@@ -484,6 +486,8 @@ export async function computeMonthInvoiceToDate(params: {
     reactivePenaltyCharge,
     trafoDegeri,
     totalProductionKwh: totalGn,
+    onYil,
+    perakendeEnerjiBedeli,
   });
 
   // YEKDEM mahsup: M-1 (tam ay)  — InvoiceDetail ile aynı mantık
