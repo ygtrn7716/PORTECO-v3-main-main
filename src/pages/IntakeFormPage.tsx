@@ -226,7 +226,11 @@ export default function IntakeFormPage() {
     });
     setSubmitting(false);
     if (error) {
-      setErrors({ submit: "Gönderim sırasında hata oluştu. Lütfen tekrar deneyin." });
+      if (error.message?.includes("Rate limit")) {
+        setErrors({ submit: "Çok fazla gönderim yaptınız. Lütfen daha sonra tekrar deneyin." });
+      } else {
+        setErrors({ submit: "Gönderim sırasında hata oluştu. Lütfen tekrar deneyin." });
+      }
       return;
     }
     setStep(3);

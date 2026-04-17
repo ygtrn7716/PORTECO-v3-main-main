@@ -12,7 +12,7 @@ import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": "https://ecoenerji.net.tr",
   "Access-Control-Allow-Headers":
     "authorization, x-client-info, apikey, content-type",
 };
@@ -96,7 +96,7 @@ serve(async (req) => {
   } catch (err) {
     console.error("contact-notify error:", err);
     return new Response(
-      JSON.stringify({ error: (err as Error).message }),
+      JSON.stringify({ error: "İşlem sırasında bir hata oluştu." }),
       {
         status: 500,
         headers: { ...CORS_HEADERS, "Content-Type": "application/json" },

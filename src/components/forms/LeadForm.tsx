@@ -64,7 +64,16 @@ export default function LeadForm({
         .from("contact_messages")
         .insert(contactRecord);
 
-      if (error) throw error;
+      if (error) {
+        if (error.message?.includes("Rate limit")) {
+          setResult({
+            ok: false,
+            msg: "Çok fazla gönderim yaptınız. Lütfen daha sonra tekrar deneyin.",
+          });
+          return;
+        }
+        throw error;
+      }
 
       setResult({
         ok: true,

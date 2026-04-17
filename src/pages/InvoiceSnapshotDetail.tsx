@@ -189,7 +189,7 @@ const yekdemCell = useMemo(() => {
 
                   <tr className="border-b border-neutral-100">
                     <td className="py-2 pr-4">BTV (%{((Number(row.btv_rate ?? 0)) * 100).toFixed(2)})</td>
-                    <td className="py-2 pr-4 text-neutral-600">Enerji bedeli × BTV oranı</td>
+                    <td className="py-2 pr-4 text-neutral-600">Net enerji bedeli × BTV oranı</td>
                     <td className="py-2 pr-4 text-right">{fmtMoney2(row.btv_charge)}</td>
                   </tr>
 

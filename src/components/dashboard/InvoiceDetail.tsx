@@ -1230,7 +1230,7 @@ const isDualTerm = data?.tariffType === "dual";
                       BTV (%{(data.btvRate * 100).toFixed(2)})
                     </td>
                     <td className="py-2 pr-4 text-neutral-600">
-                      Enerji bedeli × BTV oranı
+                      Net enerji bedeli × BTV oranı
                     </td>
                     <td className="py-2 pr-4 text-right">
                       {fmtMoney2(data.breakdown.btvCharge)}

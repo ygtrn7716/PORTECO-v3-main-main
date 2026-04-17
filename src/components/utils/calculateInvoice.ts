@@ -45,6 +45,8 @@ export interface InvoiceBreakdown {
   distributionAdjustment: number; // Veriş kaynaklı dağıtım indirimi = (D/2) × verişKwh
   verisKwh: number; // Dağıtım hesabında kullanılan veriş kWh
   effectiveDistributionUnitPrice: number; // distributionCharge / netKwh
+  netEnergyKwh: number;     // totalConsumptionKwh - verisKwh
+  netEnergyCharge: number;  // unitPriceEnergy × netEnergyKwh
   btvCharge: number;
 
   powerBaseCharge: number;
@@ -114,10 +116,11 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
 
   console.log('[DAGITIM]', { verisKwh, cekisCharge, distributionAdjustment, distributionCharge, effectiveDistributionUnitPrice, netKwh });
 
-  // 2) BTV (enerji üzerinden)
-  // ✅ İstersen trafoyu da enerji sayıp BTV'ye dahil ediyoruz:
-  const btvCharge = (energyCharge + trafoCharge) * btvRate;
-  // (Eğer BTV trafoya uygulanmasın istersen: const btvCharge = energyCharge * btvRate;)
+  // 2) BTV (net enerji bedeli üzerinden — veriş mahsuplu)
+  // netKwh = totalConsumptionKwh - verisKwh (dağıtımda da aynı)
+  const netEnergyKwh = Math.abs(netKwh);  // çekiş - veriş, mutlak değer
+  const netEnergyCharge = unitPriceEnergy * netEnergyKwh;
+  const btvCharge = (netEnergyCharge + trafoCharge) * btvRate;
 
   // 3) Güç bedeli...
   let powerBaseCharge = 0;
@@ -177,6 +180,8 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
     distributionAdjustment,
     verisKwh,
     effectiveDistributionUnitPrice,
+    netEnergyKwh,
+    netEnergyCharge,
     btvCharge,
     powerBaseCharge,
     powerExcessCharge,
