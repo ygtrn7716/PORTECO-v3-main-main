@@ -4,6 +4,13 @@
 
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
+import {
+  buildReactiveAlertEmail,
+  trDateISO,
+  trTimeNow,
+  type Breach,
+  type SubInfo,
+} from "./lib/reactive-email-template";
 
 /* ── Environment Variables ── */
 const SUPABASE_URL = process.env.VITE_SUPABASE_URL!;
@@ -125,16 +132,19 @@ async function sendSms(phone: string, text: string): Promise<string | null> {
 
 /* ── Email Gonderim (Resend) ── */
 
-async function sendEmail(to: string, subject: string, text: string): Promise<string | null> {
-  if (!RESEND_API_KEY || !RESEND_FROM) return null;
-
+async function sendHtmlEmail(
+  to: string,
+  subject: string,
+  html: string,
+  text: string,
+): Promise<string | null> {
   const resp = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${RESEND_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ from: RESEND_FROM, to: [to], subject, text }),
+    body: JSON.stringify({ from: RESEND_FROM, to: [to], subject, html, text }),
   });
 
   const body = await resp.text();
@@ -146,13 +156,16 @@ async function sendEmail(to: string, subject: string, text: string): Promise<str
   return body;
 }
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 /* ── Email Log ── */
 
 async function logEmail(params: {
   userId: string;
-  subscriptionSerno: number;
+  subscriptionSerno: number | null;
   emailAddress: string;
   subject: string;
+  messageType: string;
   messageBody: string;
   status: "sent" | "failed";
   providerResponse?: string | null;
@@ -160,9 +173,10 @@ async function logEmail(params: {
 }) {
   await supabase.from("email_logs").insert({
     user_id: params.userId,
-    subscription_serno: String(params.subscriptionSerno),
+    subscription_serno: params.subscriptionSerno != null ? String(params.subscriptionSerno) : null,
     email_address: params.emailAddress,
     subject: params.subject,
+    message_type: params.messageType,
     message_body: params.messageBody,
     status: params.status,
     provider_response: params.providerResponse ? { raw: params.providerResponse } : null,
@@ -210,7 +224,10 @@ async function main() {
   }
 
   if (!RESEND_API_KEY || !RESEND_FROM) {
-    log("WARNING: Missing RESEND credentials - Email will not be sent");
+    log(
+      "ERROR: RESEND_API_KEY ve RESEND_FROM tanimli degil (orn. /opt/porteco/.env). Mail gonderilemiyor — script duruyor.",
+    );
+    process.exit(1);
   }
 
   const periodYM = trYM();
@@ -259,19 +276,22 @@ async function main() {
     }[];
 
     // user_emails tablosundan aktif emailleri al
+    // Mail sadece is_active filtresi ile gider (spec gereji receive_alerts uygulanmiyor)
     const { data: emailRows } = await supabase
       .from("user_emails")
-      .select("email, receive_warnings, receive_alerts")
+      .select("email")
       .eq("user_id", userId)
       .eq("is_active", true);
 
-    const emails = (emailRows ?? []) as {
-      email: string;
-      receive_warnings: boolean;
-      receive_alerts: boolean;
-    }[];
+    const emails = (emailRows ?? []) as { email: string }[];
 
     if (phones.length === 0 && emails.length === 0) continue;
+
+    // Limit gecisi olan tesisleri user bazinda topla — tek mail icinde gonderilecek
+    type GridRow = { ri_pct: number; rc_pct: number; ri_breach: boolean; rc_breach: boolean };
+    type ProdRow = { rio_pct: number; rco_pct: number; rio_breach: boolean; rco_breach: boolean };
+    const gridLimit = new Map<number, GridRow>();
+    const prodLimit = new Map<number, ProdRow>();
 
     const { data: subs, error: subsErr } = await supabase
       .from("owner_subscriptions")
@@ -348,7 +368,7 @@ async function main() {
           { onConflict: "user_id,subscription_serno,kind,period_ym" }
         );
 
-        if (!shouldSend || nextLevel === "ok") continue;
+        if (!shouldSend) continue;
 
         const text = msgText({
           kind,
@@ -398,45 +418,15 @@ async function main() {
           }
         }
 
-        // Email gonder — her aktif email adresine
-        const targetEmails = emails.filter((e) =>
-          nextLevel === "warn" ? e.receive_warnings : e.receive_alerts
-        );
-
-        const subjectPrefix = `${meterSerial ?? ""} ${title ?? ""}`.trim();
-        const emailSubject =
-          nextLevel === "warn"
-            ? `${subjectPrefix} - Reaktif uyari: sinira yaklasiyor`
-            : `${subjectPrefix} - Reaktif uyari: limit asildi`;
-
-        for (const em of targetEmails) {
-          try {
-            const providerResp = await sendEmail(em.email, emailSubject, text);
-            await logEmail({
-              userId,
-              subscriptionSerno: subNo,
-              emailAddress: em.email,
-              subject: emailSubject,
-              messageBody: text,
-              status: "sent",
-              providerResponse: providerResp,
-            });
-            log(`Email sent to ${em.email}`);
-            emailSent++;
-          } catch (e) {
-            const errMsg = (e as Error).message;
-            log(`Email failed to ${em.email}: ${errMsg}`);
-            await logEmail({
-              userId,
-              subscriptionSerno: subNo,
-              emailAddress: em.email,
-              subject: emailSubject,
-              messageBody: text,
-              status: "failed",
-              errorMessage: errMsg,
-            });
-            errorCount++;
-          }
+        // Mail tetigi: yalnizca limit gecisinde, kullanici bazli buffer'a topla
+        if (nextLevel === "limit") {
+          const cur =
+            gridLimit.get(subNo) ?? { ri_pct: riPct, rc_pct: rcPct, ri_breach: false, rc_breach: false };
+          cur.ri_pct = riPct;
+          cur.rc_pct = rcPct;
+          if (kind === "ri") cur.ri_breach = true;
+          if (kind === "rc") cur.rc_breach = true;
+          gridLimit.set(subNo, cur);
         }
       }
 
@@ -479,7 +469,7 @@ async function main() {
             { onConflict: "user_id,subscription_serno,kind,period_ym" }
           );
 
-          if (!shouldSend || nextLevel === "ok") continue;
+          if (!shouldSend) continue;
 
           const text = msgText({ kind, level: nextLevel, meterSerial, title, valuePct });
           const messageType =
@@ -522,48 +512,107 @@ async function main() {
             }
           }
 
-          // Email gonder
-          const targetEmails = emails.filter((e) =>
-            nextLevel === "warn" ? e.receive_warnings : e.receive_alerts
-          );
-
-          const subjectPrefix = `${meterSerial ?? ""} ${title ?? ""}`.trim();
-          const emailSubject =
-            nextLevel === "warn"
-              ? `${subjectPrefix} - Reaktif uyari (veris): sinira yaklasiyor`
-              : `${subjectPrefix} - Reaktif uyari (veris): limit asildi`;
-
-          for (const em of targetEmails) {
-            try {
-              const providerResp = await sendEmail(em.email, emailSubject, text);
-              await logEmail({
-                userId,
-                subscriptionSerno: subNo,
-                emailAddress: em.email,
-                subject: emailSubject,
-                messageBody: text,
-                status: "sent",
-                providerResponse: providerResp,
-              });
-              log(`Email sent to ${em.email}`);
-              emailSent++;
-            } catch (e) {
-              const errMsg = (e as Error).message;
-              log(`Email failed to ${em.email}: ${errMsg}`);
-              await logEmail({
-                userId,
-                subscriptionSerno: subNo,
-                emailAddress: em.email,
-                subject: emailSubject,
-                messageBody: text,
-                status: "failed",
-                errorMessage: errMsg,
-              });
-              errorCount++;
-            }
+          // Mail tetigi: yalnizca limit gecisinde, kullanici bazli prod buffer'ina topla
+          if (nextLevel === "limit") {
+            const cur =
+              prodLimit.get(subNo) ??
+              { rio_pct: rioPct, rco_pct: rcoPct, rio_breach: false, rco_breach: false };
+            cur.rio_pct = rioPct;
+            cur.rco_pct = rcoPct;
+            if (kind === "rio") cur.rio_breach = true;
+            if (kind === "rco") cur.rco_breach = true;
+            prodLimit.set(subNo, cur);
           }
         }
       }
+    }
+
+    // ── Per-user mail dispatch (limit gecisi varsa) ──
+    if (gridLimit.size === 0 && prodLimit.size === 0) continue;
+    if (emails.length === 0) continue;
+
+    // Tesis adlari icin nickname/title cozumlemesi
+    const allSernos = [
+      ...new Set<number>([...gridLimit.keys(), ...prodLimit.keys()]),
+    ].map(String);
+
+    const subMap = new Map<string, SubInfo>();
+    for (const s of subs as any[]) {
+      subMap.set(String(s.subscription_serno), { nickname: null, title: s.title ?? null });
+    }
+    if (allSernos.length) {
+      const { data: settings } = await supabase
+        .from("subscription_settings")
+        .select("subscription_serno, title, nickname")
+        .in("subscription_serno", allSernos);
+      for (const s of (settings ?? []) as any[]) {
+        const k = String(s.subscription_serno);
+        const cur = subMap.get(k) ?? { nickname: null, title: null };
+        subMap.set(k, {
+          nickname: s.nickname || null,
+          title: s.title || cur.title,
+        });
+      }
+    }
+
+    const gridBreaches: Breach[] = [...gridLimit.entries()].map(([serno, b]) => ({
+      serno: String(serno),
+      ind_pct: b.ri_pct,
+      cap_pct: b.rc_pct,
+      ind_breach: b.ri_breach,
+      cap_breach: b.rc_breach,
+    }));
+    const prodBreaches: Breach[] = [...prodLimit.entries()].map(([serno, b]) => ({
+      serno: String(serno),
+      ind_pct: b.rio_pct,
+      cap_pct: b.rco_pct,
+      ind_breach: b.rio_breach,
+      cap_breach: b.rco_breach,
+    }));
+
+    const { subject, html, text: textBody } = buildReactiveAlertEmail({
+      todayIso: trDateISO(),
+      timeText: trTimeNow(),
+      gridBreaches,
+      prodBreaches,
+      subMap,
+    });
+
+    log(
+      `Mail tetiklendi (user=${userId}): grid=${gridBreaches.length}, prod=${prodBreaches.length}, alici=${emails.length}`,
+    );
+
+    for (const em of emails) {
+      try {
+        const providerResp = await sendHtmlEmail(em.email, subject, html, textBody);
+        await logEmail({
+          userId,
+          subscriptionSerno: null,
+          emailAddress: em.email,
+          subject,
+          messageType: "reactive_instant_notification",
+          messageBody: html,
+          status: "sent",
+          providerResponse: providerResp,
+        });
+        log(`Mail gonderildi: ${em.email}`);
+        emailSent++;
+      } catch (e) {
+        const errMsg = (e as Error).message;
+        log(`Mail basarisiz: ${em.email} — ${errMsg}`);
+        await logEmail({
+          userId,
+          subscriptionSerno: null,
+          emailAddress: em.email,
+          subject,
+          messageType: "reactive_instant_notification",
+          messageBody: html,
+          status: "failed",
+          errorMessage: errMsg,
+        });
+        errorCount++;
+      }
+      await sleep(600); // Resend rate limit
     }
   }
 

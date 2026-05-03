@@ -24,6 +24,7 @@ import {
   Mail,
   Sun,
   ClipboardList,
+  Upload,
 } from "lucide-react";
 
 type NavItem = {
@@ -93,6 +94,7 @@ const NAV_CATEGORIES: NavCategory[] = [
       { label: "GES Hesaplar", to: "/dashboard/admin/ges-credentials", icon: <Users size={16} /> },
       { label: "GES Tesisler", to: "/dashboard/admin/ges-plants", icon: <Building2 size={16} /> },
       { label: "GES Üretim Verisi", to: "/dashboard/admin/ges-production", icon: <BarChart3 size={16} /> },
+      { label: "GES Üretim Yükleme", to: "/dashboard/admin/ges-production-upload", icon: <Upload size={16} /> },
       { label: "GES Sync Logları", to: "/dashboard/admin/ges-sync-logs", icon: <Clock size={16} /> },
       { label: "GES Satış Hakkı", to: "/dashboard/admin/ges-satis-hakki", icon: <TrendingUp size={16} /> },
     ],

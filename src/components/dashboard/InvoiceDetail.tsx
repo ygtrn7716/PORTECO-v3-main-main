@@ -854,12 +854,15 @@ try {
           gesOlmasaydiCalced.current = false;
           setGesOlmasaydiResult(null);
 
-          // GES plant kontrolü
+          // GES plant kontrolü — sadece SEÇİLİ ABONELİĞE bağlı plant'lar
+          // (linked_serno = selectedSub). Böylece "GES Olmasaydı" kartı yalnızca
+          // bu tüketim tesisine eşleşen GES varsa görünür.
           const { data: gesPlants } = await supabase
             .from("ges_plants")
             .select("id")
             .eq("user_id", uid)
-            .eq("is_active", true);
+            .eq("is_active", true)
+            .eq("linked_serno", selectedSub);
           setHasGes((gesPlants?.length ?? 0) > 0);
         }
       } catch (e: any) {
@@ -1218,7 +1221,7 @@ const isDualTerm = data?.tariffType === "dual";
                     <td className="py-2 pr-4">Dağıtım Bedeli</td>
                     <td className="py-2 pr-4 text-neutral-600">
                       {fmtUnit(data.breakdown.effectiveDistributionUnitPrice)} TL/kWh ×{" "}
-                      {fmtKwh(data.totalConsumptionKwh - data.breakdown.verisKwh)} kWh
+                      {fmtKwh(data.breakdown.distributionChargeKwh)} kWh
                     </td>
                     <td className="py-2 pr-4 text-right">
                       {fmtMoney2(data.breakdown.distributionCharge)}

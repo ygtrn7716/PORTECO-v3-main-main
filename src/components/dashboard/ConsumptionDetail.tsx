@@ -604,7 +604,7 @@ useEffect(() => {
                     <td className="py-2 pr-4">Dağıtım Bedeli</td>
                     <td className="py-2 pr-4 text-neutral-600">
                       {fmtUnit6(invoiceToDate.breakdown.effectiveDistributionUnitPrice)} TL/kWh ×{" "}
-                      {fmtKwh(invoiceToDate.totalConsumptionKwh - invoiceToDate.breakdown.verisKwh)} kWh
+                      {fmtKwh(invoiceToDate.breakdown.distributionChargeKwh)} kWh
                     </td>
                     <td className="py-2 pr-4 text-right">
                       {fmtMoney2(invoiceToDate.breakdown.distributionCharge)}

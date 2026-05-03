@@ -57,6 +57,7 @@ import GesProvidersAdmin from "@/pages/admin/GesProvidersAdmin";
 import GesCredentialsAdmin from "@/pages/admin/GesCredentialsAdmin";
 import GesPlantsAdmin from "@/pages/admin/GesPlantsAdmin";
 import GesProductionAdmin from "@/pages/admin/GesProductionAdmin";
+import GesProductionUploadAdmin from "@/pages/admin/GesProductionUploadAdmin";
 import GesSyncLogAdmin from "@/pages/admin/GesSyncLogAdmin";
 import GesSatisHakkiAdmin from "@/pages/admin/GesSatisHakkiAdmin";
 import AdminUsersPage from "@/pages/admin/AdminUsersPage";
@@ -128,6 +129,7 @@ export default function App() {
               <Route path="ges-credentials" element={<GesCredentialsAdmin />} />
               <Route path="ges-plants" element={<GesPlantsAdmin />} />
               <Route path="ges-production" element={<GesProductionAdmin />} />
+              <Route path="ges-production-upload" element={<GesProductionUploadAdmin />} />
               <Route path="ges-sync-logs" element={<GesSyncLogAdmin />} />
               <Route path="ges-satis-hakki" element={<GesSatisHakkiAdmin />} />
               <Route path="kullanıcılar" element={<AdminUsersPage />} />

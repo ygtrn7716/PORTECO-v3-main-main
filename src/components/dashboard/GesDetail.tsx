@@ -9,6 +9,10 @@ import { downloadXlsx } from "@/components/utils/xlsx";
 import EnergySoldCard from "@/components/dashboard/EnergySoldCard";
 import { HelpCircle } from "lucide-react";
 import GesHourlyView from "@/components/dashboard/GesHourlyView";
+import ConnectGesOverlay from "@/components/dashboard/shared/ConnectGesOverlay";
+import GesSavingsSection from "@/components/dashboard/shared/GesSavingsSection";
+import { MOCK_MONTHLY, MOCK_DAILY, MOCK_SUMMARY } from "@/components/dashboard/shared/gesPlaceholders";
+import { detectVerisPresence, logVerisPresenceErrors } from "@/lib/ges/detectVerisPresence";
 import {
   ResponsiveContainer,
   BarChart,
@@ -116,10 +120,23 @@ export default function GesDetail() {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // Veriş geçmişi: ges_plants yok ama consumption_hourly.gn > 0 olan kullanıcı
+  const [hasVeris, setHasVeris] = useState(false);
+
+  // Hedef 4 — GesSavingsSection ile paylaşılan tesis seçimi (EnergySoldCard'tan gelir)
+  const [revenueSub, setRevenueSub] = useState<number | null>(null);
+
   // Aktif plant id'leri (seçili veya tümü)
   const activePlantIds = selectedPlantId === null || selectedPlantId === "all"
     ? plants.map((p) => p.id)
     : [selectedPlantId];
+
+  const hasGesApi = plants.length > 0;
+  const showBlur = !hasGesApi && hasVeris;
+
+  useEffect(() => {
+    if (showBlur) setChartTab('sold');
+  }, [showBlur]);
 
   // 1) GES plant'leri yükle
   useEffect(() => {
@@ -148,6 +165,22 @@ export default function GesDetail() {
         setSelectedPlantId("all");
         localStorage.removeItem(LS_GES_PLANT_KEY);
       }
+    })();
+
+    return () => { cancel = true; };
+  }, [uid, sessionLoading]);
+
+  // 1b) Veriş geçmişi kontrolü — helper ile iki kademeli tespit (snapshot + hourly fallback)
+  useEffect(() => {
+    if (sessionLoading || !uid) return;
+    let cancel = false;
+
+    (async () => {
+      const presence = await detectVerisPresence(supabase, uid);
+      if (cancel) return;
+      logVerisPresenceErrors("GesDetail", presence);
+      console.log("[GesDetail] GES presence:", presence); // DEBUG — PR öncesi temizlenecek
+      setHasVeris(presence.hasVeris);
     })();
 
     return () => { cancel = true; };
@@ -537,8 +570,8 @@ export default function GesDetail() {
         </div>
       )}
 
-      {/* Boş durum */}
-      {!sessionLoading && plants.length === 0 && !err && (
+      {/* Boş durum — tamamen GES yok (API yok + veriş yok) */}
+      {!sessionLoading && plants.length === 0 && !hasVeris && !err && (
         <div className="rounded-2xl border border-neutral-200/60 bg-white p-8 text-center">
           <p className="text-neutral-500 text-sm">
             Henüz bir GES tesisi bulunamadı. Profil sayfanızdan GES hesabınızı ekleyebilirsiniz.
@@ -546,40 +579,67 @@ export default function GesDetail() {
         </div>
       )}
 
-      {plants.length > 0 && (
+      {(plants.length > 0 || hasVeris) && (
         <>
+          {/* Sadece-verişli kullanıcı: Mahsup/Satış kartları + GES Olmasaydı kartı en üstte, blursuz */}
+          {showBlur && (
+            <>
+              <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm p-6 mb-4">
+                <EnergySoldCard onSernoChange={setRevenueSub} />
+              </section>
+              <div className="mb-8">
+                <GesSavingsSection
+                  userId={uid ?? ""}
+                  subscriptionSerno={revenueSub}
+                  hasGesApi={hasGesApi}
+                />
+              </div>
+            </>
+          )}
+
+          {/* Blurlu bölgelerin ortak kapsayıcısı — showBlur iken tek overlay bu wrapper'a düşer */}
+          <div className={showBlur ? "relative" : ""}>
+
           {/* A) Özet Kartları */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4 mb-8">
-            <SummaryCard
-              title="Bu Ay Toplam Üretim"
-              value={fmtKwh(monthTotal)}
-              unit="kWh"
-            />
-            <SummaryCard
-              title="Geçen Ay Üretim"
-              value={fmtKwh(prevMonthTotal)}
-              unit="kWh"
-            />
-            <SummaryCard
-              title="Bugünkü Üretim"
-              value={fmtKwh(snapshot?.today_energy_kwh ?? null)}
-              unit="kWh"
-            />
-            <SummaryCard
-              title="Anlık Güç"
-              value={fmtKwh(snapshot ? snapshot.current_power_w / 1000 : null)}
-              unit="kW"
-            />
-            <SummaryCard
-              title="Toplam Ömür Boyu Üretim"
-              value={fmtKwh(snapshot?.total_energy_kwh ?? null)}
-              unit="kWh"
-            />
+          <div className="mb-8">
+            <div
+              aria-hidden={showBlur ? "true" : undefined}
+              className={showBlur ? "pointer-events-none select-none blur-[3px] opacity-60" : ""}
+            >
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+                <SummaryCard
+                  title="Bu Ay Toplam Üretim"
+                  value={fmtKwh(showBlur ? MOCK_SUMMARY.thisMonth : monthTotal)}
+                  unit="kWh"
+                />
+                <SummaryCard
+                  title="Geçen Ay Üretim"
+                  value={fmtKwh(showBlur ? MOCK_SUMMARY.lastMonth : prevMonthTotal)}
+                  unit="kWh"
+                />
+                <SummaryCard
+                  title="Bugünkü Üretim"
+                  value={fmtKwh(showBlur ? MOCK_SUMMARY.today : (snapshot?.today_energy_kwh ?? null))}
+                  unit="kWh"
+                />
+                <SummaryCard
+                  title="Anlık Güç"
+                  value={fmtKwh(showBlur ? MOCK_SUMMARY.instantKw : (snapshot ? snapshot.current_power_w / 1000 : null))}
+                  unit="kW"
+                />
+                <SummaryCard
+                  title="Toplam Ömür Boyu Üretim"
+                  value={fmtKwh(showBlur ? MOCK_SUMMARY.lifetime : (snapshot?.total_energy_kwh ?? null))}
+                  unit="kWh"
+                />
+              </div>
+            </div>
           </div>
 
-          {/* B) Üretim Grafiği / Satılan Üretim — sekmeli */}
+          {/* B) Üretim Grafiği / Satılan Üretim — sekmeli (showBlur iken tab switcher yok, grafikler direkt) */}
           <div className="mb-8">
-            {/* Tab Toggle */}
+            {/* Tab Toggle — showBlur modunda gizli (sadece-verişli kullanıcıya anlamsız) */}
+            {!showBlur && (
             <div className="mb-4">
               <div className="inline-flex rounded-lg border border-neutral-200 overflow-hidden">
                 <button
@@ -606,9 +666,15 @@ export default function GesDetail() {
                 </button>
               </div>
             </div>
+            )}
 
-            {/* Üretim Grafiği Tab İçeriği */}
-            {chartTab === 'production' && (
+            {/* Üretim Grafiği Tab İçeriği — showBlur iken tab state ignore, her zaman render */}
+            {(showBlur || chartTab === 'production') && (
+              <div>
+                <div
+                  aria-hidden={showBlur ? "true" : undefined}
+                  className={showBlur ? "pointer-events-none select-none blur-[3px] opacity-60" : ""}
+                >
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
                 {/* SOL: Aylık Üretim Grafiği */}
                 <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm p-6">
@@ -624,9 +690,9 @@ export default function GesDetail() {
                     </select>
                   </div>
 
-                  {monthlyData.length > 0 ? (
+                  {(showBlur ? MOCK_MONTHLY : monthlyData).length > 0 ? (
                     <ResponsiveContainer width="100%" height={300}>
-                      <BarChart data={monthlyData}>
+                      <BarChart data={showBlur ? MOCK_MONTHLY : monthlyData}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
                         <XAxis dataKey="label" tick={{ fontSize: 12 }} />
                         <YAxis tick={{ fontSize: 12 }} />
@@ -671,13 +737,13 @@ export default function GesDetail() {
                     </div>
                   </div>
 
-                  {!plants.length || !activePlantIds.length ? (
+                  {!showBlur && (!plants.length || !activePlantIds.length) ? (
                     <p className="text-sm text-neutral-400 text-center py-12">
                       Lütfen bir tesis seçin
                     </p>
-                  ) : dailyChartBars.length > 0 ? (
+                  ) : (showBlur ? MOCK_DAILY : dailyChartBars).length > 0 ? (
                     <ResponsiveContainer width="100%" height={300}>
-                      <BarChart data={dailyChartBars}>
+                      <BarChart data={showBlur ? MOCK_DAILY : dailyChartBars}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
                         <XAxis dataKey="day" tick={{ fontSize: 12 }} />
                         <YAxis tick={{ fontSize: 12 }} />
@@ -697,10 +763,13 @@ export default function GesDetail() {
                   )}
                 </section>
               </div>
+                </div>
+              </div>
             )}
 
-            {/* Satılan Üretim Tab İçeriği */}
-            {chartTab === 'sold' && (
+            {/* Satılan Üretim Tab İçeriği — sadece normal kullanıcıda (showBlur=false);
+                showBlur iken EnergySoldCard + GesSavingsSection zaten en üstte blursuz render edildi */}
+            {!showBlur && chartTab === 'sold' && (
               <>
                 {/* Yıllık Satış Hakkı Banner */}
                 {maxSatisKwh != null && yearlyTotal != null && (() => {
@@ -759,14 +828,28 @@ export default function GesDetail() {
                 })()}
 
                 <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm p-6">
-                  <EnergySoldCard />
+                  <EnergySoldCard onSernoChange={setRevenueSub} />
                 </section>
+
+                {/* Hedef 4: GES Olmasaydı Faturanız — Hedef 2 kartlarının altında */}
+                <div className="mt-4">
+                  <GesSavingsSection
+                    userId={uid ?? ""}
+                    subscriptionSerno={revenueSub}
+                    hasGesApi={hasGesApi}
+                  />
+                </div>
               </>
             )}
           </div>
 
           {/* C) Üretim Verileri — Günlük / Saatlik Toggle */}
-          <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm p-6 mb-8">
+          <div className="mb-8">
+            <div
+              aria-hidden={showBlur ? "true" : undefined}
+              className={showBlur ? "pointer-events-none select-none blur-[3px] opacity-60" : ""}
+            >
+          <section className="rounded-2xl border border-neutral-200/60 bg-white shadow-sm p-6">
             {/* Başlık + Toggle + Kontroller */}
             <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
               <div className="flex items-center gap-3">
@@ -899,6 +982,15 @@ export default function GesDetail() {
               />
             )}
           </section>
+            </div>
+          </div>
+
+          {/* Tek overlay — blurlu A + grafikler + C kapsayıcısının ortasında */}
+          {showBlur && (
+            <ConnectGesOverlay className="absolute inset-0" />
+          )}
+
+          </div>
         </>
       )}
     </DashboardShell>

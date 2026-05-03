@@ -269,12 +269,15 @@ export default function PtfDetail() {
         if (cancel) return;
         if (ptf.error) throw ptf.error;
 
-        // GES saatlik üretim verisi
+        // GES saatlik üretim verisi — sadece seçili tesise (selectedSub)
+        // bağlı plant'lardan. Bu tesise bağlı plant yoksa GES Olmasaydı
+        // hesabı yapılmaz (hasGes=false).
         const { data: gesPlants } = await supabase
           .from("ges_plants")
           .select("id")
           .eq("user_id", uid)
-          .eq("is_active", true);
+          .eq("is_active", true)
+          .eq("linked_serno", selectedSub);
 
         if (cancel) return;
 

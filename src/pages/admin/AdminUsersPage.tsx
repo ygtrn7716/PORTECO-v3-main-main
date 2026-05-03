@@ -29,6 +29,7 @@ type SettingsForm = {
   trafo_degeri: number | null;
   nickname: string | null;
   on_yil: boolean;
+  satis_hakki: number | null;
 };
 
 type YekdemMonth = {
@@ -49,6 +50,7 @@ const EMPTY_SETTINGS: SettingsForm = {
   trafo_degeri: null,
   nickname: null,
   on_yil: false,
+  satis_hakki: null,
 };
 
 const MONTH_NAMES = [
@@ -201,7 +203,7 @@ export default function AdminUsersPage() {
     (async () => {
       const { data } = await supabase
         .from("subscription_settings")
-        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil")
+        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil, satis_hakki")
         .eq("user_id", selectedUserId)
         .eq("subscription_serno", selectedSerno)
         .maybeSingle();
@@ -617,6 +619,24 @@ export default function AdminUsersPage() {
                         onChange={(e) => setSettings((p) => ({ ...p, trafo_degeri: numOrNull(e.target.value) }))}
                         className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
                       />
+                    </label>
+
+                    {/* Yıllık Satış Hakkı */}
+                    <label className="block">
+                      <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                        Yıllık Satış Hakkı (kWh)
+                      </span>
+                      <input
+                        type="number"
+                        step="0.001"
+                        value={d(settings.satis_hakki)}
+                        onChange={(e) => setSettings((p) => ({ ...p, satis_hakki: numOrNull(e.target.value) }))}
+                        placeholder="Örn: 500000"
+                        className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                      />
+                      <span className="mt-1 block text-[10px] text-neutral-400">
+                        Boş bırakılırsa GES sayfasında "Tanımlı değil" gösterilir.
+                      </span>
                     </label>
 
                     {/* 10 Yıl Üstü Lisans */}

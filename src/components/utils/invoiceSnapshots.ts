@@ -1,6 +1,60 @@
 //src/components/utils/invoiceSnapshots.ts
 import { supabase } from "@/lib/supabase";
-import type { InvoiceBreakdown, TariffType } from "@/components/utils/calculateInvoice";
+import { calculateInvoice, type InvoiceBreakdown, type TariffType } from "@/components/utils/calculateInvoice";
+
+/**
+ * Saklı snapshot satırından "ödenecek toplam"ı (mahsup + diğer dahil) canlı
+ * yeniden hesaplar.
+ *
+ * Eski snapshot'larda dağıtım bedeli yanlış (üretim>tüketim durumunda negatif)
+ * kayıtlı olabilir. Yeni calculateInvoice() bu durumu düzelttiği için,
+ * snapshot'tan okurken stored total yerine bu helper'dan dönen değer
+ * gösterilmelidir.
+ *
+ * Not: Çağıran tarafın `select`'inde calculateInvoice'a giden tüm input
+ * alanlarının (total_consumption_kwh, unit_price_energy/distribution, btv_rate,
+ * vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price,
+ * power_excess_price, reactive_penalty_charge, trafo_degeri,
+ * total_production_kwh, on_yil, perakende_enerji_bedeli, yekdem_mahsup,
+ * diger_degerler) bulunması gerekir; eksikse stored total_with_mahsup'a düşer.
+ */
+export function recomputeSnapshotTotalWithMahsup(
+  row: Partial<InvoiceSnapshotRow> & {
+    total_with_mahsup?: number | null;
+    yekdem_mahsup?: number | null;
+    diger_degerler?: number | null;
+  }
+): number {
+  try {
+    const breakdown = calculateInvoice({
+      totalConsumptionKwh: Number(row.total_consumption_kwh ?? 0),
+      unitPriceEnergy: Number(row.unit_price_energy ?? 0),
+      unitPriceDistribution: Number(row.unit_price_distribution ?? 0),
+      btvRate: Number(row.btv_rate ?? 0),
+      vatRate: Number(row.vat_rate ?? 0),
+      tariffType: ((row.tariff_type as TariffType) ?? "single"),
+      contractPowerKw: Number(row.contract_power_kw ?? 0),
+      monthFinalDemandKw: Number(row.month_final_demand_kw ?? 0),
+      powerPrice: Number(row.power_price ?? 0),
+      powerExcessPrice: Number(row.power_excess_price ?? 0),
+      reactivePenaltyCharge: Number(row.reactive_penalty_charge ?? 0),
+      trafoDegeri: Number(row.trafo_degeri ?? 0),
+      totalProductionKwh: Number(row.total_production_kwh ?? 0),
+      onYil: row.on_yil ?? true,
+      perakendeEnerjiBedeli: Number(row.perakende_enerji_bedeli ?? 0),
+    });
+    const yekdem = Number(row.yekdem_mahsup ?? 0);
+    const diger = Number(row.diger_degerler ?? 0);
+    return breakdown.totalInvoice + yekdem + diger;
+  } catch {
+    return Number(row.total_with_mahsup ?? 0);
+  }
+}
+
+/** Tek noktadan import edilen "snapshot select" listesi — recompute yapacak
+ * çağıran tarafların kullanması beklenir. */
+export const INVOICE_SNAPSHOT_RECOMPUTE_FIELDS =
+  "total_consumption_kwh, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, trafo_degeri, total_production_kwh, on_yil, perakende_enerji_bedeli, yekdem_mahsup, diger_degerler, total_with_mahsup";
 
 export type InvoiceType = "billed" | "backdated";
 
@@ -170,10 +224,12 @@ export async function listInvoiceSnapshots(params: {
   invoiceType?: InvoiceType;
   subscriptionSerno?: number;
 }) {
+  // Listing'de canlı recompute yapabilmek için calculateInvoice'a gereken
+  // tüm input'ları + mahsup/diger_degerler alanlarını getiriyoruz.
   const q = supabase
     .from("invoice_snapshots")
     .select(
-      "user_id, subscription_serno, period_year, period_month, invoice_type, month_label, total_with_mahsup, total_invoice, total_consumption_kwh, updated_at"
+      "user_id, subscription_serno, period_year, period_month, invoice_type, month_label, total_with_mahsup, total_invoice, total_consumption_kwh, updated_at, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, trafo_degeri, total_production_kwh, on_yil, perakende_enerji_bedeli, yekdem_mahsup, diger_degerler"
     )
     .eq("user_id", params.userId)
     .eq("invoice_type", params.invoiceType ?? "billed")

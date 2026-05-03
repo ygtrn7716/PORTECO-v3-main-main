@@ -43,8 +43,9 @@ export interface InvoiceBreakdown {
   distributionCharge: number;
   distributionBaseKwh: number; // totalConsumptionKwh + trafoKwh (çekiş)
   distributionAdjustment: number; // Veriş kaynaklı dağıtım indirimi = (D/2) × verişKwh
+  distributionChargeKwh: number; // Dağıtım bedeli açıklamasında gösterilecek kWh (distributionCharge / effectiveDistributionUnitPrice)
   verisKwh: number; // Dağıtım hesabında kullanılan veriş kWh
-  effectiveDistributionUnitPrice: number; // distributionCharge / netKwh
+  effectiveDistributionUnitPrice: number; // distributionCharge / netKwh (veya override durumda unitPriceDistribution)
   netEnergyKwh: number;     // totalConsumptionKwh - verisKwh
   netEnergyCharge: number;  // unitPriceEnergy × netEnergyKwh
   btvCharge: number;
@@ -103,18 +104,34 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
   // Veriş kWh (pozitifse al, değilse 0)
   const verisKwh = (totalProductionKwh ?? 0) > 0 ? totalProductionKwh! : 0;
 
-  // Yeni formül: çekiş×D - veriş×(D/2)
+  // Çekiş ve net kWh
   const cekisCharge = unitPriceDistribution * distributionBaseKwh;
-  const distributionAdjustment = (unitPriceDistribution / 2) * verisKwh;
-  const distributionCharge = cekisCharge - distributionAdjustment;
-
-  // Efektif birim fiyat
   const netKwh = totalConsumptionKwh - verisKwh;
-  const effectiveDistributionUnitPrice = netKwh !== 0
-    ? distributionCharge / netKwh
-    : unitPriceDistribution;
 
-  console.log('[DAGITIM]', { verisKwh, cekisCharge, distributionAdjustment, distributionCharge, effectiveDistributionUnitPrice, netKwh });
+  // Dağıtım bedeli:
+  //  - netKwh > 0  → çekiş×D - veriş×(D/2)  (mahsuplu eski formül)
+  //  - netKwh ≤ 0  → üretim çekişe eşit/fazla. Mahsup uygulanmaz; dağıtım bedeli
+  //    gerçek çekiş üzerinden tarife birim fiyatıyla hesaplanır (negatife düşmez).
+  let distributionAdjustment: number;
+  let distributionCharge: number;
+  let distributionChargeKwh: number;
+  let effectiveDistributionUnitPrice: number;
+
+  if (netKwh <= 0) {
+    distributionAdjustment = 0;
+    distributionCharge = cekisCharge;
+    distributionChargeKwh = distributionBaseKwh;
+    effectiveDistributionUnitPrice = unitPriceDistribution;
+  } else {
+    distributionAdjustment = (unitPriceDistribution / 2) * verisKwh;
+    distributionCharge = cekisCharge - distributionAdjustment;
+    distributionChargeKwh = netKwh;
+    effectiveDistributionUnitPrice = netKwh !== 0
+      ? distributionCharge / netKwh
+      : unitPriceDistribution;
+  }
+
+  console.log('[DAGITIM]', { verisKwh, cekisCharge, distributionAdjustment, distributionCharge, distributionChargeKwh, effectiveDistributionUnitPrice, netKwh });
 
   // 2) BTV (net enerji bedeli üzerinden — veriş mahsuplu)
   // netKwh = totalConsumptionKwh - verisKwh (dağıtımda da aynı)
@@ -178,6 +195,7 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
     distributionCharge,
     distributionBaseKwh,
     distributionAdjustment,
+    distributionChargeKwh,
     verisKwh,
     effectiveDistributionUnitPrice,
     netEnergyKwh,

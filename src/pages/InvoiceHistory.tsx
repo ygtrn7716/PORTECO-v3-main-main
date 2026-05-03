@@ -2,7 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { useSession } from "@/hooks/useSession";
-import { listInvoiceSnapshots, type InvoiceSnapshotRow } from "@/components/utils/invoiceSnapshots";
+import {
+  listInvoiceSnapshots,
+  recomputeSnapshotTotalWithMahsup,
+  type InvoiceSnapshotRow,
+} from "@/components/utils/invoiceSnapshots";
 
 const fmtMoney2 = (n: number | null | undefined) =>
   n == null || !Number.isFinite(Number(n))
@@ -114,7 +118,7 @@ export default function InvoiceHistory() {
 
                       <div className="text-right">
                         <div className="text-xs text-neutral-500">Ödenecek</div>
-                        <div className="text-sm font-semibold text-neutral-900">{fmtMoney2(r.total_with_mahsup)} TL</div>
+                        <div className="text-sm font-semibold text-neutral-900">{fmtMoney2(recomputeSnapshotTotalWithMahsup(r))} TL</div>
                       </div>
                     </div>
 

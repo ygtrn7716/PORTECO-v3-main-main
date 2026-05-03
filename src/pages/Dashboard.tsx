@@ -7,7 +7,11 @@ import { Link, useNavigate } from "react-router-dom";
 import { DASH_CARDS } from "@/content/dashboardCards";
 import ReactiveSection from "@/components/dashboard/ReactiveSection";
 import DashboardShell from "@/components/dashboard/DashboardShell";
-import { getInvoiceSnapshot } from "@/components/utils/invoiceSnapshots";
+import {
+  getInvoiceSnapshot,
+  recomputeSnapshotTotalWithMahsup,
+  INVOICE_SNAPSHOT_RECOMPUTE_FIELDS,
+} from "@/components/utils/invoiceSnapshots";
 
 import {
   calculateInvoice,
@@ -16,6 +20,7 @@ import {
 } from "@/components/utils/calculateInvoice";
 import { fetchHiddenSernos, resolveSelectedSub } from "@/lib/subscriptionVisibility";
 import { fetchAllConsumption } from "@/lib/paginatedFetch";
+import { detectVerisPresence, logVerisPresenceErrors } from "@/lib/ges/detectVerisPresence";
 
 type ImgSpec = {
   src: string;
@@ -761,9 +766,11 @@ export default function Dashboard() {
         const periodMonth = prev.month() + 1;
 
         // ✅ 5.0) önce snapshot var mı bak
+        // NOT: total_with_mahsup'ı saklı değer yerine canlı recompute ediyoruz
+        // (eski snapshot'larda dağıtım bedeli yanlış olabilir).
         const snap = await supabase
           .from("invoice_snapshots")
-          .select("total_with_mahsup, has_yekdem_mahsup, yekdem_mahsup")
+          .select(`${INVOICE_SNAPSHOT_RECOMPUTE_FIELDS}, has_yekdem_mahsup`)
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .eq("period_year", periodYear)
@@ -774,10 +781,10 @@ export default function Dashboard() {
         if (cancel) return;
 
         if (!snap.error && snap.data?.total_with_mahsup != null) {
-          setInvoiceTotal(Number(snap.data.total_with_mahsup));
-          setHasYekdemMahsup(!!snap.data.has_yekdem_mahsup);
+          setInvoiceTotal(recomputeSnapshotTotalWithMahsup(snap.data as any));
+          setHasYekdemMahsup(!!(snap.data as any).has_yekdem_mahsup);
           setYekdemMahsup(
-            snap.data.yekdem_mahsup != null ? Number(snap.data.yekdem_mahsup) : null
+            (snap.data as any).yekdem_mahsup != null ? Number((snap.data as any).yekdem_mahsup) : null
           );
           return; // ✅ snapshot varsa hesaplamaya devam etme
         }
@@ -1127,10 +1134,10 @@ export default function Dashboard() {
           if (cancel) return;
           if (subKwh === 0) continue; // tüketim yoksa fatura da yok
 
-          // 6.2) Önce snapshot kontrol — varsa direkt kullan
+          // 6.2) Önce snapshot kontrol — varsa direkt kullan (canlı recompute ile)
           const { data: snapData } = await supabase
             .from("invoice_snapshots")
-            .select("total_with_mahsup, yekdem_mahsup")
+            .select(INVOICE_SNAPSHOT_RECOMPUTE_FIELDS)
             .eq("user_id", uid)
             .eq("subscription_serno", serno)
             .eq("period_year", pYear)
@@ -1141,10 +1148,10 @@ export default function Dashboard() {
           if (cancel) return;
 
           if (snapData?.total_with_mahsup != null) {
-            grandTotalInvoice += Number(snapData.total_with_mahsup) || 0;
-            grandTotalMahsup += Number(snapData.yekdem_mahsup) || 0;
+            grandTotalInvoice += recomputeSnapshotTotalWithMahsup(snapData as any) || 0;
+            grandTotalMahsup += Number((snapData as any).yekdem_mahsup) || 0;
             hasAnyInvoice = true;
-            if (snapData.yekdem_mahsup != null) hasAnyMahsup = true;
+            if ((snapData as any).yekdem_mahsup != null) hasAnyMahsup = true;
             continue; // snapshot varsa hesaplamaya gerek yok
           }
 
@@ -1365,8 +1372,21 @@ export default function Dashboard() {
         setGesLoading(true);
         setGesErr(null);
 
-        // 1. Kullanıcının aktif GES plant'lerini çek
-        const { data: plants, error: plantsErr } = await supabase
+        // 1) User-level GES görünürlük tespiti (helper)
+        const presence = await detectVerisPresence(supabase, uid);
+        if (cancel) return;
+        logVerisPresenceErrors("Dashboard.GES", presence);
+        console.log("[Dashboard] GES presence:", presence); // DEBUG — PR öncesi temizlenecek
+
+        setHasGes(presence.hasGesApi || presence.hasVeris);
+
+        if (!presence.hasGesApi) {
+          setGesMonthlyKwh(null);
+          return;
+        }
+
+        // 2) Üretim fetch'i için tam plant id listesi (helper LIMIT 1 yetmez)
+        const { data: plantsFull, error: plantsErr } = await supabase
           .from("ges_plants")
           .select("id")
           .eq("user_id", uid)
@@ -1375,16 +1395,11 @@ export default function Dashboard() {
         if (cancel) return;
         if (plantsErr) throw plantsErr;
 
-        const userHasGes = (plants?.length || 0) > 0;
-        setHasGes(userHasGes);
-
-        if (!userHasGes) {
+        const plantIds = (plantsFull ?? []).map((p: { id: string }) => p.id);
+        if (plantIds.length === 0) {
           setGesMonthlyKwh(null);
           return;
         }
-
-        // 2. Bu ayın toplam üretimini çek
-        const plantIds = plants.map((p: { id: string }) => p.id);
         const startOfMonth = dayjsTR().startOf("month").format("YYYY-MM-DD");
         const endOfMonth = dayjsTR().endOf("month").format("YYYY-MM-DD");
 

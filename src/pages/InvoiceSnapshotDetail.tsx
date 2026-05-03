@@ -4,6 +4,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { useSession } from "@/hooks/useSession";
 import { getInvoiceSnapshot, type InvoiceSnapshotRow } from "@/components/utils/invoiceSnapshots";
+import { calculateInvoice, type InvoiceBreakdown, type TariffType } from "@/components/utils/calculateInvoice";
 
 const fmtMoney2 = (n: number | null | undefined) =>
   n == null || !Number.isFinite(Number(n))
@@ -94,6 +95,41 @@ const yekdemCell = useMemo(() => {
     return Number.isFinite(v) ? v : 0;
   }, [row]);
 
+  // Eski snapshot'larda dağıtım bedeli yanlış kayıtlı olabilir (üretim>tüketim
+  // durumunda negatif). Saklı input'lardan canlı hesaplayıp doğru değerleri
+  // gösteriyoruz. Yeni snapshot'lar zaten doğru yazılıyor.
+  const liveBreakdown = useMemo<InvoiceBreakdown | null>(() => {
+    if (!row) return null;
+    try {
+      return calculateInvoice({
+        totalConsumptionKwh: Number(row.total_consumption_kwh ?? 0),
+        unitPriceEnergy: Number(row.unit_price_energy ?? 0),
+        unitPriceDistribution: Number(row.unit_price_distribution ?? 0),
+        btvRate: Number(row.btv_rate ?? 0),
+        vatRate: Number(row.vat_rate ?? 0),
+        tariffType: ((row.tariff_type as TariffType) ?? "single"),
+        contractPowerKw: Number(row.contract_power_kw ?? 0),
+        monthFinalDemandKw: Number(row.month_final_demand_kw ?? 0),
+        powerPrice: Number(row.power_price ?? 0),
+        powerExcessPrice: Number(row.power_excess_price ?? 0),
+        reactivePenaltyCharge: Number(row.reactive_penalty_charge ?? 0),
+        trafoDegeri: Number(row.trafo_degeri ?? 0),
+        totalProductionKwh: Number(row.total_production_kwh ?? 0),
+        onYil: row.on_yil ?? true,
+        perakendeEnerjiBedeli: Number(row.perakende_enerji_bedeli ?? 0),
+      });
+    } catch {
+      return null;
+    }
+  }, [row]);
+
+  // Eski toplam (mahsup dahil) ile yeni toplamı tutarlı şekilde gösterelim.
+  const liveTotalWithMahsup = useMemo(() => {
+    if (!row || !liveBreakdown) return Number(row?.total_with_mahsup ?? 0);
+    const yekdem = Number(row.yekdem_mahsup ?? 0);
+    return liveBreakdown.totalInvoice + yekdem + digerDegerler;
+  }, [row, liveBreakdown, digerDegerler]);
+
 
 
   return (
@@ -141,7 +177,7 @@ const yekdemCell = useMemo(() => {
             <div className="rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm">
               <p className="text-xs text-neutral-500 mb-1">Ödenecek Toplam (Mahsup Dahil)</p>
               <p className="mt-1 text-xl font-semibold text-neutral-900">
-                {fmtMoney2(row.total_with_mahsup)} TL
+                {fmtMoney2(liveTotalWithMahsup)} TL
               </p>
             </div>
           </div>
@@ -176,21 +212,21 @@ const yekdemCell = useMemo(() => {
                     <td className="py-2 pr-4 text-neutral-600">
                       {fmtUnit(row.unit_price_energy)} TL/kWh × {fmtKwh(row.total_consumption_kwh)} kWh
                     </td>
-                    <td className="py-2 pr-4 text-right">{fmtMoney2(row.energy_charge)}</td>
+                    <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.energyCharge ?? row.energy_charge)}</td>
                   </tr>
 
                   <tr className="border-b border-neutral-100">
                     <td className="py-2 pr-4">Dağıtım Bedeli</td>
                     <td className="py-2 pr-4 text-neutral-600">
-                      {fmtUnit(row.effective_distribution_unit_price ?? row.unit_price_distribution)} TL/kWh × {fmtKwh(Number(row.total_consumption_kwh ?? 0) - Number(row.veris_kwh ?? 0))} kWh
+                      {fmtUnit(liveBreakdown?.effectiveDistributionUnitPrice ?? row.effective_distribution_unit_price ?? row.unit_price_distribution)} TL/kWh × {fmtKwh(liveBreakdown?.distributionChargeKwh ?? (Number(row.total_consumption_kwh ?? 0) - Number(row.veris_kwh ?? 0)))} kWh
                     </td>
-                    <td className="py-2 pr-4 text-right">{fmtMoney2(row.distribution_charge)}</td>
+                    <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.distributionCharge ?? row.distribution_charge)}</td>
                   </tr>
 
                   <tr className="border-b border-neutral-100">
                     <td className="py-2 pr-4">BTV (%{((Number(row.btv_rate ?? 0)) * 100).toFixed(2)})</td>
                     <td className="py-2 pr-4 text-neutral-600">Net enerji bedeli × BTV oranı</td>
-                    <td className="py-2 pr-4 text-right">{fmtMoney2(row.btv_charge)}</td>
+                    <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.btvCharge ?? row.btv_charge)}</td>
                   </tr>
 
                   <tr className="border-b border-neutral-100">
@@ -198,7 +234,7 @@ const yekdemCell = useMemo(() => {
                     <td className="py-2 pr-4 text-neutral-600">
                       {row.tariff_type === "dual" ? "Güç bedeli × sözleşme gücü" : "Tek terimde güç bedeli yok"}
                     </td>
-                    <td className="py-2 pr-4 text-right">{fmtMoney2(row.power_base_charge)}</td>
+                    <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.powerBaseCharge ?? row.power_base_charge)}</td>
                   </tr>
 
                   <tr className="border-b border-neutral-100">
@@ -206,7 +242,7 @@ const yekdemCell = useMemo(() => {
                     <td className="py-2 pr-4 text-neutral-600">
                       {row.tariff_type === "dual" ? "Aşan kısım × aşım birim fiyatı" : "Tek terimde yok"}
                     </td>
-                    <td className="py-2 pr-4 text-right">{fmtMoney2(row.power_excess_charge)}</td>
+                    <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.powerExcessCharge ?? row.power_excess_charge)}</td>
                   </tr>
 
                   <tr className="border-b border-neutral-100">
@@ -214,27 +250,27 @@ const yekdemCell = useMemo(() => {
                     <td className="py-2 pr-4 text-neutral-600">
                       Ri %{Number(row.reactive_ri_percent ?? 0).toFixed(1)} / Rc %{Number(row.reactive_rc_percent ?? 0).toFixed(1)}
                     </td>
-                    <td className="py-2 pr-4 text-right">{fmtMoney2(row.reactive_penalty_charge)}</td>
+                    <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.reactivePenaltyCharge ?? row.reactive_penalty_charge)}</td>
                   </tr>
-                  
+
                   {Number(row.trafo_degeri ?? 0) > 0 && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Trafo Bedeli</td>
                       <td className="py-2 pr-4 text-neutral-600">
                         {fmtUnit(row.unit_price_energy)} TL/kWh × {fmtKwh(row.trafo_degeri)} kWh
                       </td>
-                      <td className="py-2 pr-4 text-right">{fmtMoney2(row.trafo_charge)}</td>
+                      <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.trafoCharge ?? row.trafo_charge)}</td>
                     </tr>
                   )}
 
-                  {Number(row.veris_satis_bedeli ?? 0) > 0 && (
+                  {Number(liveBreakdown?.verisSatisBedeli ?? row.veris_satis_bedeli ?? 0) > 0 && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4 text-emerald-700">Veriş Satış Bedeli (Mahsup)</td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {fmtKwh(Number(row.veris_kwh ?? row.total_production_kwh ?? 0))} kWh veriş
+                        {fmtKwh(Number(liveBreakdown?.verisKwh ?? row.veris_kwh ?? row.total_production_kwh ?? 0))} kWh veriş
                       </td>
                       <td className="py-2 pr-4 text-right text-emerald-700">
-                        −{fmtMoney2(row.veris_satis_bedeli)}
+                        −{fmtMoney2(liveBreakdown?.verisSatisBedeli ?? row.veris_satis_bedeli)}
                       </td>
                     </tr>
                   )}
@@ -242,19 +278,19 @@ const yekdemCell = useMemo(() => {
                   <tr className="border-t border-neutral-200">
                     <td className="py-2 pr-4 font-semibold">KDV Hariç Toplam</td>
                     <td className="py-2 pr-4 text-neutral-600">Ara toplam</td>
-                    <td className="py-2 pr-4 text-right font-semibold">{fmtMoney2(row.subtotal_before_vat)}</td>
+                    <td className="py-2 pr-4 text-right font-semibold">{fmtMoney2(liveBreakdown?.subtotalBeforeVat ?? row.subtotal_before_vat)}</td>
                   </tr>
 
                   <tr className="border-b border-neutral-200">
                     <td className="py-2 pr-4 font-semibold">KDV (%{((Number(row.vat_rate ?? 0)) * 100).toFixed(2)})</td>
                     <td className="py-2 pr-4 text-neutral-600">Ara toplam × KDV</td>
-                    <td className="py-2 pr-4 text-right font-semibold">{fmtMoney2(row.vat_charge)}</td>
+                    <td className="py-2 pr-4 text-right font-semibold">{fmtMoney2(liveBreakdown?.vatCharge ?? row.vat_charge)}</td>
                   </tr>
 
                   <tr className="border-b border-neutral-200">
                     <td className="py-2 pr-4 font-semibold">Genel Toplam (KDV Dahil)</td>
                     <td className="py-2 pr-4 text-neutral-600">Bu dönem (mahsup hariç)</td>
-                    <td className="py-2 pr-4 text-right font-semibold">{fmtMoney2(row.total_invoice)} TL</td>
+                    <td className="py-2 pr-4 text-right font-semibold">{fmtMoney2(liveBreakdown?.totalInvoice ?? row.total_invoice)} TL</td>
                   </tr>
 
                   <tr className="border-b border-neutral-200">
@@ -282,7 +318,7 @@ const yekdemCell = useMemo(() => {
                     <td className="py-3 pr-4 font-semibold text-neutral-900">Genel Toplam (YEKDEM Mahsubu Dahil)</td>
                     <td className="py-3 pr-4 text-neutral-600">Ödenecek toplam</td>
                     <td className="py-3 pr-4 text-right text-lg font-semibold text-neutral-900">
-                      {fmtMoney2(row.total_with_mahsup)} TL
+                      {fmtMoney2(liveTotalWithMahsup)} TL
                     </td>
                   </tr>
                 </tbody>

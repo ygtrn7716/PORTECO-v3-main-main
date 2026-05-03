@@ -89,12 +89,16 @@ export async function calculateGesOlmasaydi(
 ): Promise<GesOlmasaydiResult | null> {
   const { supabase, userId, subscriptionSerno, periodYear, periodMonth } = params;
 
-  // 1) Kullanıcının aktif GES plant'lerini bul
+  // 1) Bu tüketim aboneliğine (subscription_serno) BAĞLI aktif GES plant'ları bul.
+  //    linked_serno filtresi sayesinde her tüketim tesisi sadece kendi GES
+  //    üretimini görür. Birden fazla plant aynı abonelikle eşleşebilir
+  //    (örn. iki manuel + bir API plant).
   const { data: plants, error: plantsErr } = await supabase
     .from("ges_plants")
     .select("id")
     .eq("user_id", userId)
-    .eq("is_active", true);
+    .eq("is_active", true)
+    .eq("linked_serno", subscriptionSerno);
 
   if (plantsErr || !plants || plants.length === 0) return null;
   const plantIds = plants.map((p: { id: string }) => p.id);
