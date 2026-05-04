@@ -233,10 +233,15 @@ async function main() {
   const periodYM = trYM();
   log(`Period: ${periodYM}`);
 
-  // 1) Tum kullanicilarin email listesi (user_integrations.aril_user)
+  // 1) Aktif entegrasyonu olan kullanıcı listesi (sadece keşif amaçlı)
+  // NOT: Mail GÖNDERİM HEDEFİ user_emails tablosudur (aşağıda her user için ayrı çekilir).
+  // Bu sorgu yalnızca hangi kullanıcılar için reaktif kontrol yapılacağını belirler;
+  // aril_user mail formatlı olmak zorunda DEĞİL (örn. Meram OSOS portal username:
+  // "sabri.baran"). Eski sürümdeki `if (!mail.includes("@"))` kontrolü bu kullanıcıları
+  // atlıyordu — kaldırıldı.
   const { data: integRows, error: integErr } = await supabase
     .from("user_integrations")
-    .select("user_id, aril_user")
+    .select("user_id")
     .not("aril_user", "is", null);
 
   if (integErr) {
@@ -244,24 +249,20 @@ async function main() {
     process.exit(1);
   }
 
-  const emailsByUser = new Map<string, string[]>();
+  const userIdSet = new Set<string>();
   for (const r of integRows ?? []) {
-    const uid = String((r as any).user_id);
-    const mail = String((r as any).aril_user ?? "").trim();
-    if (!mail.includes("@")) continue;
-    const arr = emailsByUser.get(uid) ?? [];
-    if (!arr.includes(mail)) arr.push(mail);
-    emailsByUser.set(uid, arr);
+    const uid = String((r as any).user_id ?? "").trim();
+    if (uid) userIdSet.add(uid);
   }
 
-  log(`Found ${emailsByUser.size} users with integrations`);
+  log(`Found ${userIdSet.size} users with integrations`);
 
   // 2) Her user icin tesisler + ay-to-date reaktif oranlar
   let smsSent = 0;
   let emailSent = 0;
   let errorCount = 0;
 
-  for (const [userId] of emailsByUser.entries()) {
+  for (const userId of userIdSet) {
     // user_phone_numbers tablosundan aktif telefonlari al
     const { data: phoneRows } = await supabase
       .from("user_phone_numbers")

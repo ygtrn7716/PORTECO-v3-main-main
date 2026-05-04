@@ -45,6 +45,7 @@ type EmailLogRow = {
   subscription_serno: string | null;
   email_address: string;
   subject: string;
+  message_type: string;
   message_body: string;
   status: string;
   error_message: string | null;
@@ -115,6 +116,10 @@ const KIND_LABELS: Record<string, string> = {
 };
 
 function formatMessageType(mt: string): string {
+  // Toplu reaktif bildirim maili (kullanıcı bazlı, çoklu tesis tablosu)
+  if (mt === "reactive_instant_notification") return "Reaktif Aşım Bildirimi";
+
+  // Tesis × kind bazlı SMS / mail (reactive_ri_warn, reactive_rc_limit, vb.)
   const match = mt.match(/^reactive_(\w+?)_(warn|limit)$/);
   if (!match) return mt;
   const [, kind, level] = match;
@@ -221,7 +226,7 @@ export default function AlertsPage() {
       try {
         const { data } = await supabase
           .from("email_logs")
-          .select("id, subscription_serno, email_address, subject, message_body, status, error_message, created_at")
+          .select("id, subscription_serno, email_address, subject, message_type, message_body, status, error_message, created_at")
           .eq("user_id", uid)
           .order("created_at", { ascending: false })
           .limit(50);
@@ -558,6 +563,7 @@ export default function AlertsPage() {
                   <thead>
                     <tr className="border-b border-neutral-100 bg-neutral-50/80">
                       <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">Tarih</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">Tur</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">Email</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">Konu</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">Durum</th>
@@ -571,6 +577,21 @@ export default function AlertsPage() {
                             <Clock className="h-3.5 w-3.5 text-neutral-400" />
                             {formatDate(log.created_at)}
                           </div>
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <span
+                            className={`inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium ${
+                              log.message_type === "reactive_instant_notification"
+                                ? "bg-red-50 text-red-700"
+                                : log.message_type?.includes("limit")
+                                ? "bg-red-50 text-red-700"
+                                : log.message_type?.includes("warn")
+                                ? "bg-amber-50 text-amber-700"
+                                : "bg-neutral-100 text-neutral-600"
+                            }`}
+                          >
+                            {formatMessageType(log.message_type ?? "unknown")}
+                          </span>
                         </td>
                         <td className="px-4 py-3 text-neutral-600 whitespace-nowrap text-xs">
                           {log.email_address}

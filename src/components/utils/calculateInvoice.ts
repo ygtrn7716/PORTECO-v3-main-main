@@ -34,7 +34,11 @@ export interface InvoiceInput {
   totalProductionKwh?: number;
 
   // GES lisans durumu
-  onYil?: boolean;               // true = 10+ yıl (PTF ile satış), false = ulusal tarife
+  // @deprecated calculateInvoice formülünü ETKİLEMEZ — sadece geri uyumluluk için
+  // tutulur. on_yil yalnızca GES sayfasındaki dağıtım kesintisi sabit oranını
+  // etkiler (EnergySoldCard.tsx). Veriş satış bedeli her tesis için aynı şekilde
+  // (mahsup + perakende) hesaplanır.
+  onYil?: boolean;
   perakendeEnerjiBedeli?: number; // TL/kWh, distribution_tariff_official'dan
 }
 
@@ -160,19 +164,26 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
       ? reactivePenaltyInput
       : 0;
 
-  // 4.5) Veriş satış bedeli (ulusal tarife mahsubu — iki katmanlı)
-  const onYil = input.onYil ?? true;
+  // 4.5) Veriş satış bedeli (iki katmanlı)
+  //
+  // Her tesis (10 yıl üstü/altı farketmez) için aynı kural uygulanır:
+  //   • Çekişi geçmeyen kısım  → o ayın enerji birim fiyatıyla mahsup edilir
+  //   • Çekişi geçen kısım     → perakende enerji bedeliyle satılır
+  // Sonuç fatura toplamından düşülür (kullanıcı lehine).
+  //
+  // input.onYil parametresi DEPRECATED. calculateInvoice formülünü artık
+  // etkilemez. on_yil flag'i yalnızca GES sayfasındaki "Devlete Satılan Enerji
+  // Bedeli" kartında dağıtım kesintisinin sabit oranı (1,575810 / 0,496738)
+  // için kullanılır (bkz. EnergySoldCard.tsx).
   const perakendeEnerjiBedeli = input.perakendeEnerjiBedeli ?? 0;
 
-  // Çekişi geçmeyen kısım → o ayın birim fiyatıyla mahsup
-  // Çekişi geçen kısım → perakende enerji bedeliyle satılır
-  const verisMahsupKwh = !onYil && verisKwh > 0
+  const verisMahsupKwh = verisKwh > 0
     ? Math.min(verisKwh, totalConsumptionKwh)
     : 0;
-  const verisFazlaKwh = !onYil && verisKwh > 0
+  const verisFazlaKwh = verisKwh > 0
     ? Math.max(0, verisKwh - totalConsumptionKwh)
     : 0;
-  const verisSatisBedeli = !onYil && verisKwh > 0
+  const verisSatisBedeli = verisKwh > 0
     ? (verisMahsupKwh * unitPriceEnergy) + (verisFazlaKwh * perakendeEnerjiBedeli)
     : 0;
 
