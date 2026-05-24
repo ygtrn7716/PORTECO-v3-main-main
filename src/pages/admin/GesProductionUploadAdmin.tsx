@@ -384,6 +384,13 @@ export default function GesProductionUploadAdmin() {
   const [selectedSubscription, setSelectedSubscription] = useState<string>("");
   const [newPlantPeak, setNewPlantPeak] = useState("");
 
+  // Plant taşıma (mevcut tesisi başka OSOS sernosuna bağlama)
+  const [showMovePlant, setShowMovePlant] = useState(false);
+  const [movingPlant, setMovingPlant] = useState(false);
+  const [movePlantError, setMovePlantError] = useState<string | null>(null);
+  const [movePlantSuccess, setMovePlantSuccess] = useState<string | null>(null);
+  const [moveTargetSubscription, setMoveTargetSubscription] = useState<string>("");
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   /* ---------------- Users (sistemdeki TÜM kayıtlı kullanıcılar) ----- */
@@ -446,6 +453,10 @@ export default function GesProductionUploadAdmin() {
   useEffect(() => {
     setSelectedPlant("");
     setPlants([]);
+    setShowMovePlant(false);
+    setMoveTargetSubscription("");
+    setMovePlantError(null);
+    setMovePlantSuccess(null);
     if (!selectedUser) return;
 
     let mounted = true;
@@ -621,6 +632,137 @@ export default function GesProductionUploadAdmin() {
       setCreatePlantError(err?.message ?? "Bilinmeyen hata");
     } finally {
       setCreatingPlant(false);
+    }
+  }
+
+  /* ---------------- Tesisi başka sernoya taşı ---------------------- */
+  // Mevcut bir GES tesisini (ve dolayısıyla ona bağlı tüm üretim verisini)
+  // başka bir OSOS aboneliğinin sernosuna bağlar. Üretim satırları
+  // ges_plant_id (tesis UUID'si) ile saklandığı için veri otomatik takip eder;
+  // sadece ges_plants kaydındaki linked_serno / isim / provider_plant_id güncellenir.
+  async function handleMovePlant() {
+    setMovePlantSuccess(null);
+    if (!selectedUser) {
+      setMovePlantError("Önce kullanıcı seçin.");
+      return;
+    }
+    if (!selectedPlant) {
+      setMovePlantError("Taşınacak GES tesisini seçin.");
+      return;
+    }
+    if (!moveTargetSubscription) {
+      setMovePlantError("Hedef aboneliği (yeni serno) seçin.");
+      return;
+    }
+
+    const targetSerno = Number(moveTargetSubscription);
+    const targetSub = subscriptions.find(
+      (s) => s.subscription_serno === targetSerno,
+    );
+    if (!targetSub) {
+      setMovePlantError("Seçili hedef abonelik geçersiz.");
+      return;
+    }
+
+    setMovingPlant(true);
+    setMovePlantError(null);
+
+    try {
+      // 1) Taşınacak tesisin mevcut bilgilerini al (credential_id dahil)
+      const { data: plantRow, error: plantErr } = await supabase
+        .from("ges_plants")
+        .select("id, user_id, credential_id, linked_serno, plant_name")
+        .eq("id", selectedPlant)
+        .single();
+      if (plantErr) throw new Error("Tesis okunamadı: " + plantErr.message);
+      if (!plantRow) throw new Error("Taşınacak tesis bulunamadı.");
+      if (plantRow.user_id !== selectedUser) {
+        throw new Error("Tesis bu kullanıcıya ait değil.");
+      }
+
+      if (Number(plantRow.linked_serno) === targetSerno) {
+        throw new Error("Tesis zaten bu sernoya bağlı — taşımaya gerek yok.");
+      }
+
+      // 2) Çakışma kontrolü — hedef sernoda zaten AKTİF başka bir tesis var mı?
+      const { data: conflict, error: conflictErr } = await supabase
+        .from("ges_plants")
+        .select("id, plant_name, is_active")
+        .eq("user_id", selectedUser)
+        .eq("linked_serno", targetSerno)
+        .eq("is_active", true)
+        .neq("id", selectedPlant)
+        .maybeSingle();
+      if (conflictErr)
+        throw new Error("Çakışma kontrolü: " + conflictErr.message);
+      if (conflict?.id) {
+        throw new Error(
+          `Hedef sernoda (${targetSerno}) zaten aktif bir GES tesisi var: "${
+            conflict.plant_name ?? conflict.id.slice(0, 8)
+          }". Taşıma iptal edildi. Önce o tesisi pasifleştirin veya farklı bir hedef seçin.`,
+        );
+      }
+
+      // 3) provider_plant_id'yi hedefe göre belirle —
+      //    UNIQUE(credential_id, provider_plant_id) çakışmasını önle.
+      let newProviderPlantId = `MANUAL_${targetSerno}`;
+      const { data: ppidClash, error: ppidErr } = await supabase
+        .from("ges_plants")
+        .select("id")
+        .eq("credential_id", plantRow.credential_id)
+        .eq("provider_plant_id", newProviderPlantId)
+        .neq("id", selectedPlant)
+        .maybeSingle();
+      if (ppidErr)
+        throw new Error("provider_plant_id kontrolü: " + ppidErr.message);
+      if (ppidClash?.id) {
+        // Aynı credential altında bu provider_plant_id kullanılıyor —
+        // benzersiz kalması için tesis UUID'sinin ön ekini ekle.
+        newProviderPlantId = `MANUAL_${targetSerno}_${selectedPlant.slice(0, 8)}`;
+      }
+
+      // 4) İsim: hedef aboneliğin başlığı kullanılır
+      const newTitle = (targetSub.title ?? "").trim() || `Tesis ${targetSerno}`;
+
+      // 5) Güncelle — üretim verisi (hourly/daily/snapshot) ges_plant_id ile
+      //    bağlı olduğu için otomatik bu sernoya taşınmış olur.
+      const { data: updated, error: updErr } = await supabase
+        .from("ges_plants")
+        .update({
+          linked_serno: targetSerno,
+          plant_name: newTitle,
+          nickname: newTitle,
+          provider_plant_id: newProviderPlantId,
+        })
+        .eq("id", selectedPlant)
+        .select("id, plant_name, nickname, linked_serno")
+        .single();
+      if (updErr) throw new Error("Güncelleme: " + updErr.message);
+
+      // 6) UI state güncelle
+      setPlants((prev) =>
+        prev.map((p) =>
+          p.id === selectedPlant
+            ? {
+                id: p.id,
+                plant_name: (updated?.plant_name as string | null) ?? newTitle,
+                nickname: (updated?.nickname as string | null) ?? newTitle,
+                linked_serno:
+                  (updated?.linked_serno as number | null) ?? targetSerno,
+              }
+            : p,
+        ),
+      );
+      setMovePlantSuccess(
+        `Tesis "${newTitle}" → serno ${targetSerno} olarak taşındı. Tüm üretim verisi bu sernoya bağlandı.`,
+      );
+      setShowMovePlant(false);
+      setMoveTargetSubscription("");
+    } catch (err: any) {
+      console.error(err);
+      setMovePlantError(err?.message ?? "Bilinmeyen hata");
+    } finally {
+      setMovingPlant(false);
     }
   }
 
@@ -1117,20 +1259,43 @@ export default function GesProductionUploadAdmin() {
         <div className="rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm">
           <div className="flex items-center justify-between mb-1">
             <div className="text-xs text-neutral-500">GES Tesisi</div>
-            {selectedUser && plants.length > 0 && !showCreatePlant && (
-              <button
-                type="button"
-                onClick={() => setShowCreatePlant(true)}
-                className="text-xs text-blue-600 hover:text-blue-800 inline-flex items-center gap-1"
-              >
-                <Plus size={12} /> Yeni manuel tesis
-              </button>
-            )}
+            <div className="flex items-center gap-3">
+              {selectedUser && selectedPlant && !showMovePlant && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowMovePlant(true);
+                    setShowCreatePlant(false);
+                    setMovePlantError(null);
+                    setMovePlantSuccess(null);
+                    setMoveTargetSubscription("");
+                  }}
+                  className="text-xs text-amber-600 hover:text-amber-800 inline-flex items-center gap-1"
+                >
+                  <Building2 size={12} /> Başka sernoya taşı
+                </button>
+              )}
+              {selectedUser && plants.length > 0 && !showCreatePlant && (
+                <button
+                  type="button"
+                  onClick={() => setShowCreatePlant(true)}
+                  className="text-xs text-blue-600 hover:text-blue-800 inline-flex items-center gap-1"
+                >
+                  <Plus size={12} /> Yeni manuel tesis
+                </button>
+              )}
+            </div>
           </div>
           <select
             className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm bg-white disabled:bg-neutral-50 disabled:text-neutral-400"
             value={selectedPlant}
-            onChange={(e) => setSelectedPlant(e.target.value)}
+            onChange={(e) => {
+              setSelectedPlant(e.target.value);
+              setShowMovePlant(false);
+              setMovePlantError(null);
+              setMovePlantSuccess(null);
+              setMoveTargetSubscription("");
+            }}
             disabled={!selectedUser || plants.length === 0}
           >
             <option value="">
@@ -1249,6 +1414,125 @@ export default function GesProductionUploadAdmin() {
               )}
             </button>
           </div>
+        </div>
+      )}
+
+      {/* 1c) Tesisi başka sernoya taşı */}
+      {selectedUser && selectedPlant && showMovePlant && (
+        <div className="rounded-2xl border border-amber-200 bg-amber-50/50 p-4 shadow-sm">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Building2 size={18} className="text-amber-600" />
+              <div className="text-sm font-medium text-neutral-900">
+                Tesisi Başka Sernoya Taşı
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setShowMovePlant(false);
+                setMovePlantError(null);
+              }}
+              className="text-neutral-400 hover:text-neutral-700"
+              aria-label="Kapat"
+            >
+              <X size={16} />
+            </button>
+          </div>
+
+          {(() => {
+            const cur = plants.find((p) => p.id === selectedPlant);
+            return (
+              <p className="text-xs text-neutral-600 mb-4">
+                <span className="font-medium">
+                  {cur?.nickname || cur?.plant_name || selectedPlant.slice(0, 8)}
+                </span>{" "}
+                tesisi
+                {cur?.linked_serno ? (
+                  <>
+                    {" "}
+                    (mevcut serno:{" "}
+                    <span className="font-mono">{cur.linked_serno}</span>)
+                  </>
+                ) : null}{" "}
+                başka bir OSOS aboneliğine taşınacak. Tesise bağlı tüm üretim
+                verisi (saatlik + günlük) otomatik olarak yeni sernoya taşınır —
+                veri kopyalanmaz, kaybolmaz.
+              </p>
+            );
+          })()}
+
+          <div>
+            <label className="text-xs text-neutral-500 block mb-1">
+              Hedef Abonelik (yeni serno){" "}
+              <span className="text-red-500">*</span>
+            </label>
+            <select
+              value={moveTargetSubscription}
+              onChange={(e) => setMoveTargetSubscription(e.target.value)}
+              disabled={subscriptions.length === 0}
+              className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm bg-white disabled:bg-neutral-50 disabled:text-neutral-400"
+            >
+              <option value="">
+                {subscriptions.length === 0
+                  ? "Bu kullanıcının kayıtlı aboneliği yok"
+                  : "Hedef abonelik seçin..."}
+              </option>
+              {subscriptions
+                .filter(
+                  (s) =>
+                    s.subscription_serno !==
+                    plants.find((p) => p.id === selectedPlant)?.linked_serno,
+                )
+                .map((s) => (
+                  <option
+                    key={s.subscription_serno}
+                    value={s.subscription_serno}
+                  >
+                    {s.subscription_serno} — {s.title || "İsimsiz Tesis"}
+                  </option>
+                ))}
+            </select>
+            <div className="text-[11px] text-neutral-500 mt-1">
+              Tesis adı hedef aboneliğin başlığıyla güncellenir. Hedef sernoda
+              zaten aktif bir tesis varsa taşıma engellenir.
+            </div>
+          </div>
+
+          {movePlantError && (
+            <div className="mt-3 rounded-lg border border-red-200 bg-red-50 p-2.5 text-sm text-red-700 flex items-start gap-2">
+              <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+              <div>{movePlantError}</div>
+            </div>
+          )}
+
+          <div className="mt-3 flex justify-end">
+            <button
+              type="button"
+              onClick={handleMovePlant}
+              disabled={movingPlant || !moveTargetSubscription}
+              className="inline-flex items-center gap-2 rounded-lg bg-amber-600 px-3 py-2 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50"
+            >
+              {movingPlant ? (
+                <>
+                  <Loader2 size={14} className="animate-spin" />
+                  Taşınıyor...
+                </>
+              ) : (
+                <>
+                  <Building2 size={14} />
+                  Tesisi Taşı
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {movePlantSuccess && !showMovePlant && (
+        <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800 flex items-start gap-2">
+          <CheckCircle2 size={16} className="shrink-0 mt-0.5" />
+          <div>{movePlantSuccess}</div>
         </div>
       )}
 

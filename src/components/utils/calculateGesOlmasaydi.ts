@@ -48,6 +48,9 @@ export interface GesOlmasaydiParams {
   // Veriş satış parametreleri
   onYil?: boolean;
   perakendeEnerjiBedeli?: number;
+  // Lisanslı Satış: true ise GES tüketim faturasını etkilemez; tasarruf =
+  // satılan enerjinin geliri olarak ortaya çıkar (gesOlmasaydiFatura - mevcut).
+  lisansliSatis?: boolean;
 }
 
 /** GES production_hourly'den paginated fetch */
@@ -88,6 +91,71 @@ export async function calculateGesOlmasaydi(
   params: GesOlmasaydiParams,
 ): Promise<GesOlmasaydiResult | null> {
   const { supabase, userId, subscriptionSerno, periodYear, periodMonth } = params;
+
+  // Lisanslı Satış: GES tüketim faturasını etkilemez. "GES olmasaydı fatura"
+  // = mevcut tüketim faturası (satış indirimi yokken). Tasarruf doğal olarak
+  // satılan enerjinin geliri (×KDV) olarak hesaplanır.
+  if (params.lisansliSatis) {
+    let totalGesKwh = 0;
+    const { data: plantsData } = await supabase
+      .from("ges_plants")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("is_active", true)
+      .eq("linked_serno", subscriptionSerno);
+
+    if (plantsData && plantsData.length > 0) {
+      const plantIds = plantsData.map((p: { id: string }) => p.id);
+      const start = new Date(periodYear, periodMonth - 1, 1);
+      const end = new Date(periodYear, periodMonth, 1);
+      const gesRes = await fetchAllGesProduction(
+        supabase,
+        plantIds,
+        start.toISOString(),
+        end.toISOString(),
+      );
+      if (!gesRes.error) {
+        totalGesKwh = gesRes.data.reduce(
+          (s: number, r: { energy_kwh: number | null }) =>
+            s + (Number(r.energy_kwh) || 0),
+          0,
+        );
+      }
+    }
+
+    const breakdown = calculateInvoice({
+      totalConsumptionKwh: params.mevcutTuketimKwh,
+      unitPriceEnergy: params.mevcutBirimFiyat,
+      unitPriceDistribution: params.unitPriceDistribution,
+      btvRate: params.btvRate,
+      vatRate: params.vatRate,
+      tariffType: params.tariffType,
+      contractPowerKw: params.contractPowerKw,
+      monthFinalDemandKw: params.monthFinalDemandKw,
+      powerPrice: params.powerPrice,
+      powerExcessPrice: params.powerExcessPrice,
+      reactivePenaltyCharge: params.reactivePenaltyCharge,
+      trafoDegeri: params.trafoDegeri,
+      totalProductionKwh: 0,
+      lisansliSatis: true,
+    });
+
+    const gesOlmasaydiFatura = breakdown.totalInvoice;
+    const tasarruf = gesOlmasaydiFatura - params.mevcutFatura;
+    return {
+      hamTuketimKwh: params.mevcutTuketimKwh,
+      mevcutTuketimKwh: params.mevcutTuketimKwh,
+      gesUretimKwh: totalGesKwh,
+      gesOlmasaydiFatura,
+      mevcutFatura: params.mevcutFatura,
+      tasarruf,
+      tasarrufYuzde:
+        gesOlmasaydiFatura > 0 ? (tasarruf / gesOlmasaydiFatura) * 100 : 0,
+      hamBirimFiyat: params.mevcutBirimFiyat,
+      mevcutBirimFiyat: params.mevcutBirimFiyat,
+      gesOlmasaydiBreakdown: breakdown,
+    };
+  }
 
   // 1) Bu tüketim aboneliğine (subscription_serno) BAĞLI aktif GES plant'ları bul.
   //    linked_serno filtresi sayesinde her tüketim tesisi sadece kendi GES

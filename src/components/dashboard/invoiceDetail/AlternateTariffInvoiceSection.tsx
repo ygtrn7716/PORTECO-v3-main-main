@@ -63,7 +63,9 @@ export default function AlternateTariffInvoiceSection(props: {
 
   totalProductionKwh?: number;
   onYil?: boolean;
+  lisansliSatis?: boolean;
   perakendeEnerjiBedeli?: number;
+  usdKur?: number;
 }) {
   const {
     uid,
@@ -82,7 +84,9 @@ export default function AlternateTariffInvoiceSection(props: {
     hasYekdemMahsup,
     totalProductionKwh,
     onYil,
+    lisansliSatis,
     perakendeEnerjiBedeli,
+    usdKur,
   } = props;
 
   const [loading, setLoading] = useState(false);
@@ -237,7 +241,9 @@ export default function AlternateTariffInvoiceSection(props: {
           trafoDegeri,
           totalProductionKwh: totalProductionKwh ?? 0,
           onYil,
+          lisansliSatis,
           perakendeEnerjiBedeli,
+          usdKur,
         });
 
         if (cancel) return;

@@ -42,6 +42,8 @@ export function recomputeSnapshotTotalWithMahsup(
       totalProductionKwh: Number(row.total_production_kwh ?? 0),
       onYil: row.on_yil ?? true,
       perakendeEnerjiBedeli: Number(row.perakende_enerji_bedeli ?? 0),
+      usdKur: Number(row.usd_kur ?? 0),
+      lisansliSatis: row.lisansli_satis ?? false,
     });
     const yekdem = Number(row.yekdem_mahsup ?? 0);
     const diger = Number(row.diger_degerler ?? 0);
@@ -54,7 +56,7 @@ export function recomputeSnapshotTotalWithMahsup(
 /** Tek noktadan import edilen "snapshot select" listesi — recompute yapacak
  * çağıran tarafların kullanması beklenir. */
 export const INVOICE_SNAPSHOT_RECOMPUTE_FIELDS =
-  "total_consumption_kwh, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, trafo_degeri, total_production_kwh, on_yil, perakende_enerji_bedeli, yekdem_mahsup, diger_degerler, total_with_mahsup";
+  "total_consumption_kwh, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, yekdem_mahsup, diger_degerler, total_with_mahsup";
 
 export type InvoiceType = "billed" | "backdated";
 
@@ -110,8 +112,10 @@ export type InvoiceSnapshotRow = {
   veris_kwh: number | null;
   effective_distribution_unit_price: number | null;
   on_yil: boolean | null;
+  lisansli_satis: boolean | null;
   veris_satis_bedeli: number | null;
   perakende_enerji_bedeli: number | null;
+  usd_kur: number | null;
 };
 
 export async function upsertInvoiceSnapshot(params: {
@@ -153,7 +157,9 @@ export async function upsertInvoiceSnapshot(params: {
 
   totalProductionKwh?: number;
   onYil?: boolean;
+  lisansliSatis?: boolean;
   perakendeEnerjiBedeli?: number;
+  usdKur?: number;
 }) {
   const invoiceType = params.invoiceType ?? "billed";
 
@@ -206,8 +212,10 @@ export async function upsertInvoiceSnapshot(params: {
     veris_kwh: params.breakdown.verisKwh ?? 0,
     effective_distribution_unit_price: params.breakdown.effectiveDistributionUnitPrice ?? 0,
     on_yil: params.onYil ?? null,
+    lisansli_satis: params.lisansliSatis ?? null,
     veris_satis_bedeli: params.breakdown.verisSatisBedeli ?? 0,
     perakende_enerji_bedeli: params.perakendeEnerjiBedeli ?? null,
+    usd_kur: params.usdKur ?? null,
   };
 
   const { error } = await supabase
@@ -229,7 +237,7 @@ export async function listInvoiceSnapshots(params: {
   const q = supabase
     .from("invoice_snapshots")
     .select(
-      "user_id, subscription_serno, period_year, period_month, invoice_type, month_label, total_with_mahsup, total_invoice, total_consumption_kwh, updated_at, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, trafo_degeri, total_production_kwh, on_yil, perakende_enerji_bedeli, yekdem_mahsup, diger_degerler"
+      "user_id, subscription_serno, period_year, period_month, invoice_type, month_label, total_with_mahsup, total_invoice, total_consumption_kwh, updated_at, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, yekdem_mahsup, diger_degerler"
     )
     .eq("user_id", params.userId)
     .eq("invoice_type", params.invoiceType ?? "billed")

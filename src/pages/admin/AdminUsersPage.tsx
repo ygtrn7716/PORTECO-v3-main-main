@@ -30,6 +30,7 @@ type SettingsForm = {
   nickname: string | null;
   on_yil: boolean;
   satis_hakki: number | null;
+  lisansli_satis: boolean;
 };
 
 type YekdemMonth = {
@@ -37,6 +38,7 @@ type YekdemMonth = {
   yekdem_value: number | null;
   yekdem_final: number | null;
   diger_degerler: number | null;
+  usd_kur: number | null;
 };
 
 type RightTab = "settings" | "yekdem";
@@ -51,6 +53,7 @@ const EMPTY_SETTINGS: SettingsForm = {
   nickname: null,
   on_yil: false,
   satis_hakki: null,
+  lisansli_satis: false,
 };
 
 const MONTH_NAMES = [
@@ -203,7 +206,7 @@ export default function AdminUsersPage() {
     (async () => {
       const { data } = await supabase
         .from("subscription_settings")
-        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil, satis_hakki")
+        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil, satis_hakki, lisansli_satis")
         .eq("user_id", selectedUserId)
         .eq("subscription_serno", selectedSerno)
         .maybeSingle();
@@ -228,7 +231,7 @@ export default function AdminUsersPage() {
     (async () => {
       const { data } = await supabase
         .from("subscription_yekdem")
-        .select("period_month, yekdem_value, yekdem_final, diger_degerler")
+        .select("period_month, yekdem_value, yekdem_final, diger_degerler, usd_kur")
         .eq("user_id", selectedUserId)
         .eq("subscription_serno", selectedSerno)
         .eq("period_year", yekdemYear)
@@ -288,6 +291,7 @@ export default function AdminUsersPage() {
       yekdem_value: draft?.yekdem_value ?? existing?.yekdem_value ?? null,
       yekdem_final: draft?.yekdem_final ?? existing?.yekdem_final ?? null,
       diger_degerler: draft?.diger_degerler ?? existing?.diger_degerler ?? null,
+      usd_kur: draft?.usd_kur ?? existing?.usd_kur ?? null,
     };
 
     setYekdemSaving(month);
@@ -300,6 +304,7 @@ export default function AdminUsersPage() {
         yekdem_value: merged.yekdem_value,
         yekdem_final: merged.yekdem_final,
         diger_degerler: merged.diger_degerler,
+        usd_kur: merged.usd_kur,
       },
       { onConflict: "user_id,subscription_serno,period_year,period_month" },
     );
@@ -311,7 +316,7 @@ export default function AdminUsersPage() {
       // Refresh data
       const { data } = await supabase
         .from("subscription_yekdem")
-        .select("period_month, yekdem_value, yekdem_final, diger_degerler")
+        .select("period_month, yekdem_value, yekdem_final, diger_degerler, usd_kur")
         .eq("user_id", selectedUserId)
         .eq("subscription_serno", selectedSerno)
         .eq("period_year", yekdemYear)
@@ -341,8 +346,9 @@ export default function AdminUsersPage() {
         yekdem_value: draft?.yekdem_value ?? existing?.yekdem_value ?? null,
         yekdem_final: draft?.yekdem_final ?? existing?.yekdem_final ?? null,
         diger_degerler: draft?.diger_degerler ?? existing?.diger_degerler ?? null,
+        usd_kur: draft?.usd_kur ?? existing?.usd_kur ?? null,
       };
-    }).filter((r) => r.yekdem_value != null || r.yekdem_final != null || r.diger_degerler != null);
+    }).filter((r) => r.yekdem_value != null || r.yekdem_final != null || r.diger_degerler != null || r.usd_kur != null);
 
     if (rows.length > 0) {
       const { error } = await supabase
@@ -358,7 +364,7 @@ export default function AdminUsersPage() {
     // Refresh
     const { data } = await supabase
       .from("subscription_yekdem")
-      .select("period_month, yekdem_value, yekdem_final, diger_degerler")
+      .select("period_month, yekdem_value, yekdem_final, diger_degerler, usd_kur")
       .eq("user_id", selectedUserId)
       .eq("subscription_serno", selectedSerno)
       .eq("period_year", yekdemYear)
@@ -652,6 +658,19 @@ export default function AdminUsersPage() {
                       </span>
                     </label>
 
+                    {/* Lisanslı Satış Üretim Tesisi */}
+                    <label className="flex items-center gap-2 mt-1">
+                      <input
+                        type="checkbox"
+                        checked={settings.lisansli_satis ?? false}
+                        onChange={(e) => setSettings((p) => ({ ...p, lisansli_satis: e.target.checked }))}
+                        className="rounded border-neutral-300"
+                      />
+                      <span className="text-xs font-medium text-neutral-600">
+                        Lisanslı Satış Üretim Tesisi
+                      </span>
+                    </label>
+
                     {/* Save */}
                     <button
                       disabled={settingsSaving}
@@ -713,6 +732,7 @@ export default function AdminUsersPage() {
                         const val = draft?.yekdem_value ?? existing?.yekdem_value;
                         const fin = draft?.yekdem_final ?? existing?.yekdem_final;
                         const dig = draft?.diger_degerler ?? existing?.diger_degerler;
+                        const usd = draft?.usd_kur ?? existing?.usd_kur;
                         const hasFill = val != null;
                         const hasFinal = fin != null;
                         const saved = yekdemSaved[m];
@@ -776,7 +796,7 @@ export default function AdminUsersPage() {
                             </label>
 
                             {/* diger_degerler */}
-                            <label className="block mb-2">
+                            <label className="block mb-1.5">
                               <span className="text-[10px] text-neutral-500">Diğer</span>
                               <input
                                 type="number"
@@ -787,6 +807,25 @@ export default function AdminUsersPage() {
                                     [m]: { ...p[m], diger_degerler: numOrNull(e.target.value) },
                                   }))
                                 }
+                                className="w-full rounded-lg border border-neutral-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200"
+                              />
+                            </label>
+
+                            {/* usd_kur — 10 yıl üstü tesislerde veriş fazlası satışı için ay sonu USD/TL kuru.
+                                Boş bırakılırsa eski perakende_enerji_bedeli formülüne fallback yapılır. */}
+                            <label className="block mb-2">
+                              <span className="text-[10px] text-neutral-500">USD/TL Kuru (10 yıl üstü)</span>
+                              <input
+                                type="number"
+                                step="0.0001"
+                                value={d(usd)}
+                                onChange={(e) =>
+                                  setYekdemDraft((p) => ({
+                                    ...p,
+                                    [m]: { ...p[m], usd_kur: numOrNull(e.target.value) },
+                                  }))
+                                }
+                                placeholder="örn. 32,5000"
                                 className="w-full rounded-lg border border-neutral-300 px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-blue-200"
                               />
                             </label>

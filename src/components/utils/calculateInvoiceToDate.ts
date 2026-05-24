@@ -39,26 +39,31 @@ function hourKeyUtc(ts: any) {
 async function fetchSubYekdemValue(
   supabase: SupabaseClient,
   params: { uid: string; sub: number; year: number; month: number }
-): Promise<number | null> {
+): Promise<{ yekdem_value: number | null; usd_kur: number | null }> {
   const { uid, sub, year, month } = params;
 
   // 1) period_year/period_month (primary)
   const r1 = await supabase
     .from("subscription_yekdem")
-    .select("yekdem_value")
+    .select("yekdem_value, usd_kur")
     .eq("user_id", uid)
     .eq("subscription_serno", sub)
     .eq("period_year", year)
     .eq("period_month", month)
     .maybeSingle();
 
-  if (!r1.error) return r1.data?.yekdem_value != null ? num(r1.data.yekdem_value, 0) : null;
+  if (!r1.error) {
+    return {
+      yekdem_value: r1.data?.yekdem_value != null ? num(r1.data.yekdem_value, 0) : null,
+      usd_kur: r1.data?.usd_kur != null ? num(r1.data.usd_kur, 0) : null,
+    };
+  }
 
   // 2) year/month (fallback)
   if (isMissingColumnError(r1.error, "period_year") || isMissingColumnError(r1.error, "period_month")) {
     const r2 = await supabase
       .from("subscription_yekdem")
-      .select("yekdem_value")
+      .select("yekdem_value, usd_kur")
       .eq("user_id", uid)
       .eq("subscription_serno", sub)
       .eq("year", year)
@@ -66,7 +71,10 @@ async function fetchSubYekdemValue(
       .maybeSingle();
 
     if (r2.error) throw r2.error;
-    return r2.data?.yekdem_value != null ? num(r2.data.yekdem_value, 0) : null;
+    return {
+      yekdem_value: r2.data?.yekdem_value != null ? num(r2.data.yekdem_value, 0) : null,
+      usd_kur: r2.data?.usd_kur != null ? num(r2.data.usd_kur, 0) : null,
+    };
   }
 
   throw r1.error;
@@ -218,6 +226,7 @@ export type MonthInvoiceToDateResult = {
 
   monthlyPTF_tl_kwh: number;   // tüketim-ağırlıklı ort PTF
   monthlyYekdem_tl_kwh: number;
+  monthlyUsdKur: number;       // 0 ise fallback (perakende_enerji_bedeli)
 
   kbk: number;
   unitPriceEnergy: number;        // (PTF+YEKDEM)*KBK
@@ -237,6 +246,10 @@ export type MonthInvoiceToDateResult = {
 
   trafoDegeri: number;
   digerDegerler: number;
+
+  onYil: boolean;
+  lisansliSatis: boolean;
+  perakendeEnerjiBedeli: number;
 
   breakdown: InvoiceBreakdown;
 
@@ -273,13 +286,16 @@ export async function computeMonthInvoiceToDate(params: {
   const monthEndExclusiveIso = monthEndExclusive.toDate().toISOString();
 
   // ✅ şart: bu ay için yekdem_value girilmiş olmalı (senin istediğin davranış)
-  const monthlyYekdem = await fetchSubYekdemValue(supabase, {
+  // + usd_kur (10 yıl üstü tesislerde veriş fazlası satış birim fiyatı için)
+  const yekRow = await fetchSubYekdemValue(supabase, {
     uid,
     sub: subscriptionSerNo,
     year,
     month,
   });
-  if (monthlyYekdem == null) return null;
+  if (yekRow.yekdem_value == null) return null;
+  const monthlyYekdem = yekRow.yekdem_value;
+  const monthlyUsdKur = yekRow.usd_kur ?? 0;
 
   // PTF cutoff (bu ay içinde en son ts)
   const maxPtf = await supabase
@@ -359,7 +375,7 @@ export async function computeMonthInvoiceToDate(params: {
   // settings: KBK, terim, gerilim, tarife, güç limit, trafo
   const settingsRes = await supabase
     .from("subscription_settings")
-    .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil")
+    .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis")
     .eq("user_id", uid)
     .eq("subscription_serno", subscriptionSerNo)
     .maybeSingle();
@@ -375,6 +391,7 @@ export async function computeMonthInvoiceToDate(params: {
   const contractPowerKw = num(settingsRes.data.guc_bedel_limit, 0);
   const trafoDegeri = num(settingsRes.data.trafo_degeri, 0);
   const onYil = settingsRes.data.on_yil ?? false;
+  const lisansliSatis = settingsRes.data.lisansli_satis ?? false;
 
   if (!terim || !gerilim || !tarife) return null;
 
@@ -488,14 +505,20 @@ export async function computeMonthInvoiceToDate(params: {
     totalProductionKwh: totalGn,
     onYil,
     perakendeEnerjiBedeli,
+    usdKur: monthlyUsdKur,
+    lisansliSatis,
   });
 
   // YEKDEM mahsup: M-1 (tam ay)  — InvoiceDetail ile aynı mantık
+  // Lisanslı Satış tesisleri mahsup akışına hiç girmez.
   let yekdemMahsup = 0;
   let hasYekdemMahsup = false;
   let yekdemMissing: "none" | "value" | "final" | "both" = "both";
 
-  try {
+  if (lisansliSatis) {
+    yekdemMissing = "none";
+  } else {
+   try {
     const prevForMahsup = m.subtract(1, "month"); // M-1
     const prevStart = prevForMahsup.startOf("month");
     const prevEndExclusive = prevStart.clone().add(1, "month");
@@ -565,12 +588,13 @@ export async function computeMonthInvoiceToDate(params: {
         }
       }
     }
-  } catch {
+   } catch {
     yekdemMahsup = 0;
     hasYekdemMahsup = false;
+   }
   }
 
-  if (requirePrevMonthMahsup && !hasYekdemMahsup) return null;
+  if (requirePrevMonthMahsup && !hasYekdemMahsup && !lisansliSatis) return null;
 
   const totalWithMahsup = breakdown.totalInvoice + yekdemMahsup + digerDegerler;
 
@@ -589,6 +613,7 @@ export async function computeMonthInvoiceToDate(params: {
 
     monthlyPTF_tl_kwh: monthlyPTF,
     monthlyYekdem_tl_kwh: monthlyYekdem,
+    monthlyUsdKur,
 
     kbk,
     unitPriceEnergy,
@@ -608,6 +633,10 @@ export async function computeMonthInvoiceToDate(params: {
 
     trafoDegeri,
     digerDegerler,
+
+    onYil,
+    lisansliSatis,
+    perakendeEnerjiBedeli,
 
     breakdown,
 

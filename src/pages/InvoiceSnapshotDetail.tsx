@@ -117,6 +117,7 @@ const yekdemCell = useMemo(() => {
         totalProductionKwh: Number(row.total_production_kwh ?? 0),
         onYil: row.on_yil ?? true,
         perakendeEnerjiBedeli: Number(row.perakende_enerji_bedeli ?? 0),
+        lisansliSatis: (row as any).lisansli_satis ?? false,
       });
     } catch {
       return null;

@@ -99,7 +99,9 @@ interface InvoiceViewData {
    digerDegerler: number;
 
    onYil: boolean;
+   lisansliSatis: boolean;
    perakendeEnerjiBedeli: number;
+   usdKur: number; // 10 yıl üstü tesisler için ay sonu USD/TL kuru (0 ise fallback)
 }
 
 function mapTermToTariffType(term: string | null | undefined): TariffType {
@@ -118,26 +120,31 @@ async function fetchSubYekdemValue(params: {
   sub: number;
   year: number;
   month: number;
-}): Promise<number | null> {
+}): Promise<{ yekdem_value: number | null; usd_kur: number | null }> {
   const { uid, sub, year, month } = params;
 
   // 1) period_year/period_month (primary)
   const r1 = await supabase
     .from("subscription_yekdem")
-    .select("yekdem_value")
+    .select("yekdem_value, usd_kur")
     .eq("user_id", uid)
     .eq("subscription_serno", sub)
     .eq("period_year", year)
     .eq("period_month", month)
     .maybeSingle();
 
-  if (!r1.error) return r1.data?.yekdem_value != null ? Number(r1.data.yekdem_value) : null;
+  if (!r1.error) {
+    return {
+      yekdem_value: r1.data?.yekdem_value != null ? Number(r1.data.yekdem_value) : null,
+      usd_kur: r1.data?.usd_kur != null ? Number(r1.data.usd_kur) : null,
+    };
+  }
 
   // 2) year/month (fallback)
   if (isMissingColumnError(r1.error, "period_year") || isMissingColumnError(r1.error, "period_month")) {
     const r2 = await supabase
       .from("subscription_yekdem")
-      .select("yekdem_value")
+      .select("yekdem_value, usd_kur")
       .eq("user_id", uid)
       .eq("subscription_serno", sub)
       .eq("year", year)
@@ -145,7 +152,10 @@ async function fetchSubYekdemValue(params: {
       .maybeSingle();
 
     if (r2.error) throw r2.error;
-    return r2.data?.yekdem_value != null ? Number(r2.data.yekdem_value) : null;
+    return {
+      yekdem_value: r2.data?.yekdem_value != null ? Number(r2.data.yekdem_value) : null,
+      usd_kur: r2.data?.usd_kur != null ? Number(r2.data.usd_kur) : null,
+    };
   }
 
   throw r1.error;
@@ -403,7 +413,9 @@ export default function InvoiceDetail() {
             : 0;
 
         // 3) YEKDEM (subscription_yekdem -> fallback resmi) – TL/kWh
+        // + usd_kur (10 yıl üstü tesisler için ay sonu USD/TL kuru)
         let monthlyYekdem = 0;
+        let monthlyUsdKur = 0;
 
         const subYekVal = await fetchSubYekdemValue({
           uid,
@@ -412,8 +424,12 @@ export default function InvoiceDetail() {
           month: periodMonth,
         });
 
-        if (subYekVal != null) {
-          monthlyYekdem = Number(subYekVal) || 0;
+        if (subYekVal.usd_kur != null) {
+          monthlyUsdKur = Number(subYekVal.usd_kur) || 0;
+        }
+
+        if (subYekVal.yekdem_value != null) {
+          monthlyYekdem = Number(subYekVal.yekdem_value) || 0;
         } else {
           const { data: offRow, error: offErr } = await supabase
             .from("yekdem_official")
@@ -435,7 +451,7 @@ export default function InvoiceDetail() {
         // 4) tesis ayarları (KBK + tarife + güç limit) -> SADECE subscription_settings
         const settingsRes = await supabase
           .from("subscription_settings")
-          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil")
+          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -458,6 +474,7 @@ export default function InvoiceDetail() {
             : 0;
 
         const onYil = settingsRes.data.on_yil ?? false;
+        const lisansliSatis = settingsRes.data.lisansli_satis ?? false;
 
         const missing: string[] = [];
         if (!terim) missing.push("terim");
@@ -614,6 +631,8 @@ export default function InvoiceDetail() {
             totalProductionKwh: totalGn,
             onYil,
             perakendeEnerjiBedeli,
+            usdKur: monthlyUsdKur, // 10 yıl üstü için veriş fazlası USD bazlı (0 ise perakende fallback)
+            lisansliSatis,
           });
 
        //ara taşak madde ekliyom  buraya
@@ -626,11 +645,12 @@ export default function InvoiceDetail() {
           });
 
         // 9) YEKDEM mahsup (M-1 için)
+        // Lisanslı Satış tesisleri için YEKDEM mahsup uygulanmaz.
         let yekdemMahsupValue = 0;
         let hasYekdemMahsup = false;
-        let yekdemMissing: "none" | "value" | "final" | "both" = "both";
+        let yekdemMissing: "none" | "value" | "final" | "both" = lisansliSatis ? "none" : "both";
 
-        try {
+        if (!lisansliSatis) try {
           const billingMonth = dayjsTR().year(periodYear).month(periodMonth - 1); // M
           const prevForYekdem = billingMonth.subtract(1, "month"); // M-1
 
@@ -792,7 +812,9 @@ try {
     digerDegerler,
     totalProductionKwh: totalGn,
     onYil,
+    lisansliSatis,
     perakendeEnerjiBedeli,
+    usdKur: monthlyUsdKur,
   });
 } catch (e) {
   console.error("upsertInvoiceSnapshot error:", e);
@@ -825,7 +847,9 @@ try {
             digerDegerler,
             totalProductionKwh: totalGn,
             onYil,
+            lisansliSatis,
             perakendeEnerjiBedeli,
+            usdKur: monthlyUsdKur,
           });
 
           // GES olmasaydı — parametreleri sakla + GES kontrolü
@@ -849,7 +873,9 @@ try {
             reactivePenaltyCharge,
             trafoDegeri,
             onYil,
+            lisansliSatis,
             perakendeEnerjiBedeli,
+            usdKur: monthlyUsdKur,
           };
           gesOlmasaydiCalced.current = false;
           setGesOlmasaydiResult(null);
@@ -912,6 +938,7 @@ try {
         reactivePenaltyCharge: p.reactivePenaltyCharge,
         trafoDegeri: p.trafoDegeri,
         onYil: p.onYil,
+        lisansliSatis: p.lisansliSatis,
         perakendeEnerjiBedeli: p.perakendeEnerjiBedeli,
       });
       setGesOlmasaydiResult(result);
@@ -1169,7 +1196,9 @@ const isDualTerm = data?.tariffType === "dual";
             yekdemMahsup={data.yekdemMahsup}
             totalProductionKwh={data.totalProductionKwh}
             onYil={data.onYil}
+            lisansliSatis={data.lisansliSatis}
             perakendeEnerjiBedeli={data.perakendeEnerjiBedeli}
+            usdKur={data.usdKur}
           />
 
 
@@ -1285,18 +1314,38 @@ const isDualTerm = data?.tariffType === "dual";
                     </tr>
                   )}
 
-                  {/* Veriş Fazla — çekişi geçen kısım (perakende ile) */}
-                  {data.breakdown.verisFazlaKwh > 0 && (
-                    <tr className="border-b border-neutral-100">
-                      <td className="py-2 pr-4 text-emerald-700">Veriş Satış (Perakende)</td>
-                      <td className="py-2 pr-4 text-neutral-600">
-                        {fmtUnit(data.perakendeEnerjiBedeli)} TL/kWh × {fmtKwh(data.breakdown.verisFazlaKwh)} kWh
-                      </td>
-                      <td className="py-2 pr-4 text-right text-emerald-700">
-                        −{fmtMoney2(data.breakdown.verisFazlaKwh * data.perakendeEnerjiBedeli)}
-                      </td>
-                    </tr>
-                  )}
+                  {/* Veriş Fazla — çekişi geçen kısım
+                      • on_yil=true && usd_kur>0 → 0.133 USD × kur (TL/kWh)
+                      • aksi halde → perakende_enerji_bedeli (TL/kWh, fallback) */}
+                  {data.breakdown.verisFazlaKwh > 0 && (() => {
+                    const verisFazlaUseUsd = data.onYil && data.usdKur > 0;
+                    const verisFazlaBirim = verisFazlaUseUsd
+                      ? 0.133 * data.usdKur
+                      : data.perakendeEnerjiBedeli;
+                    const verisFazlaBedeli = data.breakdown.verisFazlaKwh * verisFazlaBirim;
+                    return (
+                      <tr className="border-b border-neutral-100">
+                        <td className="py-2 pr-4 text-emerald-700">
+                          {verisFazlaUseUsd ? "Veriş Satış (USD)" : "Veriş Satış (Perakende)"}
+                        </td>
+                        <td className="py-2 pr-4 text-neutral-600">
+                          {verisFazlaUseUsd ? (
+                            <>
+                              0,133 USD/kWh × {fmtMoney2(data.usdKur)} TL/USD ={" "}
+                              {fmtUnit(verisFazlaBirim)} TL/kWh × {fmtKwh(data.breakdown.verisFazlaKwh)} kWh
+                            </>
+                          ) : (
+                            <>
+                              {fmtUnit(data.perakendeEnerjiBedeli)} TL/kWh × {fmtKwh(data.breakdown.verisFazlaKwh)} kWh
+                            </>
+                          )}
+                        </td>
+                        <td className="py-2 pr-4 text-right text-emerald-700">
+                          −{fmtMoney2(verisFazlaBedeli)}
+                        </td>
+                      </tr>
+                    );
+                  })()}
 
                   <tr className="border-t border-neutral-200">
                     <td className="py-2 pr-4 font-semibold">KDV Hariç Toplam</td>

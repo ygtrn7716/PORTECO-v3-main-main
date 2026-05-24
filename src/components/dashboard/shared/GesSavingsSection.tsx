@@ -58,6 +58,7 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<GesOlmasaydiResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [lisansliSatis, setLisansliSatis] = useState(false);
 
   useEffect(() => {
     // Placeholder variant — API yoksa hiç fetch yapma
@@ -77,6 +78,7 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
       setLoading(true);
       setError(null);
       setResult(null);
+      setLisansliSatis(false);
       try {
         const prev = dayjsTR().subtract(1, "month");
         const periodYear = prev.year();
@@ -92,7 +94,7 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
           }),
           supabase
             .from("subscription_settings")
-            .select("kbk")
+            .select("kbk, lisansli_satis")
             .eq("user_id", userId)
             .eq("subscription_serno", subscriptionSerno)
             .maybeSingle(),
@@ -100,6 +102,17 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
         ]);
 
         if (cancel) return;
+
+        // Lisanslı Satış tesisleri: kart anlam taşımıyor (mahsuplaşma yok,
+        // tasarruf kavramı için ayrı bir görselleme gerek), gizle.
+        const isLisansliSatis = !!(kbkRow.data as any)?.lisansli_satis;
+        setLisansliSatis(isLisansliSatis);
+        if (isLisansliSatis) {
+          setResult(null);
+          setError(null);
+          setLoading(false);
+          return;
+        }
 
         if (!snap) {
           setError("Geçen ayın fatura kaydı henüz oluşturulmadı.");
@@ -163,6 +176,11 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
 
   // API'li kullanıcı — aktif tesis seçimi bekleniyor
   if (subscriptionSerno == null) {
+    return null;
+  }
+
+  // Lisanslı Satış tesisi: kartı tamamen gizle.
+  if (lisansliSatis) {
     return null;
   }
 

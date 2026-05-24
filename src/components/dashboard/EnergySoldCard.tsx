@@ -44,6 +44,11 @@ type CalcResult = {
   satisNetGelir: number;     // TL
   dagitimBedeli: number;     // TL/kWh (bilgi) — on_yil'e göre sabit oran
   onYil: boolean;            // 10 yıl üstü/altı bilgisi (açıklama metni için)
+  // Brüt gelirde kullanılan birim fiyat ve mod (USD vs perakende)
+  satisBrutBirim: number;    // TL/kWh — gerçekten uygulanan birim fiyat
+  satisModu: "usd" | "perakende";
+  satisUsdKur: number;       // 0 = USD modu kullanılmadı
+  perakendeRate: number;     // TL/kWh — perakende_enerji_bedeli (her durumda gösterilir)
   // Yıllık satış hakkı (subscription_settings.satis_hakki) — takvim yılı kümülatifi
   yillikMaxSatisKwh: number | null;     // null = admin tanımlamamış
   yillikKullanilanKwh: number;          // 1 Oca → bugün arası ay-bazlı satış toplamı
@@ -62,6 +67,12 @@ const MONTH_NAMES = [
 //   on_yil = false (10 yıl altı) → 0,496738 TL/kWh
 const DAGITIM_BEDELI_ON_YIL_USTU = 1.575810;
 const DAGITIM_BEDELI_ON_YIL_ALTI = 0.496738;
+
+// 10 yıl üstü tesislerin veriş fazlası satış birim fiyatı (USD/kWh).
+// Brüt gelir = satisKwh × VERIS_USD_BIRIM_FIYAT × usd_kur (TL/USD)
+// usd_kur subscription_yekdem.usd_kur'dan o ay için okunur. NULL/0 ise
+// eski perakende_enerji_bedeli formülüne fallback yapılır.
+const VERIS_USD_BIRIM_FIYAT = 0.133;
 
 const fmtKwh = (n: number) =>
   n.toLocaleString("tr-TR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -260,16 +271,15 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
 
         // Sağ kart: satış hesabı.
         //
-        // BRÜT GELIR (on_yil farketmez):
-        //   satisBrutGelir = satisKwh × distribution_tariff_official.perakende_enerji_bedeli
-        //   (tesisin terim/gerilim/tarife eşleşmesinden çekilir)
+        // BRÜT GELIR (iki mod):
+        //   • on_yil = true  ve  subscription_yekdem.usd_kur > 0 →
+        //     satisBrutGelir = satisKwh × 0.133 × usd_kur     (USD bazlı)
+        //   • aksi halde (10 yıl altı VEYA usd_kur tanımsız) →
+        //     satisBrutGelir = satisKwh × perakende_enerji_bedeli   (TL fallback)
         //
-        // DAĞITIM KESİNTİSİ (on_yil'e göre sabit oran):
+        // DAĞITIM KESİNTİSİ (on_yil'e göre sabit oran — USD/perakende fark etmez):
         //   on_yil = true  → 1,575810 TL/kWh (10 yıl üstü tesisler)
         //   on_yil = false → 0,496738 TL/kWh (10 yıl altı tesisler)
-        //
-        // NOT: Saat-bazlı PTF mantığı tamamen kaldırıldı. Tariff tablosundaki
-        // dagitim_bedeli artık bu kartta kullanılmıyor.
         const onYil = (settingsRes.data as any)?.on_yil ?? false;
         let dagitimBedeli = 0;
         let perakendeRate = 0;
@@ -289,8 +299,45 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
           perakendeRate = Number(tariff?.perakende_enerji_bedeli) || 0;
         }
 
-        // Brüt gelir: tek formül, on_yil farketmez.
-        const satisBrutGelir = satisKwh > 0 ? satisKwh * perakendeRate : 0;
+        // USD kur (subscription_yekdem.usd_kur) — geçen ay için
+        let satisUsdKur = 0;
+        if (onYil) {
+          // primary: period_year/period_month
+          const yek1 = await supabase
+            .from("subscription_yekdem")
+            .select("usd_kur")
+            .eq("user_id", uid)
+            .eq("subscription_serno", selectedSerno)
+            .eq("period_year", prevYear)
+            .eq("period_month", prevMonthNum)
+            .maybeSingle();
+
+          if (!yek1.error && yek1.data?.usd_kur != null) {
+            satisUsdKur = Number(yek1.data.usd_kur) || 0;
+          } else if (yek1.error && /period_year|period_month/.test(String(yek1.error.message))) {
+            // legacy year/month fallback
+            const yek2 = await supabase
+              .from("subscription_yekdem")
+              .select("usd_kur")
+              .eq("user_id", uid)
+              .eq("subscription_serno", selectedSerno)
+              .eq("year", prevYear)
+              .eq("month", prevMonthNum)
+              .maybeSingle();
+            if (!yek2.error && yek2.data?.usd_kur != null) {
+              satisUsdKur = Number(yek2.data.usd_kur) || 0;
+            }
+          }
+        }
+
+        // Brüt gelir: USD modu yalnızca on_yil=true && usd_kur > 0
+        const satisModu: "usd" | "perakende" =
+          onYil && satisUsdKur > 0 ? "usd" : "perakende";
+        const satisBrutBirim =
+          satisModu === "usd"
+            ? VERIS_USD_BIRIM_FIYAT * satisUsdKur
+            : perakendeRate;
+        const satisBrutGelir = satisKwh > 0 ? satisKwh * satisBrutBirim : 0;
 
         // Dağıtım kesintisi: on_yil'e göre seçilmiş sabit oran × satış kWh.
         const satisDagitimKesintisi = satisKwh * dagitimBedeli;
@@ -350,6 +397,10 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
           satisNetGelir,
           dagitimBedeli,
           onYil,
+          satisBrutBirim,
+          satisModu,
+          satisUsdKur,
+          perakendeRate,
           yillikMaxSatisKwh,
           yillikKullanilanKwh,
           yillikKalanKwh,
@@ -485,6 +536,26 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
                     </div>
 
                     <div className="flex items-center justify-between">
+                      <span className="text-sm text-neutral-600">
+                        Birim Fiyat
+                        {result.satisModu === "usd" && (
+                          <span className="ml-1 text-[10px] font-medium text-amber-600 uppercase tracking-wide">
+                            USD
+                          </span>
+                        )}
+                      </span>
+                      <span className="text-sm font-medium text-neutral-700">
+                        {fmtUnit(result.satisBrutBirim)} TL/kWh
+                      </span>
+                    </div>
+
+                    {result.satisModu === "usd" && (
+                      <p className="-mt-1 text-[11px] text-neutral-500 text-right">
+                        0,1330 USD/kWh × {fmtUnit(result.satisUsdKur)} TL/USD
+                      </p>
+                    )}
+
+                    <div className="flex items-center justify-between">
                       <span className="text-sm text-neutral-600">Brüt Gelir</span>
                       <span className="text-sm font-medium text-emerald-600">
                         {fmtTL(result.satisBrutGelir)} TL
@@ -519,6 +590,19 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
                         ? "10 yıl üstü tesis için sabit oran"
                         : "10 yıl altı tesis için sabit oran"})
                     </p>
+                  )}
+
+                  {result.satisModu === "usd" ? (
+                    <p className="mt-1 text-xs text-neutral-400">
+                      Brüt gelir USD bazlı: 0,1330 USD/kWh × {fmtUnit(result.satisUsdKur)} TL/USD ={" "}
+                      {fmtUnit(result.satisBrutBirim)} TL/kWh
+                    </p>
+                  ) : (
+                    result.onYil && result.perakendeRate > 0 && (
+                      <p className="mt-1 text-xs text-amber-600">
+                        Bu ay için USD/TL kuru girilmemiş — perakende enerji bedeli ({fmtUnit(result.perakendeRate)} TL/kWh) ile fallback hesaplandı.
+                      </p>
+                    )
                   )}
                 </>
               )}

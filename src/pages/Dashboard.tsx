@@ -78,13 +78,17 @@ async function fetchSubscriptionYekdem(params: {
   sub: number;
   year: number;
   month: number; // 1-12
-}): Promise<{ yekdem_value: number | null; yekdem_final: number | null } | null> {
+}): Promise<{
+  yekdem_value: number | null;
+  yekdem_final: number | null;
+  usd_kur: number | null;
+} | null> {
   const { uid, sub, year, month } = params;
 
   // 1) period_year/period_month
   const r1 = await supabase
     .from("subscription_yekdem")
-    .select("yekdem_value, yekdem_final")
+    .select("yekdem_value, yekdem_final, usd_kur")
     .eq("user_id", uid)
     .eq("subscription_serno", sub)
     .eq("period_year", year)
@@ -98,6 +102,8 @@ async function fetchSubscriptionYekdem(params: {
         r1.data.yekdem_value != null ? Number(r1.data.yekdem_value) : null,
       yekdem_final:
         r1.data.yekdem_final != null ? Number(r1.data.yekdem_final) : null,
+      usd_kur:
+        r1.data.usd_kur != null ? Number(r1.data.usd_kur) : null,
     };
   }
 
@@ -108,7 +114,7 @@ async function fetchSubscriptionYekdem(params: {
   ) {
     const r2 = await supabase
       .from("subscription_yekdem")
-      .select("yekdem_value, yekdem_final")
+      .select("yekdem_value, yekdem_final, usd_kur")
       .eq("user_id", uid)
       .eq("subscription_serno", sub)
       .eq("year", year)
@@ -123,6 +129,8 @@ async function fetchSubscriptionYekdem(params: {
         r2.data.yekdem_value != null ? Number(r2.data.yekdem_value) : null,
       yekdem_final:
         r2.data.yekdem_final != null ? Number(r2.data.yekdem_final) : null,
+      usd_kur:
+        r2.data.usd_kur != null ? Number(r2.data.usd_kur) : null,
     };
   }
 
@@ -358,6 +366,9 @@ export default function Dashboard() {
 
   // 3) Geçen ay YEKDEM (TL/kWh)
   const [monthlyYekdem, setMonthlyYekdem] = useState<number | null>(null);
+  // Faturanın kesildiği ay (M) için subscription_yekdem.usd_kur
+  // 10 yıl üstü tesislerde veriş fazlası satış bedelinde kullanılır.
+  const [monthlyUsdKur, setMonthlyUsdKur] = useState<number | null>(null);
   const [yekdemMode, setYekdemMode] = useState<"official" | "custom" | null>(
     null
   );
@@ -644,6 +655,9 @@ export default function Dashboard() {
 
         if (cancel) return;
 
+        // usd_kur her durumda set ediliyor (custom YEKDEM kaydı varsa o satırdan)
+        setMonthlyUsdKur(subYek?.usd_kur ?? null);
+
         if (
           subYek &&
           (subYek.yekdem_value != null || subYek.yekdem_final != null)
@@ -682,6 +696,7 @@ export default function Dashboard() {
           console.error("YEKDEM error:", e);
           setYekdemErr(e?.message ?? "YEKDEM getirilemedi");
           setMonthlyYekdem(null);
+          setMonthlyUsdKur(null);
           setYekdemMode(null);
         }
       } finally {
@@ -795,7 +810,7 @@ export default function Dashboard() {
         // 5.1) settings
         const { data: settings, error: settingsErr } = await supabase
           .from("subscription_settings")
-          .select("terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil")
+          .select("terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -813,6 +828,7 @@ export default function Dashboard() {
         const gerilim = settings.gerilim ?? null;
         const tarife = settings.tarife ?? null;
         const onYil = settings.on_yil ?? false;
+        const lisansliSatis = settings.lisansli_satis ?? false;
 
         const trafoDegeri =
           settings.trafo_degeri != null && Number.isFinite(Number(settings.trafo_degeri))
@@ -939,15 +955,18 @@ export default function Dashboard() {
           trafoDegeri,
           totalProductionKwh: prevMonthGn ?? 0,
           onYil,
+          lisansliSatis,
           perakendeEnerjiBedeli,
+          usdKur: monthlyUsdKur ?? 0,
         });
 
         // ✅ YEKDEM mahsup (M-1)
+        // Lisanslı Satış tesisleri için YEKDEM mahsup uygulanmaz.
         let yekdemMahsupValue = 0;
         let has = false;
-        let missing: "none" | "value" | "final" | "both" = "both";
+        let missing: "none" | "value" | "final" | "both" = lisansliSatis ? "none" : "both";
 
-        try {
+        if (!lisansliSatis) try {
           const billingMonth = dayjsTR().year(periodYear).month(periodMonth - 1); // M
           const prevForYekdem = billingMonth.subtract(1, "month"); // M-1
           setYekdemMahsupLabel(prevForYekdem.format("MMMM YYYY"));
@@ -1069,6 +1088,7 @@ export default function Dashboard() {
     monthlyPTF,
     monthlyYekdem,
     monthlyKbk,
+    monthlyUsdKur,
   ]);
 
   // ---------------------------
@@ -1186,7 +1206,7 @@ export default function Dashboard() {
           // KBK
           const { data: kbkData } = await supabase
             .from("subscription_settings")
-            .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil")
+            .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis")
             .eq("user_id", uid)
             .eq("subscription_serno", serno)
             .maybeSingle();
@@ -1202,6 +1222,7 @@ export default function Dashboard() {
 
           const trafoDegeri = kbkData.trafo_degeri != null && Number.isFinite(Number(kbkData.trafo_degeri)) ? Number(kbkData.trafo_degeri) : 0;
           const subOnYil = kbkData.on_yil ?? false;
+          const subLisansliSatis = kbkData.lisansli_satis ?? false;
           const gucLimit = kbkData.guc_bedel_limit != null ? Number(kbkData.guc_bedel_limit) : 0;
 
           // Tariff
@@ -1263,6 +1284,9 @@ export default function Dashboard() {
 
           const subPerakende = tariffRow.perakende_enerji_bedeli != null ? Number(tariffRow.perakende_enerji_bedeli) : 0;
 
+          // Tesis x ay için USD kur (subscription_yekdem.usd_kur'dan, subYek satırında zaten geldi)
+          const subUsdKur = subYek?.usd_kur != null ? Number(subYek.usd_kur) : 0;
+
           const breakdown = calculateInvoice({
             totalConsumptionKwh: subKwh,
             unitPriceEnergy,
@@ -1278,12 +1302,14 @@ export default function Dashboard() {
             trafoDegeri,
             totalProductionKwh: subGn,
             onYil: subOnYil,
+            lisansliSatis: subLisansliSatis,
             perakendeEnerjiBedeli: subPerakende,
+            usdKur: subUsdKur,
           });
 
-          // YEKDEM Mahsup (M-1)
+          // YEKDEM Mahsup (M-1) — Lisanslı Satış tesisleri için atlanır.
           let yekdemMahsupVal = 0;
-          try {
+          if (!subLisansliSatis) try {
             const billingMonth = dayjsTR().year(pYear).month(pMonth - 1);
             const prevForYekdem = billingMonth.subtract(1, "month");
             const prevStart2 = prevForYekdem.startOf("month");

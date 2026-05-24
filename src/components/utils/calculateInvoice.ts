@@ -34,13 +34,25 @@ export interface InvoiceInput {
   totalProductionKwh?: number;
 
   // GES lisans durumu
-  // @deprecated calculateInvoice formülünü ETKİLEMEZ — sadece geri uyumluluk için
-  // tutulur. on_yil yalnızca GES sayfasındaki dağıtım kesintisi sabit oranını
-  // etkiler (EnergySoldCard.tsx). Veriş satış bedeli her tesis için aynı şekilde
-  // (mahsup + perakende) hesaplanır.
+  // 10 yıl üstü tesislerde veriş FAZLASI (çekişten geçen kısım) USD bazlı satılır.
+  // Mahsup kısmı (çekişe eşit veriş) her tesis için aynı (enerji birim fiyatı).
   onYil?: boolean;
   perakendeEnerjiBedeli?: number; // TL/kWh, distribution_tariff_official'dan
+  // Ay sonu USD/TL kuru (subscription_yekdem.usd_kur). on_yil=true ve usd_kur>0
+  // ise veriş fazlası 0.133 × usd_kur birim fiyatıyla satılır. NULL/0 ise
+  // perakende_enerji_bedeli formülüne fallback yapılır.
+  usdKur?: number;
+
+  // Lisanslı Satış Üretim Tesisi: true ise mahsuplaşma tamamen kapatılır;
+  // tüm üretim doğrudan satış olarak işlenir. on_yil ile bağımsız çalışır
+  // (ikisi de true olabilir — on_yil bu durumda sadece satış birim fiyatını
+  // belirler, mahsup davranışında lisansliSatis baskındır).
+  lisansliSatis?: boolean;
 }
+
+// 10 yıl üstü tesislerin veriş fazlası satışında kullanılan sabit USD birim fiyatı.
+// Toplam birim fiyat (TL/kWh) = VERIS_USD_BIRIM_FIYAT × usd_kur.
+const VERIS_USD_BIRIM_FIYAT = 0.133;
 
 export interface InvoiceBreakdown {
   energyCharge: number;
@@ -92,6 +104,8 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
     totalProductionKwh,
   } = input;
 
+  const lisansliSatis = input.lisansliSatis ?? false;
+
   // 1) Enerji + dağıtım
   const energyCharge = unitPriceEnergy * totalConsumptionKwh;
 
@@ -113,20 +127,37 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
   const netKwh = totalConsumptionKwh - verisKwh;
 
   // Dağıtım bedeli:
-  //  - netKwh > 0  → çekiş×D - veriş×(D/2)  (mahsuplu eski formül)
-  //  - netKwh ≤ 0  → üretim çekişe eşit/fazla. Mahsup uygulanmaz; dağıtım bedeli
-  //    gerçek çekiş üzerinden tarife birim fiyatıyla hesaplanır (negatife düşmez).
+  //  - Satış var (veriş > çekiş) → dağıtım = (D/2) × çekiş
+  //      Net üretici olan tesisler için tarife biriminin yarısı uygulanır.
+  //      Veriş çekişe eşit olduğunda satış 0'dır, bu kural devreye girmez.
+  //  - Üretim = çekiş (satış yok, rare edge) → dağıtım = D × çekiş
+  //      Mahsup uygulanmaz; tam tarife (negatife düşmez).
+  //  - Normal (veriş < çekiş) → mahsuplu eski formül: çekiş×D - veriş×(D/2)
   let distributionAdjustment: number;
   let distributionCharge: number;
   let distributionChargeKwh: number;
   let effectiveDistributionUnitPrice: number;
 
-  if (netKwh <= 0) {
+  if (lisansliSatis) {
+    // Lisanslı Satış: mahsup yok, dağıtım tam tarifeyle çekiş üzerinden alınır
+    distributionAdjustment = 0;
+    distributionCharge = cekisCharge;
+    distributionChargeKwh = distributionBaseKwh;
+    effectiveDistributionUnitPrice = unitPriceDistribution;
+  } else if (verisKwh > totalConsumptionKwh) {
+    // Satış var → (D/2) × çekiş
+    distributionCharge = (unitPriceDistribution / 2) * distributionBaseKwh;
+    distributionAdjustment = cekisCharge - distributionCharge; // = cekisCharge / 2
+    distributionChargeKwh = distributionBaseKwh;
+    effectiveDistributionUnitPrice = unitPriceDistribution / 2;
+  } else if (netKwh <= 0) {
+    // Üretim = tüketim (satış yok)
     distributionAdjustment = 0;
     distributionCharge = cekisCharge;
     distributionChargeKwh = distributionBaseKwh;
     effectiveDistributionUnitPrice = unitPriceDistribution;
   } else {
+    // Normal: çekiş>veriş, mahsuplu eski formül
     distributionAdjustment = (unitPriceDistribution / 2) * verisKwh;
     distributionCharge = cekisCharge - distributionAdjustment;
     distributionChargeKwh = netKwh;
@@ -139,7 +170,8 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
 
   // 2) BTV (net enerji bedeli üzerinden — veriş mahsuplu)
   // netKwh = totalConsumptionKwh - verisKwh (dağıtımda da aynı)
-  const netEnergyKwh = Math.abs(netKwh);  // çekiş - veriş, mutlak değer
+  // Lisanslı Satış: veriş düşülmez, BTV tam çekiş üzerinden hesaplanır
+  const netEnergyKwh = lisansliSatis ? totalConsumptionKwh : Math.abs(netKwh);
   const netEnergyCharge = unitPriceEnergy * netEnergyKwh;
   const btvCharge = (netEnergyCharge + trafoCharge) * btvRate;
 
@@ -166,25 +198,41 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
 
   // 4.5) Veriş satış bedeli (iki katmanlı)
   //
-  // Her tesis (10 yıl üstü/altı farketmez) için aynı kural uygulanır:
-  //   • Çekişi geçmeyen kısım  → o ayın enerji birim fiyatıyla mahsup edilir
-  //   • Çekişi geçen kısım     → perakende enerji bedeliyle satılır
-  // Sonuç fatura toplamından düşülür (kullanıcı lehine).
+  // MAHSUP kısmı (çekişe eşit kısım) — her tesis için aynı:
+  //   verisMahsupKwh × unitPriceEnergy   (o ayın enerji birim fiyatı)
   //
-  // input.onYil parametresi DEPRECATED. calculateInvoice formülünü artık
-  // etkilemez. on_yil flag'i yalnızca GES sayfasındaki "Devlete Satılan Enerji
-  // Bedeli" kartında dağıtım kesintisinin sabit oranı (1,575810 / 0,496738)
-  // için kullanılır (bkz. EnergySoldCard.tsx).
+  // FAZLA kısmı (çekişi aşan kısım) — tesis tipine göre değişir:
+  //   • on_yil = true  ve  usd_kur > 0 → verisFazlaKwh × 0.133 × usd_kur
+  //   • aksi halde (10 yıl altı VEYA usd_kur tanımsız) → verisFazlaKwh × perakende_enerji_bedeli
+  //
+  // Sonuç fatura toplamından düşülür (kullanıcı lehine). Mahsup ve fazla
+  // bedellerinin toplamı verisSatisBedeli olarak return edilir.
+  const onYil = input.onYil ?? false;
   const perakendeEnerjiBedeli = input.perakendeEnerjiBedeli ?? 0;
+  const usdKur = input.usdKur ?? 0;
 
-  const verisMahsupKwh = verisKwh > 0
-    ? Math.min(verisKwh, totalConsumptionKwh)
-    : 0;
-  const verisFazlaKwh = verisKwh > 0
-    ? Math.max(0, verisKwh - totalConsumptionKwh)
-    : 0;
-  const verisSatisBedeli = verisKwh > 0
-    ? (verisMahsupKwh * unitPriceEnergy) + (verisFazlaKwh * perakendeEnerjiBedeli)
+  // Lisanslı Satış: mahsup yok; tüm üretim "fazla" (satış) olarak işlenir.
+  const verisMahsupKwh = lisansliSatis
+    ? 0
+    : verisKwh > 0
+      ? Math.min(verisKwh, totalConsumptionKwh)
+      : 0;
+  const verisFazlaKwh = lisansliSatis
+    ? verisKwh
+    : verisKwh > 0
+      ? Math.max(0, verisKwh - totalConsumptionKwh)
+      : 0;
+
+  // Fazla kısmı için birim fiyat seçimi (USD veya TL fallback)
+  const verisFazlaUseUsd = onYil && usdKur > 0;
+  const verisFazlaBirim = verisFazlaUseUsd
+    ? VERIS_USD_BIRIM_FIYAT * usdKur          // 10 yıl üstü + kur var: 0.133 × kur
+    : perakendeEnerjiBedeli;                   // 10 yıl altı VEYA kur tanımsız: TL perakende
+
+  const verisMahsupBedeli = verisMahsupKwh * unitPriceEnergy;
+  const verisFazlaBedeli  = verisFazlaKwh * verisFazlaBirim;
+  const verisSatisBedeli  = verisKwh > 0
+    ? (verisMahsupBedeli + verisFazlaBedeli)
     : 0;
 
   // 5) Ara toplam + KDV
