@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
-import { Eye, EyeOff, ChevronDown, Plus, Minus, ArrowLeft, ArrowRight, Check, Loader2 } from "lucide-react";
+import { Eye, EyeOff, ChevronDown, Plus, Minus, ArrowLeft, ArrowRight, Check, Loader2, Sun } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -28,6 +28,58 @@ type Tesis = {
   yekdem_tahmin_2: number | null;
   yekdem_final_2: number | null;
 };
+
+type GesSaglayiciValue =
+  | "Growatt"
+  | "HopeCloud"
+  | "SolarEdge"
+  | "Huawei FusionSolar"
+  | "SMA"
+  | "GoodWe"
+  | "Sungrow"
+  | "Fronius"
+  | "Diğer"
+  | "";
+
+type EvetHayir = "" | "evet" | "hayir";
+
+type GesBlock = {
+  saglayici: GesSaglayiciValue;
+  saglayici_diger: string;
+  kullanici: string;
+  sifre: string;
+  tesis_sayisi: number;
+  lisansli_satis: EvetHayir;
+  on_yil_ustu: EvetHayir;
+  notlar: string;
+};
+
+const GES_SAGLAYICI_OPTIONS: { value: GesSaglayiciValue; label: string }[] = [
+  { value: "Growatt", label: "Growatt" },
+  { value: "HopeCloud", label: "HopeCloud" },
+  { value: "SolarEdge", label: "SolarEdge" },
+  { value: "Huawei FusionSolar", label: "Huawei FusionSolar" },
+  { value: "SMA", label: "SMA" },
+  { value: "GoodWe", label: "GoodWe" },
+  { value: "Sungrow", label: "Sungrow" },
+  { value: "Fronius", label: "Fronius" },
+  { value: "Diğer", label: "Diğer" },
+];
+
+const GES_MAX_SAGLAYICI = 5;
+
+function emptyGesBlock(): GesBlock {
+  return {
+    saglayici: "",
+    saglayici_diger: "",
+    kullanici: "",
+    sifre: "",
+    tesis_sayisi: 1,
+    lisansli_satis: "",
+    on_yil_ustu: "",
+    notlar: "",
+  };
+}
 
 type Errors = Record<string, string>;
 
@@ -162,6 +214,50 @@ export default function IntakeFormPage() {
   // Step 2 state
   const [tesisler, setTesisler] = useState<Tesis[]>([emptyTesis(1)]);
 
+  // GES (üretim) state — OSOS'tan ayrı, üretim sağlayıcı portal bilgileri
+  const [hasGes, setHasGes] = useState(false);
+  const [gesSaglayiciSayisi, setGesSaglayiciSayisi] = useState(1);
+  const [gesBloklar, setGesBloklar] = useState<GesBlock[]>([emptyGesBlock()]);
+  const [showGesSifre, setShowGesSifre] = useState<Record<number, boolean>>({});
+
+  const gesTesisSayisi = hasGes
+    ? gesBloklar.reduce((sum, b) => sum + (b.tesis_sayisi || 0), 0)
+    : 0;
+
+  // Sağlayıcı sayısı değişince blokları senkronla (fazlaları temizle)
+  useEffect(() => {
+    if (!hasGes) return;
+    setGesBloklar((prev) => {
+      const next = [...prev];
+      while (next.length < gesSaglayiciSayisi) next.push(emptyGesBlock());
+      while (next.length > gesSaglayiciSayisi) next.pop();
+      return next;
+    });
+  }, [gesSaglayiciSayisi, hasGes]);
+
+  function toggleHasGes(v: boolean) {
+    setHasGes(v);
+    if (!v) {
+      setGesSaglayiciSayisi(0);
+      setGesBloklar([]);
+      setShowGesSifre({});
+      setErrors((e) => {
+        const cp = { ...e };
+        Object.keys(cp).forEach((k) => {
+          if (k.startsWith("ges")) delete cp[k];
+        });
+        return cp;
+      });
+    } else {
+      setGesSaglayiciSayisi(1);
+      setGesBloklar([emptyGesBlock()]);
+    }
+  }
+
+  function updateGesBlock(idx: number, patch: Partial<GesBlock>) {
+    setGesBloklar((prev) => prev.map((b, i) => (i === idx ? { ...b, ...patch } : b)));
+  }
+
   /* ---------- Validation ---------- */
 
   function validateStep1(): boolean {
@@ -173,6 +269,27 @@ export default function IntakeFormPage() {
     if (!s1.osos_kullanici.trim()) e.osos_kullanici = "OSOS kullanıcı adı zorunlu.";
     if (!s1.osos_sifre.trim()) e.osos_sifre = "OSOS şifresi zorunlu.";
     if (s1.tesis_sayisi < 1 || s1.tesis_sayisi > 20) e.tesis_sayisi = "1-20 arası olmalı.";
+
+    if (hasGes) {
+      if (gesSaglayiciSayisi < 1 || gesSaglayiciSayisi > GES_MAX_SAGLAYICI) {
+        e.ges_saglayici_sayisi = `1-${GES_MAX_SAGLAYICI} arası olmalı.`;
+      }
+      if (gesBloklar.length === 0) {
+        e.ges_saglayici_sayisi = "En az 1 sağlayıcı gerekli.";
+      }
+      gesBloklar.forEach((b, i) => {
+        if (!b.saglayici) e[`ges${i}_saglayici`] = "Sağlayıcı seçin.";
+        if (b.saglayici === "Diğer" && !b.saglayici_diger.trim())
+          e[`ges${i}_saglayici_diger`] = "Sağlayıcı adını yazın.";
+        if (!b.kullanici.trim()) e[`ges${i}_kullanici`] = "Kullanıcı zorunlu.";
+        if (!b.sifre.trim()) e[`ges${i}_sifre`] = "Şifre zorunlu.";
+        if (!b.tesis_sayisi || b.tesis_sayisi < 1)
+          e[`ges${i}_tesis_sayisi`] = "En az 1 olmalı.";
+        if (!b.lisansli_satis) e[`ges${i}_lisansli_satis`] = "Seçiniz.";
+        if (!b.on_yil_ustu) e[`ges${i}_on_yil_ustu`] = "Seçiniz.";
+      });
+    }
+
     setErrors(e);
     return Object.keys(e).length === 0;
   }
@@ -215,6 +332,20 @@ export default function IntakeFormPage() {
   async function handleSubmit() {
     if (!validateStep2()) return;
     setSubmitting(true);
+
+    const gesPayload = hasGes
+      ? gesBloklar.map((b) => ({
+          saglayici: b.saglayici === "Diğer" ? b.saglayici_diger.trim() : b.saglayici,
+          saglayici_diger: b.saglayici === "Diğer" ? b.saglayici_diger.trim() : "",
+          kullanici: b.kullanici.trim(),
+          sifre: b.sifre,
+          tesis_sayisi: b.tesis_sayisi,
+          lisansli_satis: b.lisansli_satis === "evet",
+          on_yil_ustu: b.on_yil_ustu === "evet",
+          notlar: b.notlar.trim(),
+        }))
+      : [];
+
     const { error } = await supabase.from("intake_forms").insert({
       ad_soyad: s1.ad_soyad.trim(),
       telefon: s1.telefon.trim(),
@@ -223,6 +354,10 @@ export default function IntakeFormPage() {
       osos_sifre: s1.osos_sifre,
       tesis_sayisi: s1.tesis_sayisi,
       tesisler,
+      has_ges: hasGes,
+      ges_saglayici_sayisi: hasGes ? gesSaglayiciSayisi : 0,
+      ges_tesis_sayisi: gesTesisSayisi,
+      ges_saglayicilar: gesPayload,
     });
     setSubmitting(false);
     if (error) {
@@ -354,6 +489,320 @@ export default function IntakeFormPage() {
                 </div>
                 {errors.osos_sifre && <p className="mt-1 text-xs text-red-400">{errors.osos_sifre}</p>}
               </label>
+
+              {/* ---------- GES (Üretim) Bölümü ---------- */}
+              <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2">
+                    <Sun size={16} className="text-amber-400 mt-0.5 shrink-0" />
+                    <div>
+                      <p className="text-sm font-medium text-slate-200">
+                        GES (üretim tesisiniz) var mı?
+                      </p>
+                      <p className="mt-0.5 text-xs text-slate-400">
+                        GES sağlayıcı portal bilgileriniz OSOS'tan farklıdır.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={hasGes}
+                    onClick={() => toggleHasGes(!hasGes)}
+                    className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ${
+                      hasGes ? "bg-amber-500" : "bg-slate-600"
+                    }`}
+                  >
+                    <span
+                      className={`pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ${
+                        hasGes ? "translate-x-5" : "translate-x-0"
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {hasGes && (
+                  <div className="mt-4 space-y-4">
+                    {/* Sağlayıcı sayısı stepper */}
+                    <div>
+                      <span className={LABEL}>Kaç farklı sağlayıcı?</span>
+                      <div className="flex items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setGesSaglayiciSayisi((n) => Math.max(1, n - 1))
+                          }
+                          className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-600 bg-slate-800/50 text-slate-300 hover:bg-slate-700 transition-colors"
+                        >
+                          <Minus size={14} />
+                        </button>
+                        <span className="min-w-[2.5rem] text-center text-base font-semibold text-white">
+                          {gesSaglayiciSayisi}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setGesSaglayiciSayisi((n) =>
+                              Math.min(GES_MAX_SAGLAYICI, n + 1),
+                            )
+                          }
+                          className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-600 bg-slate-800/50 text-slate-300 hover:bg-slate-700 transition-colors"
+                        >
+                          <Plus size={14} />
+                        </button>
+                        <span className="ml-2 text-xs text-slate-500">
+                          (en fazla {GES_MAX_SAGLAYICI})
+                        </span>
+                      </div>
+                      {errors.ges_saglayici_sayisi && (
+                        <p className="mt-1 text-xs text-red-400">
+                          {errors.ges_saglayici_sayisi}
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Sağlayıcı blokları */}
+                    {gesBloklar.map((b, idx) => (
+                      <div
+                        key={idx}
+                        className="rounded-xl border border-slate-700/60 bg-slate-900/40 p-4"
+                      >
+                        <div className="mb-3 flex items-center gap-2">
+                          <span className="rounded-full border border-amber-500/30 bg-amber-600/20 px-2.5 py-0.5 text-xs font-semibold text-amber-300">
+                            Sağlayıcı #{idx + 1}
+                          </span>
+                        </div>
+
+                        <div className="space-y-3">
+                          {/* Sağlayıcı dropdown */}
+                          <label className="block">
+                            <span className={LABEL}>Sağlayıcı</span>
+                            <StyledSelect
+                              value={b.saglayici}
+                              onChange={(v) =>
+                                updateGesBlock(idx, {
+                                  saglayici: v as GesSaglayiciValue,
+                                  // başka seçeneğe geçince saglayici_diger temizle
+                                  saglayici_diger:
+                                    v === "Diğer" ? b.saglayici_diger : "",
+                                })
+                              }
+                              options={GES_SAGLAYICI_OPTIONS.map((o) => ({
+                                value: o.value as string,
+                                label: o.label,
+                              }))}
+                              placeholder="Seçiniz"
+                              error={!!errors[`ges${idx}_saglayici`]}
+                            />
+                            {errors[`ges${idx}_saglayici`] && (
+                              <p className="mt-1 text-xs text-red-400">
+                                {errors[`ges${idx}_saglayici`]}
+                              </p>
+                            )}
+                          </label>
+
+                          {/* Diğer ise serbest metin */}
+                          {b.saglayici === "Diğer" && (
+                            <label className="block">
+                              <span className={LABEL}>Sağlayıcı adı</span>
+                              <input
+                                type="text"
+                                value={b.saglayici_diger}
+                                onChange={(e) =>
+                                  updateGesBlock(idx, { saglayici_diger: e.target.value })
+                                }
+                                placeholder="Sağlayıcı adını yazın"
+                                className={
+                                  errors[`ges${idx}_saglayici_diger`] ? ERR_INPUT : INPUT_CLS
+                                }
+                              />
+                              {errors[`ges${idx}_saglayici_diger`] && (
+                                <p className="mt-1 text-xs text-red-400">
+                                  {errors[`ges${idx}_saglayici_diger`]}
+                                </p>
+                              )}
+                            </label>
+                          )}
+
+                          {/* Kullanıcı */}
+                          <label className="block">
+                            <span className={LABEL}>Kullanıcı Adı</span>
+                            <input
+                              type="text"
+                              value={b.kullanici}
+                              onChange={(e) =>
+                                updateGesBlock(idx, { kullanici: e.target.value })
+                              }
+                              placeholder="Portal kullanıcı adı"
+                              className={
+                                errors[`ges${idx}_kullanici`] ? ERR_INPUT : INPUT_CLS
+                              }
+                            />
+                            {errors[`ges${idx}_kullanici`] && (
+                              <p className="mt-1 text-xs text-red-400">
+                                {errors[`ges${idx}_kullanici`]}
+                              </p>
+                            )}
+                          </label>
+
+                          {/* Şifre */}
+                          <label className="block">
+                            <span className={LABEL}>Şifre</span>
+                            <div className="relative">
+                              <input
+                                type={showGesSifre[idx] ? "text" : "password"}
+                                value={b.sifre}
+                                onChange={(e) =>
+                                  updateGesBlock(idx, { sifre: e.target.value })
+                                }
+                                placeholder="Portal şifresi"
+                                className={
+                                  errors[`ges${idx}_sifre`] ? ERR_INPUT : INPUT_CLS
+                                }
+                              />
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setShowGesSifre((s) => ({ ...s, [idx]: !s[idx] }))
+                                }
+                                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200"
+                              >
+                                {showGesSifre[idx] ? (
+                                  <EyeOff size={16} />
+                                ) : (
+                                  <Eye size={16} />
+                                )}
+                              </button>
+                            </div>
+                            {errors[`ges${idx}_sifre`] && (
+                              <p className="mt-1 text-xs text-red-400">
+                                {errors[`ges${idx}_sifre`]}
+                              </p>
+                            )}
+                          </label>
+
+                          {/* Tesis sayısı stepper */}
+                          <div>
+                            <span className={LABEL}>
+                              Bu sağlayıcıdaki tesis (santral) sayısı
+                            </span>
+                            <div className="flex items-center gap-3">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  updateGesBlock(idx, {
+                                    tesis_sayisi: Math.max(1, b.tesis_sayisi - 1),
+                                  })
+                                }
+                                className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-600 bg-slate-800/50 text-slate-300 hover:bg-slate-700 transition-colors"
+                              >
+                                <Minus size={14} />
+                              </button>
+                              <span className="min-w-[2.5rem] text-center text-base font-semibold text-white">
+                                {b.tesis_sayisi}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  updateGesBlock(idx, {
+                                    tesis_sayisi: Math.min(50, b.tesis_sayisi + 1),
+                                  })
+                                }
+                                className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-600 bg-slate-800/50 text-slate-300 hover:bg-slate-700 transition-colors"
+                              >
+                                <Plus size={14} />
+                              </button>
+                            </div>
+                            {errors[`ges${idx}_tesis_sayisi`] && (
+                              <p className="mt-1 text-xs text-red-400">
+                                {errors[`ges${idx}_tesis_sayisi`]}
+                              </p>
+                            )}
+                          </div>
+
+                          {/* Lisanslı Satış + 10 Yıl Üstü */}
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <label className="block">
+                              <span className={LABEL}>Lisanslı Satış mı?</span>
+                              <StyledSelect
+                                value={b.lisansli_satis}
+                                onChange={(v) =>
+                                  updateGesBlock(idx, {
+                                    lisansli_satis: v as EvetHayir,
+                                  })
+                                }
+                                options={[
+                                  { value: "evet", label: "Evet" },
+                                  { value: "hayir", label: "Hayır" },
+                                ]}
+                                placeholder="Seçiniz"
+                                error={!!errors[`ges${idx}_lisansli_satis`]}
+                              />
+                              {errors[`ges${idx}_lisansli_satis`] && (
+                                <p className="mt-1 text-xs text-red-400">
+                                  {errors[`ges${idx}_lisansli_satis`]}
+                                </p>
+                              )}
+                            </label>
+                            <label className="block">
+                              <span className={LABEL}>
+                                10 Yıl Üstü Tesis
+                                <span className="ml-1 text-slate-500">(USD ile satış)</span>
+                              </span>
+                              <StyledSelect
+                                value={b.on_yil_ustu}
+                                onChange={(v) =>
+                                  updateGesBlock(idx, {
+                                    on_yil_ustu: v as EvetHayir,
+                                  })
+                                }
+                                options={[
+                                  { value: "evet", label: "Evet" },
+                                  { value: "hayir", label: "Hayır" },
+                                ]}
+                                placeholder="Seçiniz"
+                                error={!!errors[`ges${idx}_on_yil_ustu`]}
+                              />
+                              {errors[`ges${idx}_on_yil_ustu`] && (
+                                <p className="mt-1 text-xs text-red-400">
+                                  {errors[`ges${idx}_on_yil_ustu`]}
+                                </p>
+                              )}
+                            </label>
+                          </div>
+
+                          {/* Notlar */}
+                          <label className="block">
+                            <span className={LABEL}>Not (opsiyonel)</span>
+                            <textarea
+                              value={b.notlar}
+                              onChange={(e) =>
+                                updateGesBlock(idx, { notlar: e.target.value })
+                              }
+                              rows={2}
+                              placeholder="Ek bilgi varsa yazın"
+                              className={`${INPUT_CLS} resize-none`}
+                            />
+                          </label>
+                        </div>
+                      </div>
+                    ))}
+
+                    {/* Toplam GES tesisi (otomatik) */}
+                    <div className="flex items-center justify-between rounded-lg border border-amber-500/20 bg-amber-500/[0.04] px-3 py-2.5">
+                      <span className="text-xs text-slate-300">
+                        Toplam GES tesisi
+                        <span className="ml-2 text-[10px] italic text-slate-500">
+                          (otomatik)
+                        </span>
+                      </span>
+                      <span className="text-sm font-semibold text-amber-300">
+                        {gesTesisSayisi}
+                      </span>
+                    </div>
+                  </div>
+                )}
+              </div>
 
               {/* Tesis Sayısı — stepper */}
               <div>

@@ -31,6 +31,7 @@ type SettingsForm = {
   on_yil: boolean;
   satis_hakki: number | null;
   lisansli_satis: boolean;
+  unit_price_adjustment: number | null;
 };
 
 type YekdemMonth = {
@@ -54,6 +55,7 @@ const EMPTY_SETTINGS: SettingsForm = {
   on_yil: false,
   satis_hakki: null,
   lisansli_satis: false,
+  unit_price_adjustment: null,
 };
 
 const MONTH_NAMES = [
@@ -206,7 +208,7 @@ export default function AdminUsersPage() {
     (async () => {
       const { data } = await supabase
         .from("subscription_settings")
-        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil, satis_hakki, lisansli_satis")
+        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil, satis_hakki, lisansli_satis, unit_price_adjustment")
         .eq("user_id", selectedUserId)
         .eq("subscription_serno", selectedSerno)
         .maybeSingle();
@@ -642,6 +644,24 @@ export default function AdminUsersPage() {
                       />
                       <span className="mt-1 block text-[10px] text-neutral-400">
                         Boş bırakılırsa GES sayfasında "Tanımlı değil" gösterilir.
+                      </span>
+                    </label>
+
+                    {/* Birim Fiyat Manipülasyonu */}
+                    <label className="block">
+                      <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                        Birim Fiyat Manipülasyonu
+                      </span>
+                      <input
+                        type="number"
+                        step="0.0001"
+                        value={d(settings.unit_price_adjustment)}
+                        onChange={(e) => setSettings((p) => ({ ...p, unit_price_adjustment: numOrNull(e.target.value) }))}
+                        placeholder="Örn: -0.1"
+                        className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                      />
+                      <span className="mt-1 block text-[10px] text-neutral-400">
+                        Birim fiyattan her ay düşülecek/eklenecek sabit tutar (TL/kWh). PTF ve YEKDEM etkilenmez.
                       </span>
                     </label>
 

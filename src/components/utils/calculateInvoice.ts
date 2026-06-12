@@ -76,7 +76,9 @@ export interface InvoiceBreakdown {
   // Veriş satış bedeli (ulusal tarife mahsubu)
   verisMahsupKwh: number;   // min(verisKwh, totalConsumptionKwh) — birim fiyatla mahsup edilen
   verisFazlaKwh: number;    // max(0, verisKwh - totalConsumptionKwh) — perakende ile satılan
-  verisSatisBedeli: number; // toplam: (mahsup×unitPrice) + (fazla×perakende)
+  verisMahsupBedeli: number; // mahsup×unitPrice — FATURADAN DÜŞÜLEN kısım
+  verisFazlaBedeli: number;  // fazla×birim — faturadan DÜŞÜLMEZ; ayrı "GES Üretim Satışı" kartında
+  verisSatisBedeli: number; // toplam (mahsup+fazla) — geriye-uyum/audit; subtotal'a GİRMEZ
 
   subtotalBeforeVat: number;
   vatCharge: number;
@@ -117,7 +119,15 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
 
   const trafoCharge = unitPriceEnergy * trafoKwh;
 
-  const distributionBaseKwh = totalConsumptionKwh + trafoKwh; // çekiş
+  // Çekiş tabanı:
+  // - Normal tesisler: trafo kaybı şebekeden çekilen enerjinin bir parçasıdır
+  //   → çekiş = tüketim + trafo
+  // - Lisanslı Satış: tesisin çekişi yok (sadece üretim/satış). Trafo bedeli
+  //   ayrı bir gider satırı olarak kalır; dağıtım ve BTV hesabına girmez,
+  //   mahsuplaşmaya katılmaz.
+  const distributionBaseKwh = lisansliSatis
+    ? totalConsumptionKwh
+    : totalConsumptionKwh + trafoKwh;
 
   // Veriş kWh (pozitifse al, değilse 0)
   const verisKwh = (totalProductionKwh ?? 0) > 0 ? totalProductionKwh! : 0;
@@ -170,10 +180,13 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
 
   // 2) BTV (net enerji bedeli üzerinden — veriş mahsuplu)
   // netKwh = totalConsumptionKwh - verisKwh (dağıtımda da aynı)
-  // Lisanslı Satış: veriş düşülmez, BTV tam çekiş üzerinden hesaplanır
+  // Lisanslı Satış: veriş düşülmez, BTV tüketim üzerinden hesaplanır.
+  // Trafo bedeli ayrı bir gider; BTV hesabına dahil edilmez.
   const netEnergyKwh = lisansliSatis ? totalConsumptionKwh : Math.abs(netKwh);
   const netEnergyCharge = unitPriceEnergy * netEnergyKwh;
-  const btvCharge = (netEnergyCharge + trafoCharge) * btvRate;
+  const btvCharge = lisansliSatis
+    ? netEnergyCharge * btvRate
+    : (netEnergyCharge + trafoCharge) * btvRate;
 
   // 3) Güç bedeli...
   let powerBaseCharge = 0;
@@ -236,6 +249,11 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
     : 0;
 
   // 5) Ara toplam + KDV
+  //
+  // ⚠️ Faturadan YALNIZCA veriş MAHSUBU düşülür (tüketimle netleşen kısım).
+  // Veriş FAZLASI satışı (müşterinin kendi kestiği fatura) toplamlara GİRMEZ;
+  // ayrı "GES Üretim Satışı" kartında gösterilir. Böylece fatura yalnızca
+  // müşterinin gerçekten ödeyeceği tutarı yansıtır (eksiye düşmez).
   const subtotalBeforeVat =
     energyCharge +
     trafoCharge + // ✅ eklendi
@@ -243,7 +261,7 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
     btvCharge +
     powerTotalCharge +
     reactivePenaltyCharge -
-    verisSatisBedeli;
+    verisMahsupBedeli;
 
   const vatCharge = subtotalBeforeVat * vatRate;
   const totalInvoice = subtotalBeforeVat + vatCharge;
@@ -266,6 +284,8 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
     reactivePenaltyCharge,
     verisMahsupKwh,
     verisFazlaKwh,
+    verisMahsupBedeli,
+    verisFazlaBedeli,
     verisSatisBedeli,
     subtotalBeforeVat,
     vatCharge,

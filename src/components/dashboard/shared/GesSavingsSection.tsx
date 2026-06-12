@@ -135,6 +135,9 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
           mevcutTuketimKwh: Number(snap.total_consumption_kwh) || 0,
           monthlyYekdem: yekdem,
           kbk,
+          // Snapshot'a yazılan düzeltmeyi kullan → karşı-olgusal birim fiyat,
+          // mevcutBirimFiyat (snap.unit_price_energy) ile aynı bazda kalır.
+          unitPriceAdjustment: Number(snap.unit_price_adjustment) || 0,
           unitPriceDistribution: Number(snap.unit_price_distribution) || 0,
           btvRate: Number(snap.btv_rate) || 0,
           vatRate: Number(snap.vat_rate) || 0,

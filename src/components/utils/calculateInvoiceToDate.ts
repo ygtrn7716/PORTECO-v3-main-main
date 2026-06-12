@@ -250,6 +250,8 @@ export type MonthInvoiceToDateResult = {
   onYil: boolean;
   lisansliSatis: boolean;
   perakendeEnerjiBedeli: number;
+  // GES Üretim Satışı dağıtım kesinti oranı (TL/kWh) — lisansli_satis'e göre seçilmiş.
+  dagitimUreticiBedeli: number;
 
   breakdown: InvoiceBreakdown;
 
@@ -375,7 +377,7 @@ export async function computeMonthInvoiceToDate(params: {
   // settings: KBK, terim, gerilim, tarife, güç limit, trafo
   const settingsRes = await supabase
     .from("subscription_settings")
-    .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis")
+    .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis, unit_price_adjustment")
     .eq("user_id", uid)
     .eq("subscription_serno", subscriptionSerNo)
     .maybeSingle();
@@ -392,6 +394,8 @@ export async function computeMonthInvoiceToDate(params: {
   const trafoDegeri = num(settingsRes.data.trafo_degeri, 0);
   const onYil = settingsRes.data.on_yil ?? false;
   const lisansliSatis = settingsRes.data.lisansli_satis ?? false;
+  // Birim fiyat düzeltmesi (TL/kWh, +/-): (PTF+YEKDEM)*KBK sonrası eklenir. null = 0.
+  const unitPriceAdjustment = num(settingsRes.data.unit_price_adjustment, 0);
 
   if (!terim || !gerilim || !tarife) return null;
 
@@ -429,7 +433,7 @@ export async function computeMonthInvoiceToDate(params: {
   // resmi dağıtım/güç tarifesi
   const tariffRes = await supabase
     .from("distribution_tariff_official")
-    .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, perakende_enerji_bedeli")
+    .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, perakende_enerji_bedeli, dagitim_uretici_1, dagitim_uretici_2")
     .eq("terim", terim)
     .eq("gerilim", gerilim)
     .eq("tarife", tarife)
@@ -441,6 +445,10 @@ export async function computeMonthInvoiceToDate(params: {
 
   const unitPriceDistribution = num(t.dagitim_bedeli, 0);
   const perakendeEnerjiBedeli = num((t as any).perakende_enerji_bedeli, 0);
+  // GES Üretim Satışı dağıtım kesinti oranı (lisansli_satis'e göre; on_yil etkilemez).
+  const dagitimUreticiBedeli = lisansliSatis
+    ? num((t as any).dagitim_uretici_1, 0)
+    : num((t as any).dagitim_uretici_2, 0);
   const powerPrice = num(t.guc_bedeli, 0);
   const powerExcessPrice = num(t.guc_bedeli_asim, 0);
 
@@ -478,7 +486,7 @@ export async function computeMonthInvoiceToDate(params: {
     : 0;
 
   // unitPriceEnergy (InvoiceDetail ile aynı)
-  const unitPriceEnergy = (monthlyPTF + monthlyYekdem) * kbk;
+  const unitPriceEnergy = (monthlyPTF + monthlyYekdem) * kbk + unitPriceAdjustment;
 
   // diger_degerler (KDV dahil gibi ekleniyor)
   const digerDegerler = await fetchSubDigerDegerler(supabase, {
@@ -637,6 +645,7 @@ export async function computeMonthInvoiceToDate(params: {
     onYil,
     lisansliSatis,
     perakendeEnerjiBedeli,
+    dagitimUreticiBedeli,
 
     breakdown,
 

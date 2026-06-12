@@ -21,6 +21,7 @@ import {
 import { fetchHiddenSernos, resolveSelectedSub } from "@/lib/subscriptionVisibility";
 import { fetchAllConsumption } from "@/lib/paginatedFetch";
 import { detectVerisPresence, logVerisPresenceErrors } from "@/lib/ges/detectVerisPresence";
+import { resolveManualPlantIds } from "@/lib/ges/manualPlants";
 
 type ImgSpec = {
   src: string;
@@ -377,6 +378,8 @@ export default function Dashboard() {
 
   // 4) KBK
   const [monthlyKbk, setMonthlyKbk] = useState<number | null>(null);
+  // Birim fiyat düzeltmesi (TL/kWh, +/-): (PTF+YEKDEM)*KBK sonrası eklenir. null = 0.
+  const [monthlyUnitPriceAdj, setMonthlyUnitPriceAdj] = useState<number | null>(null);
   const [kbkLoading, setKbkLoading] = useState(false);
   const [kbkErr, setKbkErr] = useState<string | null>(null);
 
@@ -662,7 +665,9 @@ export default function Dashboard() {
           subYek &&
           (subYek.yekdem_value != null || subYek.yekdem_final != null)
         ) {
-          const valRaw = subYek.yekdem_value ?? subYek.yekdem_final ?? null;
+          // final-first: kesin (final) değer öncelikli; yoksa tahmini (value).
+          // ChartsPage birim-fiyat mantığı (yekdem_final ?? yekdem_value) ile hizalı.
+          const valRaw = subYek.yekdem_final ?? subYek.yekdem_value ?? null;
           const val = valRaw != null ? Number(valRaw) : null;
 
           setMonthlyYekdem(Number.isFinite(val as any) ? val : null);
@@ -725,7 +730,7 @@ export default function Dashboard() {
 
         const { data, error } = await supabase
           .from("subscription_settings")
-          .select("kbk")
+          .select("kbk, unit_price_adjustment")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -735,11 +740,15 @@ export default function Dashboard() {
 
         const val = data?.kbk != null ? Number(data.kbk) : null;
         setMonthlyKbk(Number.isFinite(val as any) ? val : null);
+
+        const adj = data?.unit_price_adjustment != null ? Number(data.unit_price_adjustment) : null;
+        setMonthlyUnitPriceAdj(Number.isFinite(adj as any) ? adj : null);
       } catch (e: any) {
         if (!cancel) {
           console.error("KBK load error:", e);
           setKbkErr(e?.message ?? "KBK getirilemedi");
           setMonthlyKbk(null);
+          setMonthlyUnitPriceAdj(null);
         }
       } finally {
         if (!cancel) setKbkLoading(false);
@@ -899,7 +908,8 @@ export default function Dashboard() {
         }
 
         // 5.5) paramlar
-        const unitPriceEnergy = (monthlyPTF + monthlyYekdem) * monthlyKbk;
+        const unitPriceEnergy =
+          (monthlyPTF + monthlyYekdem) * monthlyKbk + (monthlyUnitPriceAdj ?? 0);
 
         const unitPriceDistribution =
           tariffRow.dagitim_bedeli != null ? Number(tariffRow.dagitim_bedeli) : 0;
@@ -1088,6 +1098,7 @@ export default function Dashboard() {
     monthlyPTF,
     monthlyYekdem,
     monthlyKbk,
+    monthlyUnitPriceAdj,
     monthlyUsdKur,
   ]);
 
@@ -1152,7 +1163,9 @@ export default function Dashboard() {
           grandTotalKwh += subKwh;
 
           if (cancel) return;
-          if (subKwh === 0) continue; // tüketim yoksa fatura da yok
+          // Tüketim ve üretim ikisi de yoksa fatura kalemi olmaz; sadece
+          // tüketim 0 ise lisansli_satis tesisinde satış olabilir, devam et.
+          if (subKwh === 0 && subGn === 0) continue;
 
           // 6.2) Önce snapshot kontrol — varsa direkt kullan (canlı recompute ile)
           const { data: snapData } = await supabase
@@ -1206,7 +1219,7 @@ export default function Dashboard() {
           // KBK
           const { data: kbkData } = await supabase
             .from("subscription_settings")
-            .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis")
+            .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis, unit_price_adjustment")
             .eq("user_id", uid)
             .eq("subscription_serno", serno)
             .maybeSingle();
@@ -1214,6 +1227,12 @@ export default function Dashboard() {
 
           const subKbk = kbkData?.kbk != null ? Number(kbkData.kbk) : null;
           if (subPtf == null || subYekdem == null || subKbk == null || !kbkData) continue;
+
+          // Birim fiyat düzeltmesi (TL/kWh, +/-): (PTF+YEKDEM)*KBK sonrası eklenir. null = 0.
+          const subUnitPriceAdj =
+            kbkData.unit_price_adjustment != null && Number.isFinite(Number(kbkData.unit_price_adjustment))
+              ? Number(kbkData.unit_price_adjustment)
+              : 0;
 
           const terim = kbkData.terim ?? null;
           const gerilim = kbkData.gerilim ?? null;
@@ -1266,7 +1285,7 @@ export default function Dashboard() {
           }
 
           // calculateInvoice
-          const unitPriceEnergy = (subPtf + subYekdem) * subKbk;
+          const unitPriceEnergy = (subPtf + subYekdem) * subKbk + subUnitPriceAdj;
           const unitPriceDistribution = tariffRow.dagitim_bedeli != null ? Number(tariffRow.dagitim_bedeli) : 0;
           const powerPrice = tariffRow.guc_bedeli != null ? Number(tariffRow.guc_bedeli) : 0;
           const powerExcessPrice = tariffRow.guc_bedeli_asim != null ? Number(tariffRow.guc_bedeli_asim) : 0;
@@ -1402,11 +1421,10 @@ export default function Dashboard() {
         const presence = await detectVerisPresence(supabase, uid);
         if (cancel) return;
         logVerisPresenceErrors("Dashboard.GES", presence);
-        console.log("[Dashboard] GES presence:", presence); // DEBUG — PR öncesi temizlenecek
-
-        setHasGes(presence.hasGesApi || presence.hasVeris);
 
         if (!presence.hasGesApi) {
+          // Tesis yok — yalnızca veriş-only durumu kalır
+          setHasGes(presence.hasVeris);
           setGesMonthlyKwh(null);
           return;
         }
@@ -1423,27 +1441,60 @@ export default function Dashboard() {
 
         const plantIds = (plantsFull ?? []).map((p: { id: string }) => p.id);
         if (plantIds.length === 0) {
+          setHasGes(presence.hasVeris);
           setGesMonthlyKwh(null);
           return;
         }
-        const startOfMonth = dayjsTR().startOf("month").format("YYYY-MM-DD");
-        const endOfMonth = dayjsTR().endOf("month").format("YYYY-MM-DD");
 
-        const { data, error } = await supabase
-          .from("ges_production_daily")
-          .select("energy_kwh")
-          .in("ges_plant_id", plantIds)
-          .gte("date", startOfMonth)
-          .lte("date", endOfMonth);
-
+        // 3) Tesisleri ikiye ayır: manuel (M-1 sayılır) vs API (cari ay sayılır)
+        const manualSet = await resolveManualPlantIds(supabase, uid);
         if (cancel) return;
-        if (error) throw error;
+        const manualIds = plantIds.filter((id) => manualSet.has(id));
+        const apiIds = plantIds.filter((id) => !manualSet.has(id));
 
-        const total = (data || []).reduce(
-          (s: number, r: { energy_kwh: number }) => s + (Number(r.energy_kwh) || 0),
-          0
-        );
-        setGesMonthlyKwh(total);
+        const sumEnergy = (rows: { energy_kwh: number }[] | null) =>
+          (rows || []).reduce(
+            (s: number, r: { energy_kwh: number }) => s + (Number(r.energy_kwh) || 0),
+            0
+          );
+
+        // API tesisleri — cari ay
+        let apiTotal = 0;
+        if (apiIds.length) {
+          const startOfMonth = dayjsTR().startOf("month").format("YYYY-MM-DD");
+          const endOfMonth = dayjsTR().endOf("month").format("YYYY-MM-DD");
+          const { data, error } = await supabase
+            .from("ges_production_daily")
+            .select("energy_kwh")
+            .in("ges_plant_id", apiIds)
+            .gte("date", startOfMonth)
+            .lte("date", endOfMonth);
+          if (cancel) return;
+          if (error) throw error;
+          apiTotal = sumEnergy(data);
+        }
+
+        // Manuel tesisler — geçen ay (M-1)
+        let manualTotal = 0;
+        let manualHasM1 = false;
+        if (manualIds.length) {
+          const prevMonth = dayjsTR().subtract(1, "month");
+          const startOfPrev = prevMonth.startOf("month").format("YYYY-MM-DD");
+          const endOfPrev = prevMonth.endOf("month").format("YYYY-MM-DD");
+          const { data, error } = await supabase
+            .from("ges_production_daily")
+            .select("energy_kwh")
+            .in("ges_plant_id", manualIds)
+            .gte("date", startOfPrev)
+            .lte("date", endOfPrev);
+          if (cancel) return;
+          if (error) throw error;
+          manualHasM1 = (data?.length ?? 0) > 0;
+          manualTotal = sumEnergy(data);
+        }
+
+        setHasGes(presence.hasGesApi || presence.hasVeris || manualHasM1);
+        setGesMonthlyKwh(apiTotal + manualTotal);
       } catch (e: any) {
         if (!cancel) {
           setGesErr(e?.message ?? "GES verisi yüklenemedi");
@@ -1473,7 +1524,7 @@ export default function Dashboard() {
 
     const unitPrice =
       monthlyPTF != null && monthlyYekdem != null && monthlyKbk != null
-        ? (monthlyPTF + monthlyYekdem) * monthlyKbk
+        ? (monthlyPTF + monthlyYekdem) * monthlyKbk + (monthlyUnitPriceAdj ?? 0)
         : null;
 
     const unitPriceText = fmtPTF6(unitPrice);
@@ -1507,6 +1558,7 @@ export default function Dashboard() {
     monthlyPTF,
     monthlyYekdem,
     monthlyKbk,
+    monthlyUnitPriceAdj,
     invoiceTotal,
     hasYekdemMahsup,
     yekdemMahsup,

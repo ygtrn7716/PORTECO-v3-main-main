@@ -3,7 +3,11 @@
     "allow": [
       "Read(//c/Users/**)",
       "Bash(file:*)",
-      "Bash(grep -E \"\\\\.sql$\")"
+      "Bash(grep -E \"\\\\.sql$\")",
+      "mcp__claude_ai_Supabase__execute_sql",
+      "mcp__claude_ai_Supabase__apply_migration",
+      "mcp__claude_ai_Supabase__deploy_edge_function",
+      "Bash(grep -ivE \"\\\\.md$\")"
     ]
   }
 }

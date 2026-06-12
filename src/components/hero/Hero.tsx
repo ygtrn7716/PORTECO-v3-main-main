@@ -124,7 +124,7 @@ export default function Hero() {
                     Doğru Enerji Çözümleri ile
                   </p>
                   <h1 className="mt-4 text-4xl md:text-6xl lg:text-7xl font-extrabold leading-tight text-white">
-                    Daha fazla üretin,
+                    Daha fazla tüketin,
                     <br className="hidden md:block" />
                     daha az harcayın.
                   </h1>

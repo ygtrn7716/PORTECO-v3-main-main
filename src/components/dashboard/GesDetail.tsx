@@ -13,6 +13,8 @@ import ConnectGesOverlay from "@/components/dashboard/shared/ConnectGesOverlay";
 import GesSavingsSection from "@/components/dashboard/shared/GesSavingsSection";
 import { MOCK_MONTHLY, MOCK_DAILY, MOCK_SUMMARY } from "@/components/dashboard/shared/gesPlaceholders";
 import { detectVerisPresence, logVerisPresenceErrors } from "@/lib/ges/detectVerisPresence";
+import { resolveManualPlantIds } from "@/lib/ges/manualPlants";
+import { calcYearlySatisHakkiUsage } from "@/components/utils/yearlySatisHakki";
 import {
   ResponsiveContainer,
   BarChart,
@@ -123,6 +125,10 @@ export default function GesDetail() {
   // Veriş geçmişi: ges_plants yok ama consumption_hourly.gn > 0 olan kullanıcı
   const [hasVeris, setHasVeris] = useState(false);
 
+  // Manuel (API'siz) tesisler — scope tamamen manuel ise snapshot kartları gizlenir
+  const [manualPlantIds, setManualPlantIds] = useState<Set<string>>(new Set());
+  const [manualLoaded, setManualLoaded] = useState(false);
+
   // Hedef 4 — GesSavingsSection ile paylaşılan tesis seçimi (EnergySoldCard'tan gelir)
   const [revenueSub, setRevenueSub] = useState<number | null>(null);
 
@@ -133,6 +139,12 @@ export default function GesDetail() {
 
   const hasGesApi = plants.length > 0;
   const showBlur = !hasGesApi && hasVeris;
+
+  // Görüntülenen scope'taki tüm tesisler manuel mi? (snapshot kartlarını gizlemek için)
+  const allManual =
+    manualLoaded &&
+    activePlantIds.length > 0 &&
+    activePlantIds.every((id) => manualPlantIds.has(id));
 
   useEffect(() => {
     if (showBlur) setChartTab('sold');
@@ -186,9 +198,24 @@ export default function GesDetail() {
     return () => { cancel = true; };
   }, [uid, sessionLoading]);
 
-  // 2) Snapshot verileri
+  // 1c) Manuel tesis id'lerini çöz (snapshot kartlarını gizleme kararı için)
   useEffect(() => {
-    if (!plants.length || !activePlantIds.length) {
+    if (sessionLoading || !uid) return;
+    let cancel = false;
+
+    (async () => {
+      const ids = await resolveManualPlantIds(supabase, uid);
+      if (cancel) return;
+      setManualPlantIds(ids);
+      setManualLoaded(true);
+    })();
+
+    return () => { cancel = true; };
+  }, [uid, sessionLoading]);
+
+  // 2) Snapshot verileri — scope tamamen manuel ise hiç sorgulama
+  useEffect(() => {
+    if (!plants.length || !activePlantIds.length || allManual) {
       setSnapshot(null);
       return;
     }
@@ -223,7 +250,7 @@ export default function GesDetail() {
     })();
 
     return () => { cancel = true; };
-  }, [plants, selectedPlantId]);
+  }, [plants, selectedPlantId, allManual]);
 
   // 3) Bu ay toplam üretim
   useEffect(() => {
@@ -453,34 +480,35 @@ export default function GesDetail() {
     return () => { cancel = true; };
   }, [plants, selectedPlantId, uid]);
 
-  // 7) Yıllık toplam üretim (year-to-date)
+  // 7) Yıllık satış hakkı kullanımı (cari yıl, devlete satılan veriş fazlası).
+  // Sadece şebekeye satılan kısım sayılır; mahsup edilen veriş hariç tutulur.
   useEffect(() => {
-    if (!plants.length || !activePlantIds.length) {
+    if (!uid || !plants.length || !activePlantIds.length) {
+      setYearlyTotal(null);
+      return;
+    }
+    const linkedSernos = plants
+      .filter((p) => activePlantIds.includes(p.id) && p.linked_serno != null)
+      .map((p) => p.linked_serno!);
+
+    if (!linkedSernos.length) {
       setYearlyTotal(null);
       return;
     }
     let cancel = false;
 
     (async () => {
-      const startDate = `${dayjsTR().year()}-01-01`;
-      const endDate = dayjsTR().format("YYYY-MM-DD");
-
-      const { data, error } = await supabase
-        .from("ges_production_daily")
-        .select("energy_kwh")
-        .in("ges_plant_id", activePlantIds)
-        .gte("date", startDate)
-        .lte("date", endDate);
-
+      const used = await calcYearlySatisHakkiUsage({
+        supabase,
+        userId: uid,
+        subscriptionSernos: linkedSernos,
+      });
       if (cancel) return;
-      if (error) return;
-
-      const total = (data || []).reduce((s, r) => s + (Number(r.energy_kwh) || 0), 0);
-      setYearlyTotal(total);
+      setYearlyTotal(used);
     })();
 
     return () => { cancel = true; };
-  }, [plants, selectedPlantId]);
+  }, [plants, selectedPlantId, uid]);
 
   // XLSX export
   const handleExport = () => {
@@ -606,7 +634,13 @@ export default function GesDetail() {
               aria-hidden={showBlur ? "true" : undefined}
               className={showBlur ? "pointer-events-none select-none blur-[3px] opacity-60" : ""}
             >
-              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+              <div
+                className={
+                  allManual
+                    ? "grid grid-cols-1 sm:grid-cols-2 gap-4"
+                    : "grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4"
+                }
+              >
                 <SummaryCard
                   title="Bu Ay Toplam Üretim"
                   value={fmtKwh(showBlur ? MOCK_SUMMARY.thisMonth : monthTotal)}
@@ -617,21 +651,26 @@ export default function GesDetail() {
                   value={fmtKwh(showBlur ? MOCK_SUMMARY.lastMonth : prevMonthTotal)}
                   unit="kWh"
                 />
-                <SummaryCard
-                  title="Bugünkü Üretim"
-                  value={fmtKwh(showBlur ? MOCK_SUMMARY.today : (snapshot?.today_energy_kwh ?? null))}
-                  unit="kWh"
-                />
-                <SummaryCard
-                  title="Anlık Güç"
-                  value={fmtKwh(showBlur ? MOCK_SUMMARY.instantKw : (snapshot ? snapshot.current_power_w / 1000 : null))}
-                  unit="kW"
-                />
-                <SummaryCard
-                  title="Toplam Ömür Boyu Üretim"
-                  value={fmtKwh(showBlur ? MOCK_SUMMARY.lifetime : (snapshot?.total_energy_kwh ?? null))}
-                  unit="kWh"
-                />
+                {/* Snapshot kartları — scope tamamen manuel ise gizli (manuel tesiste anlık veri yok) */}
+                {!allManual && (
+                  <>
+                    <SummaryCard
+                      title="Bugünkü Üretim"
+                      value={fmtKwh(showBlur ? MOCK_SUMMARY.today : (snapshot?.today_energy_kwh ?? null))}
+                      unit="kWh"
+                    />
+                    <SummaryCard
+                      title="Anlık Güç"
+                      value={fmtKwh(showBlur ? MOCK_SUMMARY.instantKw : (snapshot ? snapshot.current_power_w / 1000 : null))}
+                      unit="kW"
+                    />
+                    <SummaryCard
+                      title="Toplam Ömür Boyu Üretim"
+                      value={fmtKwh(showBlur ? MOCK_SUMMARY.lifetime : (snapshot?.total_energy_kwh ?? null))}
+                      unit="kWh"
+                    />
+                  </>
+                )}
               </div>
             </div>
           </div>

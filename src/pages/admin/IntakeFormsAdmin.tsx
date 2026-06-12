@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { dayjsTR } from "@/lib/dayjs";
-import { Search, Eye, EyeOff, Lock, Copy, Check, ClipboardList } from "lucide-react";
+import { Search, Eye, EyeOff, Lock, Copy, Check, ClipboardList, Sun } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -21,6 +21,10 @@ type IntakeRow = {
   admin_notu: string | null;
   reviewed_at: string | null;
   reviewed_by: string | null;
+  has_ges: boolean;
+  ges_saglayici_sayisi: number;
+  ges_tesis_sayisi: number;
+  ges_saglayicilar: GesSaglayiciJSON[];
 };
 
 type TesisJSON = {
@@ -35,6 +39,17 @@ type TesisJSON = {
   yekdem_final_1: number | null;
   yekdem_tahmin_2: number | null;
   yekdem_final_2: number | null;
+};
+
+type GesSaglayiciJSON = {
+  saglayici: string;
+  saglayici_diger: string;
+  kullanici: string;
+  sifre: string;
+  tesis_sayisi: number;
+  lisansli_satis?: boolean;
+  on_yil_ustu?: boolean;
+  notlar: string;
 };
 
 type StatusFilter = "all" | "yeni" | "islendi" | "beklemede";
@@ -86,6 +101,7 @@ export default function IntakeFormsAdmin() {
   const [adminNote, setAdminNote] = useState("");
   const [noteSaving, setNoteSaving] = useState(false);
   const [noteMsg, setNoteMsg] = useState<string | null>(null);
+  const [gesShow, setGesShow] = useState<Record<number, boolean>>({});
 
   /* ---------- Fetch ---------- */
 
@@ -148,6 +164,8 @@ export default function IntakeFormsAdmin() {
       setAdminNote(selected.admin_notu ?? "");
       setActiveTesis(0);
       setShowPass(false);
+      setGesShow({});
+      setCopied(null);
       setNoteMsg(null);
     }
   }, [selectedId]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -272,7 +290,14 @@ export default function IntakeFormsAdmin() {
                   <p className="text-xs text-neutral-600 truncate">{r.ad_soyad}</p>
                   <div className="flex items-center justify-between mt-1.5">
                     <span className="text-[10px] text-neutral-400">{relativeTime(r.created_at)}</span>
-                    <span className="text-[10px] text-neutral-400">{r.tesis_sayisi} tesis</span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] text-neutral-400">{r.tesis_sayisi} tesis</span>
+                      {r.has_ges && (
+                        <span className="inline-flex items-center gap-0.5 rounded-full bg-amber-100 text-amber-700 px-1.5 py-0.5 text-[9px] font-medium">
+                          <Sun size={9} /> GES {r.ges_tesis_sayisi}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </button>
               ))}
@@ -340,6 +365,106 @@ export default function IntakeFormsAdmin() {
                   </div>
                 </div>
               </div>
+
+              {/* GES (Üretim) Bilgileri */}
+              {selected.has_ges && selected.ges_saglayicilar && selected.ges_saglayicilar.length > 0 && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50/40 p-4">
+                  <div className="flex items-center gap-2 mb-3">
+                    <Sun size={14} className="text-amber-600" />
+                    <span className="text-xs font-semibold text-neutral-700">GES Sağlayıcıları</span>
+                    <span className="ml-auto text-[10px] text-neutral-500">
+                      {selected.ges_saglayici_sayisi} sağlayıcı · {selected.ges_tesis_sayisi} tesis
+                    </span>
+                  </div>
+                  <div className="space-y-3">
+                    {selected.ges_saglayicilar.map((g, i) => (
+                      <div key={i} className="rounded-lg border border-neutral-200 bg-white p-3 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-semibold text-neutral-800">
+                            {g.saglayici || "—"}
+                          </span>
+                          <span className="text-[10px] text-neutral-500">{g.tesis_sayisi} tesis</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs text-neutral-500 w-20 shrink-0">Kullanıcı:</span>
+                          <code className="flex-1 rounded bg-neutral-50 px-2 py-1 text-xs font-mono text-neutral-800 border">
+                            {g.kullanici || "—"}
+                          </code>
+                          <button
+                            onClick={() => copyText(g.kullanici, `ges_user_${i}`)}
+                            className="text-neutral-400 hover:text-neutral-600"
+                          >
+                            {copied === `ges_user_${i}` ? (
+                              <Check size={14} className="text-green-500" />
+                            ) : (
+                              <Copy size={14} />
+                            )}
+                          </button>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs text-neutral-500 w-20 shrink-0">Şifre:</span>
+                          <code className="flex-1 rounded bg-neutral-50 px-2 py-1 text-xs font-mono text-neutral-800 border">
+                            {gesShow[i]
+                              ? g.sifre
+                              : "•".repeat(Math.min((g.sifre ?? "").length, 12))}
+                          </code>
+                          <button
+                            onClick={() => setGesShow((s) => ({ ...s, [i]: !s[i] }))}
+                            className="text-neutral-400 hover:text-neutral-600"
+                          >
+                            {gesShow[i] ? <EyeOff size={14} /> : <Eye size={14} />}
+                          </button>
+                          <button
+                            onClick={() => copyText(g.sifre, `ges_pass_${i}`)}
+                            className="text-neutral-400 hover:text-neutral-600"
+                          >
+                            {copied === `ges_pass_${i}` ? (
+                              <Check size={14} className="text-green-500" />
+                            ) : (
+                              <Copy size={14} />
+                            )}
+                          </button>
+                        </div>
+                        <div className="flex flex-wrap gap-x-4 gap-y-1 pt-1 text-[11px]">
+                          <span className="text-neutral-500">
+                            Lisanslı satış:{" "}
+                            <span
+                              className={`font-semibold ${
+                                g.lisansli_satis ? "text-emerald-700" : "text-neutral-700"
+                              }`}
+                            >
+                              {g.lisansli_satis === undefined
+                                ? "—"
+                                : g.lisansli_satis
+                                ? "Evet"
+                                : "Hayır"}
+                            </span>
+                          </span>
+                          <span className="text-neutral-500">
+                            10 yıl üstü (USD):{" "}
+                            <span
+                              className={`font-semibold ${
+                                g.on_yil_ustu ? "text-amber-700" : "text-neutral-700"
+                              }`}
+                            >
+                              {g.on_yil_ustu === undefined
+                                ? "—"
+                                : g.on_yil_ustu
+                                ? "Evet"
+                                : "Hayır"}
+                            </span>
+                          </span>
+                        </div>
+                        {g.notlar && (
+                          <p className="text-xs text-neutral-600 italic pt-1 border-t border-neutral-100">
+                            {g.notlar}
+                          </p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Tesis Bilgileri */}
               <div>

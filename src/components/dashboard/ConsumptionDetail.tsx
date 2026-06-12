@@ -8,6 +8,8 @@ import { supabase } from "@/lib/supabase";
 import { dayjsTR } from "@/lib/dayjs";
 import { exportConsumptionHourlyXlsx } from "@/components/utils/exportConsumptionXlsx";
 import { computeMonthInvoiceToDate } from "@/components/utils/calculateInvoiceToDate";
+import GesUretimSatisiCard from "@/components/dashboard/shared/GesUretimSatisiCard";
+import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
 
 import { ChevronDown } from "lucide-react";
 import { fetchAllConsumption } from "@/lib/paginatedFetch";
@@ -741,6 +743,20 @@ useEffect(() => {
               <p className="mt-2 text-xs text-amber-700">
                 Not: PTF olmayan saatler olduğu için {fmtKwh(invoiceToDate.skippedKwh)} kWh hesaba dahil edilmedi.
               </p>
+            )}
+
+            {/* GES Üretim Satışı — fazla üretim satışı, faturaya dahil DEĞİL */}
+            {invoiceToDate.breakdown.verisFazlaKwh > 0 && (
+              <GesUretimSatisiCard
+                result={calculateGesUretimSatisi({
+                  satisKwh: invoiceToDate.breakdown.verisFazlaKwh,
+                  onYil: invoiceToDate.onYil,
+                  usdKur: invoiceToDate.monthlyUsdKur,
+                  perakendeEnerjiBedeli: invoiceToDate.perakendeEnerjiBedeli,
+                  dagitimBedeli: invoiceToDate.dagitimUreticiBedeli,
+                })}
+                lisansliSatis={invoiceToDate.lisansliSatis}
+              />
             )}
           </>
         )}

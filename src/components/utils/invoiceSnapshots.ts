@@ -70,6 +70,7 @@ export type InvoiceSnapshotRow = {
 
   total_consumption_kwh: number | null;
   unit_price_energy: number | null;
+  unit_price_adjustment: number | null;
   unit_price_distribution: number | null;
   btv_rate: number | null;
   vat_rate: number | null;
@@ -116,6 +117,12 @@ export type InvoiceSnapshotRow = {
   veris_satis_bedeli: number | null;
   perakende_enerji_bedeli: number | null;
   usd_kur: number | null;
+
+  // GES Üretim Satışı: fatura kesilirken donmuş dağıtım kesinti oranı (TL/kWh).
+  // lisansli_satis'e göre seçilen dagitim_uretici_1/2 değeri. Geçmiş kartın
+  // tarife değişse bile sabit kalması için saklanır. null = eski snapshot →
+  // gösterim tarafında canlı tarife fallback'i yapılır.
+  ges_satis_dagitim_bedeli: number | null;
 };
 
 export async function upsertInvoiceSnapshot(params: {
@@ -128,6 +135,9 @@ export async function upsertInvoiceSnapshot(params: {
 
   totalConsumptionKwh: number;
   unitPriceEnergy: number;
+  /** Audit: bu snapshot'a uygulanan birim fiyat düzeltmesi (TL/kWh, +/-).
+   * unitPriceEnergy zaten düzeltilmiş (final) değer olarak gelir; bu yalnızca kayıt amaçlıdır. */
+  unitPriceAdjustment?: number | null;
   unitPriceDistribution: number;
   btvRate: number;
   vatRate: number;
@@ -160,6 +170,8 @@ export async function upsertInvoiceSnapshot(params: {
   lisansliSatis?: boolean;
   perakendeEnerjiBedeli?: number;
   usdKur?: number;
+  /** GES Üretim Satışı: fatura kesilirken donmuş dağıtım kesinti oranı (TL/kWh). */
+  gesSatisDagitimBedeli?: number | null;
 }) {
   const invoiceType = params.invoiceType ?? "billed";
 
@@ -173,6 +185,7 @@ export async function upsertInvoiceSnapshot(params: {
 
     total_consumption_kwh: params.totalConsumptionKwh,
     unit_price_energy: params.unitPriceEnergy,
+    unit_price_adjustment: params.unitPriceAdjustment ?? null,
     unit_price_distribution: params.unitPriceDistribution,
     btv_rate: params.btvRate,
     vat_rate: params.vatRate,
@@ -216,6 +229,7 @@ export async function upsertInvoiceSnapshot(params: {
     veris_satis_bedeli: params.breakdown.verisSatisBedeli ?? 0,
     perakende_enerji_bedeli: params.perakendeEnerjiBedeli ?? null,
     usd_kur: params.usdKur ?? null,
+    ges_satis_dagitim_bedeli: params.gesSatisDagitimBedeli ?? null,
   };
 
   const { error } = await supabase

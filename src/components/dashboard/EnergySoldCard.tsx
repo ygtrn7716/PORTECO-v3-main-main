@@ -21,6 +21,8 @@ import { supabase } from "@/lib/supabase";
 import { dayjsTR } from "@/lib/dayjs";
 import { fetchAllConsumption } from "@/lib/paginatedFetch";
 import { getInvoiceSnapshot } from "@/components/utils/invoiceSnapshots";
+import { calcYearlySatisHakkiUsage } from "@/components/utils/yearlySatisHakki";
+import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
 
 type OsosSub = {
   subscription_serno: number;
@@ -42,8 +44,9 @@ type CalcResult = {
   satisBrutGelir: number;    // TL
   satisDagitimKesintisi: number; // TL
   satisNetGelir: number;     // TL
-  dagitimBedeli: number;     // TL/kWh (bilgi) — on_yil'e göre sabit oran
-  onYil: boolean;            // 10 yıl üstü/altı bilgisi (açıklama metni için)
+  dagitimBedeli: number;     // TL/kWh — lisansli_satis'e göre tarife satırından
+  onYil: boolean;            // satış birim fiyatı (USD/perakende) için
+  lisansliSatis: boolean;    // dağıtım kesintisi tarifesi seçimi (açıklama metni için)
   // Brüt gelirde kullanılan birim fiyat ve mod (USD vs perakende)
   satisBrutBirim: number;    // TL/kWh — gerçekten uygulanan birim fiyat
   satisModu: "usd" | "perakende";
@@ -61,18 +64,15 @@ const MONTH_NAMES = [
   "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık",
 ];
 
-// Devlete satılan enerji bedelinde uygulanan sabit dağıtım bedelleri (TL/kWh).
-// SADECE bu kart için geçerli — fatura sayfası (calculateInvoice) dokunulmaz.
-//   on_yil = true  (10 yıl üstü) → 1,575810 TL/kWh
-//   on_yil = false (10 yıl altı) → 0,496738 TL/kWh
-const DAGITIM_BEDELI_ON_YIL_USTU = 1.575810;
-const DAGITIM_BEDELI_ON_YIL_ALTI = 0.496738;
+// Dağıtım kesintisi tarifesi distribution_tariff_official tablosundan okunur:
+//   lisansli_satis = true  → dagitim_uretici_1 (lisanslı satış üretici)
+//   lisansli_satis = false → dagitim_uretici_2 (lisanslı olmayan üretici)
+// on_yil bu seçimi etkilemez; sadece satış birim fiyatı kuralını yönetir.
 
-// 10 yıl üstü tesislerin veriş fazlası satış birim fiyatı (USD/kWh).
-// Brüt gelir = satisKwh × VERIS_USD_BIRIM_FIYAT × usd_kur (TL/USD)
-// usd_kur subscription_yekdem.usd_kur'dan o ay için okunur. NULL/0 ise
-// eski perakende_enerji_bedeli formülüne fallback yapılır.
-const VERIS_USD_BIRIM_FIYAT = 0.133;
+// 10 yıl üstü tesislerin veriş fazlası satış birim fiyatı (USD/kWh) ve net gelir
+// hesabı artık ortak yardımcıda: src/lib/ges/gesUretimSatisi.ts
+//   Brüt gelir = satisKwh × 0.133 × usd_kur (TL/USD); usd_kur tanımsız/0 ise
+//   perakende_enerji_bedeli fallback. Net gelir = brüt − dağıtım kesintisi.
 
 const fmtKwh = (n: number) =>
   n.toLocaleString("tr-TR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -176,24 +176,17 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
         const prevYear = prevMonth.year();
         const prevMonthNum = prevMonth.month() + 1;
 
-        // Yıllık satış hakkı için takvim yılı aralığı (1 Oca → bugün)
-        const now = dayjsTR();
-        const yearStart = now.startOf("year");
-        const yearStartIso = yearStart.toDate().toISOString();
-        const yearEndIso = now.toDate().toISOString();
-
         // Paralel fetch:
         //   1) Geçen ay tüketim (sağ kart cn/gn toplama)
         //   2) Settings (tarife/on_yil + satis_hakki) — yıllık satış hakkı dahil
         //   3) Geçen ay snapshot (sol kart)
-        //   4) Yıllık tüketim (cari yılın 1 Oca'dan bugüne — yıllık satış hakkı kümülatifi)
         // PTF artık kullanılmıyor — brüt gelir saat-bazlı PTF değil, sabit perakende.
         // Not: ges_satis_hakki tablosu legacy; satis_hakki artık subscription_settings'te.
+        // Yıllık satış hakkı kümülatifi calcYearlySatisHakkiUsage ile ayrı hesaplanır.
         const [
           hourlyRes,
           settingsRes,
           snapshotData,
-          yearlyHourlyRes,
         ] = await Promise.all([
           fetchAllConsumption({
             supabase,
@@ -206,7 +199,7 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
           }),
           supabase
             .from("subscription_settings")
-            .select("terim, gerilim, tarife, on_yil, satis_hakki")
+            .select("terim, gerilim, tarife, on_yil, lisansli_satis, satis_hakki")
             .eq("user_id", uid)
             .eq("subscription_serno", selectedSerno)
             .maybeSingle(),
@@ -217,15 +210,6 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
             periodMonth: prevMonthNum,
             invoiceType: "billed",
           }).catch(() => null),
-          fetchAllConsumption({
-            supabase,
-            userId: uid,
-            subscriptionSerno: selectedSerno,
-            columns: "ts, gn, cn",
-            startIso: yearStartIso,
-            endIso: yearEndIso,
-            endInclusive: true,
-          }),
         ]);
 
         if (cancel) return;
@@ -271,32 +255,33 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
 
         // Sağ kart: satış hesabı.
         //
-        // BRÜT GELIR (iki mod):
+        // BRÜT GELIR (iki mod — on_yil belirler):
         //   • on_yil = true  ve  subscription_yekdem.usd_kur > 0 →
         //     satisBrutGelir = satisKwh × 0.133 × usd_kur     (USD bazlı)
         //   • aksi halde (10 yıl altı VEYA usd_kur tanımsız) →
         //     satisBrutGelir = satisKwh × perakende_enerji_bedeli   (TL fallback)
         //
-        // DAĞITIM KESİNTİSİ (on_yil'e göre sabit oran — USD/perakende fark etmez):
-        //   on_yil = true  → 1,575810 TL/kWh (10 yıl üstü tesisler)
-        //   on_yil = false → 0,496738 TL/kWh (10 yıl altı tesisler)
+        // DAĞITIM KESİNTİSİ (lisansli_satis belirler — tarife satırından okunur):
+        //   lisansli_satis = true  → dagitim_uretici_1 (lisanslı satış üretici)
+        //   lisansli_satis = false → dagitim_uretici_2 (lisanslı olmayan üretici)
+        // on_yil dağıtım kesintisini ETKİLEMEZ.
         const onYil = (settingsRes.data as any)?.on_yil ?? false;
+        const lisansliSatis = (settingsRes.data as any)?.lisansli_satis ?? false;
         let dagitimBedeli = 0;
         let perakendeRate = 0;
         if (settingsRes.data) {
-          dagitimBedeli = onYil
-            ? DAGITIM_BEDELI_ON_YIL_USTU
-            : DAGITIM_BEDELI_ON_YIL_ALTI;
-
           const { data: tariff } = await supabase
             .from("distribution_tariff_official")
-            .select("perakende_enerji_bedeli")
+            .select("perakende_enerji_bedeli, dagitim_uretici_1, dagitim_uretici_2")
             .eq("terim", settingsRes.data.terim)
             .eq("gerilim", settingsRes.data.gerilim)
             .eq("tarife", settingsRes.data.tarife)
             .maybeSingle();
           if (cancel) return;
           perakendeRate = Number(tariff?.perakende_enerji_bedeli) || 0;
+          dagitimBedeli = lisansliSatis
+            ? Number(tariff?.dagitim_uretici_1) || 0
+            : Number(tariff?.dagitim_uretici_2) || 0;
         }
 
         // USD kur (subscription_yekdem.usd_kur) — geçen ay için
@@ -330,38 +315,32 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
           }
         }
 
-        // Brüt gelir: USD modu yalnızca on_yil=true && usd_kur > 0
-        const satisModu: "usd" | "perakende" =
-          onYil && satisUsdKur > 0 ? "usd" : "perakende";
-        const satisBrutBirim =
-          satisModu === "usd"
-            ? VERIS_USD_BIRIM_FIYAT * satisUsdKur
-            : perakendeRate;
-        const satisBrutGelir = satisKwh > 0 ? satisKwh * satisBrutBirim : 0;
-
-        // Dağıtım kesintisi: on_yil'e göre seçilmiş sabit oran × satış kWh.
-        const satisDagitimKesintisi = satisKwh * dagitimBedeli;
-        const satisNetGelir = satisBrutGelir - satisDagitimKesintisi;
+        // Satış hesabı tek kaynaktan (fatura görünümleriyle birebir aynı formül).
+        const satis = calculateGesUretimSatisi({
+          satisKwh,
+          onYil,
+          usdKur: satisUsdKur,
+          perakendeEnerjiBedeli: perakendeRate,
+          dagitimBedeli,
+        });
+        const {
+          satisModu,
+          satisBrutBirim,
+          satisBrutGelir,
+          satisDagitimKesintisi,
+          satisNetGelir,
+        } = satis;
 
         // ── Yıllık Satış Hakkı (subscription_settings.satis_hakki) ──────────
-        // Cari takvim yılındaki kümülatif satış kWh'ı: her ay için
-        // max(0, ayVeris - ayCekis), aylar boyu toplanır.
-        const yearlyHourlyData = yearlyHourlyRes.data ?? [];
-        const monthlyTotals = new Map<string, { veris: number; cekis: number }>();
-        for (const hour of yearlyHourlyData) {
-          const tsStr = String((hour as any).ts ?? "");
-          const monthKey = tsStr.slice(0, 7); // "YYYY-MM"
-          if (!monthKey) continue;
-          const cur = monthlyTotals.get(monthKey) ?? { veris: 0, cekis: 0 };
-          cur.veris += Number((hour as any).gn) || 0;
-          cur.cekis += Number((hour as any).cn) || 0;
-          monthlyTotals.set(monthKey, cur);
-        }
-
-        let yillikKullanilanKwh = 0;
-        for (const { veris, cekis } of monthlyTotals.values()) {
-          yillikKullanilanKwh += Math.max(0, veris - cekis);
-        }
+        // Cari takvim yılındaki kümülatif satış kWh'ı: sadece devlete satılan
+        // veriş fazlası — mahsup edilen kısım hariç. Hesap calcYearlySatisHakkiUsage
+        // helper'ında, ay-bazlı `Σ max(0, ayVeriş - ayÇekiş)` ile yapılır.
+        const yillikKullanilanKwh = await calcYearlySatisHakkiUsage({
+          supabase,
+          userId: uid,
+          subscriptionSernos: [selectedSerno],
+        });
+        if (cancel) return;
 
         // Yıllık satış hakkı limiti subscription_settings.satis_hakki kolonundan okunur.
         // (Eski ges_satis_hakki tablosu legacy — bu sürümde artık sorgulanmaz.)
@@ -397,6 +376,7 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
           satisNetGelir,
           dagitimBedeli,
           onYil,
+          lisansliSatis,
           satisBrutBirim,
           satisModu,
           satisUsdKur,
@@ -586,9 +566,9 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
                   {result.dagitimBedeli > 0 && (
                     <p className="mt-4 text-xs text-neutral-400">
                       Dağıtım Bedeli: {fmtUnit(result.dagitimBedeli)} TL/kWh
-                      ({result.onYil
-                        ? "10 yıl üstü tesis için sabit oran"
-                        : "10 yıl altı tesis için sabit oran"})
+                      ({result.lisansliSatis
+                        ? "Lisanslı satış üretici tarifesi"
+                        : "Lisanslı olmayan üretici tarifesi"})
                     </p>
                   )}
 

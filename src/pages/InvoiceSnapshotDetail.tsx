@@ -3,8 +3,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { useSession } from "@/hooks/useSession";
+import { supabase } from "@/lib/supabase";
 import { getInvoiceSnapshot, type InvoiceSnapshotRow } from "@/components/utils/invoiceSnapshots";
 import { calculateInvoice, type InvoiceBreakdown, type TariffType } from "@/components/utils/calculateInvoice";
+import GesUretimSatisiCard from "@/components/dashboard/shared/GesUretimSatisiCard";
+import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
 
 const fmtMoney2 = (n: number | null | undefined) =>
   n == null || !Number.isFinite(Number(n))
@@ -117,6 +120,7 @@ const yekdemCell = useMemo(() => {
         totalProductionKwh: Number(row.total_production_kwh ?? 0),
         onYil: row.on_yil ?? true,
         perakendeEnerjiBedeli: Number(row.perakende_enerji_bedeli ?? 0),
+        usdKur: Number(row.usd_kur ?? 0),
         lisansliSatis: (row as any).lisansli_satis ?? false,
       });
     } catch {
@@ -130,6 +134,80 @@ const yekdemCell = useMemo(() => {
     const yekdem = Number(row.yekdem_mahsup ?? 0);
     return liveBreakdown.totalInvoice + yekdem + digerDegerler;
   }, [row, liveBreakdown, digerDegerler]);
+
+  // GES Üretim Satışı dağıtım kesinti oranı:
+  //  • Yeni snapshot'larda donmuş değer (row.ges_satis_dagitim_bedeli) kullanılır.
+  //  • Eski snapshot'larda (null) subscription_settings + distribution_tariff_official'dan
+  //    canlı fallback ile çekilir (GES sayfasının davranışıyla tutarlı).
+  const [gesSatisDagitimRate, setGesSatisDagitimRate] = useState<number | null>(null);
+  useEffect(() => {
+    if (!row || !uid) {
+      setGesSatisDagitimRate(null);
+      return;
+    }
+    // Fazla satışı yoksa hesaba gerek yok.
+    const fazlaKwh = Number(liveBreakdown?.verisFazlaKwh ?? 0);
+    if (!(fazlaKwh > 0)) {
+      setGesSatisDagitimRate(null);
+      return;
+    }
+
+    const stored = (row as any).ges_satis_dagitim_bedeli;
+    if (stored != null && Number.isFinite(Number(stored))) {
+      setGesSatisDagitimRate(Number(stored));
+      return;
+    }
+
+    let cancel = false;
+    (async () => {
+      try {
+        const settingsRes = await supabase
+          .from("subscription_settings")
+          .select("terim, gerilim, tarife, lisansli_satis")
+          .eq("user_id", uid)
+          .eq("subscription_serno", sub)
+          .maybeSingle();
+        if (cancel || !settingsRes.data) return;
+
+        const lisansliSatis =
+          (row as any).lisansli_satis ?? (settingsRes.data as any).lisansli_satis ?? false;
+
+        const tariff = await supabase
+          .from("distribution_tariff_official")
+          .select("dagitim_uretici_1, dagitim_uretici_2")
+          .eq("terim", settingsRes.data.terim)
+          .eq("gerilim", settingsRes.data.gerilim)
+          .eq("tarife", settingsRes.data.tarife)
+          .maybeSingle();
+        if (cancel) return;
+
+        const rate = lisansliSatis
+          ? Number(tariff.data?.dagitim_uretici_1) || 0
+          : Number(tariff.data?.dagitim_uretici_2) || 0;
+        setGesSatisDagitimRate(rate);
+      } catch {
+        if (!cancel) setGesSatisDagitimRate(0);
+      }
+    })();
+
+    return () => {
+      cancel = true;
+    };
+  }, [row, uid, sub, liveBreakdown]);
+
+  // GES Üretim Satışı kart sonucu (fazla satışı + donmuş/canlı dağıtım oranı).
+  const gesSatisResult = useMemo(() => {
+    if (!row || !liveBreakdown) return null;
+    const fazlaKwh = Number(liveBreakdown.verisFazlaKwh ?? 0);
+    if (!(fazlaKwh > 0) || gesSatisDagitimRate == null) return null;
+    return calculateGesUretimSatisi({
+      satisKwh: fazlaKwh,
+      onYil: row.on_yil ?? false,
+      usdKur: Number(row.usd_kur ?? 0),
+      perakendeEnerjiBedeli: Number(row.perakende_enerji_bedeli ?? 0),
+      dagitimBedeli: gesSatisDagitimRate,
+    });
+  }, [row, liveBreakdown, gesSatisDagitimRate]);
 
 
 
@@ -264,14 +342,16 @@ const yekdemCell = useMemo(() => {
                     </tr>
                   )}
 
-                  {Number(liveBreakdown?.verisSatisBedeli ?? row.veris_satis_bedeli ?? 0) > 0 && (
+                  {/* Yalnızca veriş MAHSUBU faturadan düşülür. Fazla üretim satışı
+                      aşağıdaki "GES Üretim Satışı" kartında ayrı gösterilir. */}
+                  {Number(liveBreakdown?.verisMahsupBedeli ?? 0) > 0 && (
                     <tr className="border-b border-neutral-100">
-                      <td className="py-2 pr-4 text-emerald-700">Veriş Satış Bedeli (Mahsup)</td>
+                      <td className="py-2 pr-4 text-emerald-700">Veriş Mahsup (Birim Fiyat)</td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {fmtKwh(Number(liveBreakdown?.verisKwh ?? row.veris_kwh ?? row.total_production_kwh ?? 0))} kWh veriş
+                        {fmtUnit(row.unit_price_energy)} TL/kWh × {fmtKwh(Number(liveBreakdown?.verisMahsupKwh ?? 0))} kWh
                       </td>
                       <td className="py-2 pr-4 text-right text-emerald-700">
-                        −{fmtMoney2(liveBreakdown?.verisSatisBedeli ?? row.veris_satis_bedeli)}
+                        −{fmtMoney2(liveBreakdown?.verisMahsupBedeli)}
                       </td>
                     </tr>
                   )}
@@ -326,6 +406,14 @@ const yekdemCell = useMemo(() => {
               </table>
             </div>
           </div>
+
+          {/* GES Üretim Satışı — fazla üretim satışı, faturaya dahil DEĞİL */}
+          {gesSatisResult && (
+            <GesUretimSatisiCard
+              result={gesSatisResult}
+              lisansliSatis={(row as any).lisansli_satis ?? false}
+            />
+          )}
         </>
       )}
     </DashboardShell>

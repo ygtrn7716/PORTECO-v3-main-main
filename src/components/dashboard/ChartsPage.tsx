@@ -25,6 +25,7 @@ type SubOption = {
   meterSerial: string | null;
   nickname: string | null;
   kbk: number | null;
+  unitPriceAdjustment: number | null;
 };
 
 type RpcRow = {
@@ -87,6 +88,11 @@ const fmt1 = (n: number | null | undefined) =>
 
 
 function nOrNull(x: any): number | null {
+  // null/undefined'ı 0'a çevirme: Number(null)===0 olduğu için eski hâli
+  // gerçek null değerleri 0 yapıyordu. Bu, örn. yekdem_final null iken
+  // birim fiyat hesabındaki `final ?? value` mantığını bozuyordu
+  // (0 ?? value === 0 → YEKDEM düşüyordu). null'ı null olarak koru.
+  if (x === null || x === undefined || x === "") return null;
   const v = Number(x);
   return Number.isFinite(v) ? v : null;
 }
@@ -236,6 +242,7 @@ export default function ChartsPage() {
               title,
               nickname,
               kbk,
+              unit_price_adjustment,
               is_hidden
             )
           `
@@ -255,12 +262,14 @@ export default function ChartsPage() {
             const ss = r.subscription_settings;
             const nick = (ss?.nickname ?? ss?.title ?? null) as string | null;
             const kbk = ss?.kbk != null ? Number(ss.kbk) : null;
+            const upa = ss?.unit_price_adjustment != null ? Number(ss.unit_price_adjustment) : null;
 
             return {
               subscriptionSerNo: Number(r.subscription_serno),
               meterSerial: r.meter_serial ?? null,
               nickname: nick,
               kbk: Number.isFinite(kbk as any) ? kbk : null,
+              unitPriceAdjustment: Number.isFinite(upa as any) ? upa : null,
             };
           });
 
@@ -352,6 +361,8 @@ export default function ChartsPage() {
   // 2) Chart data: 12 ay birleştir (current + prev year)
   const chartData = useMemo(() => {
     const kbk = selectedSubObj?.kbk ?? null;
+    // Birim fiyat düzeltmesi (TL/kWh, +/-): (PTF+YEKDEM)*KBK sonrası eklenir. null = 0.
+    const unitPriceAdj = selectedSubObj?.unitPriceAdjustment ?? 0;
 
     const mapByMonth = (rows: RpcRow[]) => {
       const m = new Map<number, RpcRow>();
@@ -371,10 +382,10 @@ export default function ChartsPage() {
       const pYek = p ? (p.yekdem_final_tl_kwh ?? p.yekdem_value_tl_kwh) : null;
 
       const cUnit =
-        kbk != null && c?.ptf_tl_kwh != null && cYek != null ? (c.ptf_tl_kwh + cYek) * kbk : null;
+        kbk != null && c?.ptf_tl_kwh != null && cYek != null ? (c.ptf_tl_kwh + cYek) * kbk + unitPriceAdj : null;
 
       const pUnit =
-        kbk != null && p?.ptf_tl_kwh != null && pYek != null ? (p.ptf_tl_kwh + pYek) * kbk : null;
+        kbk != null && p?.ptf_tl_kwh != null && pYek != null ? (p.ptf_tl_kwh + pYek) * kbk + unitPriceAdj : null;
 
       out.push({
         m: monthNamesShort[m - 1],
@@ -420,7 +431,7 @@ export default function ChartsPage() {
     }
 
     return out;
-  }, [rowsCurr, rowsPrev, selectedSubObj?.kbk]);
+  }, [rowsCurr, rowsPrev, selectedSubObj?.kbk, selectedSubObj?.unitPriceAdjustment]);
 
   return (
     <DashboardShell>

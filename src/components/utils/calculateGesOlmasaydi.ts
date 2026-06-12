@@ -34,6 +34,9 @@ export interface GesOlmasaydiParams {
   mevcutTuketimKwh: number;
   monthlyYekdem: number;
   kbk: number;
+  // Birim fiyat düzeltmesi (TL/kWh, +/-): karşı-olgusal birim fiyata da uygulanır ki
+  // GES'li/GES'siz fatura aynı sözleşme bazında karşılaştırılsın. null/undefined = 0.
+  unitPriceAdjustment?: number | null;
   // Tarife parametreleri
   unitPriceDistribution: number;
   btvRate: number;
@@ -83,8 +86,54 @@ async function fetchAllGesProduction(
   return { data: all, error: null };
 }
 
+/** GES production_daily'den paginated fetch (hourly yoksa fallback). */
+async function fetchAllGesProductionDaily(
+  supabase: SupabaseClient,
+  plantIds: string[],
+  startDate: string, // YYYY-MM-DD (inclusive)
+  endDateExclusive: string, // YYYY-MM-DD (exclusive)
+): Promise<{ data: any[]; error: any }> {
+  const all: any[] = [];
+  let from = 0;
+
+  while (true) {
+    const { data, error } = await supabase
+      .from("ges_production_daily")
+      .select("date, energy_kwh")
+      .in("ges_plant_id", plantIds)
+      .gte("date", startDate)
+      .lt("date", endDateExclusive)
+      .order("date", { ascending: true })
+      .range(from, from + PAGE - 1);
+
+    if (error) return { data: all, error };
+    const batch = data ?? [];
+    all.push(...batch);
+    if (batch.length < PAGE) break;
+    from += PAGE;
+  }
+
+  return { data: all, error: null };
+}
+
 function hourKey(ts: string): number {
   return Math.floor(new Date(ts).getTime() / 3_600_000) * 3_600_000;
+}
+
+// TR günü (UTC+3 sabit) — daily fallback gün-bazlı agregasyonda kullanılır.
+function dayKeyTR(ts: string): string {
+  const trMs = new Date(ts).getTime() + 3 * 3_600_000;
+  return new Date(trMs).toISOString().slice(0, 10);
+}
+
+// periodYear/periodMonth → YYYY-MM-DD ay başı ve bir sonraki ay başı.
+function monthDateBounds(periodYear: number, periodMonth: number) {
+  const mm = String(periodMonth).padStart(2, "0");
+  const startDate = `${periodYear}-${mm}-01`;
+  const nextYear = periodMonth === 12 ? periodYear + 1 : periodYear;
+  const nextMonth = periodMonth === 12 ? 1 : periodMonth + 1;
+  const endDateExclusive = `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`;
+  return { startDate, endDateExclusive };
 }
 
 export async function calculateGesOlmasaydi(
@@ -120,6 +169,23 @@ export async function calculateGesOlmasaydi(
             s + (Number(r.energy_kwh) || 0),
           0,
         );
+      }
+      // Hourly tablosunda bu dönem için satır yoksa daily fallback.
+      if ((gesRes.error || gesRes.data.length === 0)) {
+        const { startDate, endDateExclusive } = monthDateBounds(periodYear, periodMonth);
+        const dailyRes = await fetchAllGesProductionDaily(
+          supabase,
+          plantIds,
+          startDate,
+          endDateExclusive,
+        );
+        if (!dailyRes.error) {
+          totalGesKwh = dailyRes.data.reduce(
+            (s: number, r: { energy_kwh: number | null }) =>
+              s + (Number(r.energy_kwh) || 0),
+            0,
+          );
+        }
       }
     }
 
@@ -192,42 +258,91 @@ export async function calculateGesOlmasaydi(
   ]);
 
   if (gesRes.error || cnRes.error || ptfRes.error) return null;
-  if (gesRes.data.length === 0) return null; // GES verisi yoksa hesaplama yapma
 
-  // 4) GES üretimi saat bazında topla (birden fazla plant olabilir)
-  const gesMap = new Map<number, number>();
-  for (const r of gesRes.data) {
-    const key = hourKey(r.ts);
-    gesMap.set(key, (gesMap.get(key) ?? 0) + (Number(r.energy_kwh) || 0));
-  }
-
-  // 5) PTF map
-  const ptfMap = new Map<number, number>();
-  for (const r of ptfRes.data) {
-    ptfMap.set(hourKey(r.ts), Number(r.ptf_tl_mwh) || 0);
-  }
-
-  // 6) Saat bazında ham tüketim hesapla + PTF ağırlıklı ortalama
   let totalHamKwh = 0;
   let totalGesKwh = 0;
   let hamPtfTl = 0; // Σ(ham_kwh × ptf_TL_per_kWh)
 
-  for (const row of cnRes.data) {
-    const key = hourKey(row.ts);
-    const cn = Number(row.cn) || 0;
-    const gn = Number(row.gn) || 0;
-    const gesKwh = gesMap.get(key) ?? 0;
-    const ptfMwh = ptfMap.get(key);
+  if (gesRes.data.length > 0) {
+    // 4a) Hourly path — GES üretimi saat bazında topla (birden fazla plant olabilir)
+    const gesMap = new Map<number, number>();
+    for (const r of gesRes.data) {
+      const key = hourKey(r.ts);
+      gesMap.set(key, (gesMap.get(key) ?? 0) + (Number(r.energy_kwh) || 0));
+    }
 
-    totalGesKwh += gesKwh;
+    // PTF map
+    const ptfMap = new Map<number, number>();
+    for (const r of ptfRes.data) {
+      ptfMap.set(hourKey(r.ts), Number(r.ptf_tl_mwh) || 0);
+    }
 
-    // Ham tüketim = çekiş + GES üretim - veriş (min 0)
-    const ham = Math.max(0, cn + gesKwh - gn);
-    totalHamKwh += ham;
+    // Saat bazında ham tüketim hesapla + PTF ağırlıklı ortalama
+    for (const row of cnRes.data) {
+      const key = hourKey(row.ts);
+      const cn = Number(row.cn) || 0;
+      const gn = Number(row.gn) || 0;
+      const gesKwh = gesMap.get(key) ?? 0;
+      const ptfMwh = ptfMap.get(key);
 
-    // PTF maliyeti (ham tüketim ağırlıklı)
-    if (ptfMwh != null && ham > 0) {
-      hamPtfTl += ham * (ptfMwh / 1000); // TL/MWh → TL/kWh
+      totalGesKwh += gesKwh;
+
+      // Ham tüketim = çekiş + GES üretim - veriş (min 0)
+      const ham = Math.max(0, cn + gesKwh - gn);
+      totalHamKwh += ham;
+
+      // PTF maliyeti (ham tüketim ağırlıklı)
+      if (ptfMwh != null && ham > 0) {
+        hamPtfTl += ham * (ptfMwh / 1000); // TL/MWh → TL/kWh
+      }
+    }
+  } else {
+    // 4b) Daily fallback — hourly tablosunda bu dönem için satır yok.
+    // ges_production_daily'den günlük üretimi al, consumption + PTF saatlerini
+    // TR-gününe göre agrega et, gün-ağırlıklı PTF ortalaması ile hesapla.
+    const { startDate, endDateExclusive } = monthDateBounds(periodYear, periodMonth);
+    const dailyRes = await fetchAllGesProductionDaily(
+      supabase,
+      plantIds,
+      startDate,
+      endDateExclusive,
+    );
+    if (dailyRes.error || dailyRes.data.length === 0) return null;
+
+    const gesDayMap = new Map<string, number>();
+    for (const r of dailyRes.data) {
+      const k = String(r.date); // PostgreSQL date → "YYYY-MM-DD"
+      gesDayMap.set(k, (gesDayMap.get(k) ?? 0) + (Number(r.energy_kwh) || 0));
+    }
+
+    type DayAgg = { cn: number; gn: number; ptfSum: number; ptfCount: number };
+    const dayMap = new Map<string, DayAgg>();
+    for (const row of cnRes.data) {
+      const k = dayKeyTR(row.ts);
+      const agg = dayMap.get(k) ?? { cn: 0, gn: 0, ptfSum: 0, ptfCount: 0 };
+      agg.cn += Number(row.cn) || 0;
+      agg.gn += Number(row.gn) || 0;
+      dayMap.set(k, agg);
+    }
+    for (const row of ptfRes.data) {
+      const k = dayKeyTR(row.ts);
+      const agg = dayMap.get(k);
+      if (!agg) continue; // consumption olmayan günleri sayma
+      agg.ptfSum += Number(row.ptf_tl_mwh) || 0;
+      agg.ptfCount += 1;
+    }
+
+    for (const [day, agg] of dayMap) {
+      const gesKwh = gesDayMap.get(day) ?? 0;
+      totalGesKwh += gesKwh;
+
+      const ham = Math.max(0, agg.cn + gesKwh - agg.gn);
+      totalHamKwh += ham;
+
+      if (agg.ptfCount > 0 && ham > 0) {
+        const dailyAvgPtfMwh = agg.ptfSum / agg.ptfCount;
+        hamPtfTl += ham * (dailyAvgPtfMwh / 1000);
+      }
     }
   }
 
@@ -237,7 +352,8 @@ export async function calculateGesOlmasaydi(
   const hamWeightedPtf = hamPtfTl / totalHamKwh;
 
   // 8) GES olmasaydı birim fiyat
-  const hamUnitPriceEnergy = (hamWeightedPtf + params.monthlyYekdem) * params.kbk;
+  const hamUnitPriceEnergy =
+    (hamWeightedPtf + params.monthlyYekdem) * params.kbk + (params.unitPriceAdjustment ?? 0);
 
   // 9) GES olmasaydı fatura (veriş = 0, çünkü GES yok)
   const gesOlmasaydiBreakdown = calculateInvoice({
