@@ -1,9 +1,21 @@
+// src/components/dashboard/reports/exportConsumptionVsProductionXlsx.ts
+//
+// "Tüketim ve Üretim Karşılaştırması" raporunun Excel yazım katmanı.
+// PortEco markalı ExcelJS şablonunu (brandedExcel.ts) kullanır; veri
+// hazırlama (fetchConsumptionVsProduction) değişmemiştir.
+//
+// 3 sheet: "Aylık Özet", "Tesis Bazlı Tüketim", "GES Üretim".
+// Dosya adı: tuketim-uretim-karsilastirma_{yıl}_{YYYYMMDD}.xlsx
+
 import { dayjsTR } from "@/lib/dayjs";
 import {
-  downloadXlsxMulti,
-  type XlsxCellValue,
-  type XlsxSheetSpec,
-} from "@/components/utils/xlsx";
+  createBrandedWorkbook,
+  addBrandedSheet,
+  downloadWorkbook,
+  type BrandedCellValue,
+  type BrandedColumn,
+} from "./brandedExcel";
+import type { Workbook } from "exceljs";
 import type {
   ConsumptionVsProductionResult,
   TesisOption,
@@ -32,57 +44,54 @@ const tesisLabel = (t: TesisOption): string => {
 
 const round2 = (v: number): number => Math.round(v * 100) / 100;
 
-const cellNum = (v: number | null): XlsxCellValue =>
-  v === null ? "—" : round2(v);
+const r2OrNull = (v: number | null): number | null =>
+  v === null ? null : round2(v);
 
-// Ay bazlı satırların altına yıllık toplam satırı ekler.
-// Sayısal kolonlar için null olmayanların toplamı; tüm değerler null ise "—".
-const yearlyTotalRow = (
-  label: string,
-  rows: XlsxCellValue[][],
-  numericColIndexes: number[],
-): XlsxCellValue[] => {
-  if (rows.length === 0) return [label];
-  const out: XlsxCellValue[] = new Array(rows[0].length).fill("");
-  out[0] = label;
-  for (const i of numericColIndexes) {
+// Kolon toplamları: satırlardaki (yuvarlanmış) sayıların toplamı;
+// kolonda hiç sayı yoksa null ("—" olarak görünür).
+const totalsFromRows = (
+  rows: Array<Record<string, BrandedCellValue>>,
+  keys: string[],
+): Record<string, BrandedCellValue> => {
+  const out: Record<string, BrandedCellValue> = {};
+  for (const k of keys) {
     let any = false;
     let acc = 0;
-    for (const r of rows) {
-      const v = r[i];
+    for (const row of rows) {
+      const v = row[k];
       if (typeof v === "number") {
         any = true;
         acc += v;
       }
     }
-    out[i] = any ? round2(acc) : "—";
+    out[k] = any ? round2(acc) : null;
   }
   return out;
 };
 
-export function exportConsumptionVsProductionXlsx(
+/**
+ * Workbook'u kurar (indirme tetiklemez). Public export'un dışında ayrıca
+ * doğrulama/test harness'larının gerçek dosya üretebilmesi için ayrıdır.
+ */
+export async function buildConsumptionVsProductionWorkbook(
   result: ConsumptionVsProductionResult,
-): void {
-  const tesisLabels = result.tesisler.map(tesisLabel);
-  const tesislerJoin = tesisLabels.length > 0 ? tesisLabels.join(", ") : "—";
-  const generatedAt = dayjsTR().format("DD.MM.YYYY HH:mm");
-
-  const baseTitle: XlsxCellValue[][] = [
-    ["Tüketim ve Üretim Karşılaştırması"],
-    [`Oluşturulma: ${generatedAt}`],
-    [`Tesisler: ${tesislerJoin}`],
-    [`Dönem: ${result.year}`],
-  ];
+): Promise<Workbook> {
+  const wb = await createBrandedWorkbook({
+    reportTitle: "Tüketim ve Üretim Karşılaştırması",
+    facilities: result.tesisler.map(tesisLabel),
+    period: String(result.year),
+  });
 
   // ---- Sheet 1: Aylık Özet ----
-  const summaryCols = [
-    "Ay",
-    "Toplam Tüketim (kWh)",
-    "Toplam Üretim (kWh)",
-    "Net (Üretim − Tüketim)",
-    "Üretim/Tüketim Oranı (%)",
+  const summaryColumns: BrandedColumn[] = [
+    { header: "Ay", key: "ay", width: 14 },
+    { header: "Toplam Tüketim (kWh)", key: "tuketim", width: 22 },
+    { header: "Toplam Üretim (kWh)", key: "uretim", width: 22 },
+    { header: "Net (Üretim − Tüketim)", key: "net", width: 22 },
+    { header: "Üretim/Tüketim Oranı (%)", key: "oran", width: 24 },
   ];
-  const summaryRows: XlsxCellValue[][] = [];
+
+  const summaryRows: Array<Record<string, BrandedCellValue>> = [];
   for (let m = 0; m < 12; m++) {
     const row = result.monthlySummary[m];
     const cons = row?.consumption_kwh ?? null;
@@ -92,123 +101,131 @@ export function exportConsumptionVsProductionXlsx(
       cons !== null && cons !== 0 && prod !== null
         ? (prod / cons) * 100
         : null;
-    summaryRows.push([
-      MONTH_LABELS_TR[m],
-      cellNum(cons),
-      cellNum(prod),
-      cellNum(net),
-      cellNum(ratio),
-    ]);
-  }
-  summaryRows.push(yearlyTotalRow("Yıllık Toplam", summaryRows, [1, 2, 3]));
-  // Yıllık oran ayrı hesap: yıllık toplam üretim / yıllık toplam tüketim
-  {
-    const lastIdx = summaryRows.length - 1;
-    const tCons = summaryRows[lastIdx][1];
-    const tProd = summaryRows[lastIdx][2];
-    const ratio =
-      typeof tCons === "number" &&
-      tCons !== 0 &&
-      typeof tProd === "number"
-        ? round2((tProd / tCons) * 100)
-        : "—";
-    summaryRows[lastIdx][4] = ratio;
+    summaryRows.push({
+      ay: MONTH_LABELS_TR[m],
+      tuketim: r2OrNull(cons),
+      uretim: r2OrNull(prod),
+      net: r2OrNull(net),
+      oran: r2OrNull(ratio),
+    });
   }
 
-  const summarySheet: XlsxSheetSpec = {
-    name: "Aylık Özet",
-    titleRows: baseTitle,
-    columns: summaryCols,
+  const summaryTotal = totalsFromRows(summaryRows, ["tuketim", "uretim", "net"]);
+  summaryTotal.ay = "Yıllık Toplam";
+  // Yıllık oran toplam DEĞİL yeniden hesap: yıllık üretim / yıllık tüketim.
+  const tCons = summaryTotal.tuketim;
+  const tProd = summaryTotal.uretim;
+  summaryTotal.oran =
+    typeof tCons === "number" && tCons !== 0 && typeof tProd === "number"
+      ? round2((tProd / tCons) * 100)
+      : null;
+
+  addBrandedSheet(wb, {
+    sheetName: "Aylık Özet",
+    columns: summaryColumns,
     rows: summaryRows,
-    colWidths: [12, 22, 22, 22, 24],
-  };
+    totalRow: summaryTotal,
+  });
 
   // ---- Sheet 2: Tesis Bazlı Tüketim ----
-  const consCols = ["Ay", ...tesisLabels, "Toplam"];
-  const consRows: XlsxCellValue[][] = [];
-  for (let m = 0; m < 12; m++) {
-    const perTesis = result.tesisler.map(
-      (t) => result.consumptionByTesis[t.subscriptionSerNo]?.[m] ?? null,
-    );
-    let total: number | null = null;
-    for (const v of perTesis) {
-      if (v === null) continue;
-      total = (total ?? 0) + v;
-    }
-    consRows.push([
-      MONTH_LABELS_TR[m],
-      ...perTesis.map((v) => cellNum(v)),
-      cellNum(total),
-    ]);
-  }
-  const consNumericCols: number[] = [];
-  for (let i = 1; i <= result.tesisler.length + 1; i++) consNumericCols.push(i);
-  consRows.push(yearlyTotalRow("Yıllık Toplam", consRows, consNumericCols));
+  const consColumns: BrandedColumn[] = [
+    { header: "Ay", key: "ay", width: 14 },
+    ...result.tesisler.map((t) => ({
+      header: tesisLabel(t),
+      key: `t${t.subscriptionSerNo}`,
+      width: 22,
+    })),
+    { header: "Toplam", key: "toplam", width: 22 },
+  ];
 
-  const consSheet: XlsxSheetSpec = {
-    name: "Tesis Bazlı Tüketim",
-    titleRows: baseTitle,
-    columns: consCols,
+  const consRows: Array<Record<string, BrandedCellValue>> = [];
+  for (let m = 0; m < 12; m++) {
+    const row: Record<string, BrandedCellValue> = { ay: MONTH_LABELS_TR[m] };
+    let total: number | null = null;
+    for (const t of result.tesisler) {
+      const v = result.consumptionByTesis[t.subscriptionSerNo]?.[m] ?? null;
+      row[`t${t.subscriptionSerNo}`] = r2OrNull(v);
+      if (v !== null) total = (total ?? 0) + v;
+    }
+    row.toplam = r2OrNull(total);
+    consRows.push(row);
+  }
+
+  const consKeys = [
+    ...result.tesisler.map((t) => `t${t.subscriptionSerNo}`),
+    "toplam",
+  ];
+  const consTotal = totalsFromRows(consRows, consKeys);
+  consTotal.ay = "Yıllık Toplam";
+
+  addBrandedSheet(wb, {
+    sheetName: "Tesis Bazlı Tüketim",
+    columns: consColumns,
     rows: consRows,
-    colWidths: [12, ...result.tesisler.map(() => 22), 16],
-  };
+    totalRow: consTotal,
+  });
 
   // ---- Sheet 3: GES Üretim ----
   const hasPlants = result.plantNames.length > 0;
-  const prodTitleRows: XlsxCellValue[][] = hasPlants
-    ? baseTitle
-    : [...baseTitle, ["Bu seçim için GES verisi yok."]];
 
-  const plantLabels = result.plantNames.map((p) => p.label);
-  const prodCols = hasPlants
-    ? ["Ay", ...plantLabels, "Toplam"]
-    : ["Ay", "Toplam"];
+  // Plant id'leri serbest string olduğundan key olarak indeks kullanılır.
+  const prodColumns: BrandedColumn[] = hasPlants
+    ? [
+        { header: "Ay", key: "ay", width: 14 },
+        ...result.plantNames.map((p, i) => ({
+          header: p.label,
+          key: `p${i}`,
+          width: 22,
+        })),
+        { header: "Toplam", key: "toplam", width: 22 },
+      ]
+    : [
+        { header: "Ay", key: "ay", width: 14 },
+        { header: "Toplam", key: "toplam", width: 22 },
+      ];
 
-  const prodRows: XlsxCellValue[][] = [];
+  const prodRows: Array<Record<string, BrandedCellValue>> = [];
   for (let m = 0; m < 12; m++) {
-    if (!hasPlants) {
-      prodRows.push([MONTH_LABELS_TR[m], "—"]);
-      continue;
+    const row: Record<string, BrandedCellValue> = { ay: MONTH_LABELS_TR[m] };
+    if (hasPlants) {
+      let total: number | null = null;
+      result.plantNames.forEach((p, i) => {
+        const v = result.productionByPlant[p.id]?.[m] ?? null;
+        row[`p${i}`] = r2OrNull(v);
+        if (v !== null) total = (total ?? 0) + v;
+      });
+      row.toplam = r2OrNull(total);
+    } else {
+      row.toplam = null;
     }
-    const perPlant = result.plantNames.map(
-      (p) => result.productionByPlant[p.id]?.[m] ?? null,
-    );
-    let total: number | null = null;
-    for (const v of perPlant) {
-      if (v === null) continue;
-      total = (total ?? 0) + v;
-    }
-    prodRows.push([
-      MONTH_LABELS_TR[m],
-      ...perPlant.map((v) => cellNum(v)),
-      cellNum(total),
-    ]);
+    prodRows.push(row);
   }
-  const prodNumericCols: number[] = [];
-  if (hasPlants) {
-    for (let i = 1; i <= result.plantNames.length + 1; i++)
-      prodNumericCols.push(i);
-  } else {
-    prodNumericCols.push(1);
-  }
-  prodRows.push(yearlyTotalRow("Yıllık Toplam", prodRows, prodNumericCols));
 
-  const prodSheet: XlsxSheetSpec = {
-    name: "GES Üretim",
-    titleRows: prodTitleRows,
-    columns: prodCols,
+  const prodKeys = hasPlants
+    ? [...result.plantNames.map((_, i) => `p${i}`), "toplam"]
+    : ["toplam"];
+  const prodTotal = totalsFromRows(prodRows, prodKeys);
+  prodTotal.ay = "Yıllık Toplam";
+
+  addBrandedSheet(wb, {
+    sheetName: "GES Üretim",
+    columns: prodColumns,
     rows: prodRows,
-    colWidths: hasPlants
-      ? [12, ...result.plantNames.map(() => 22), 16]
-      : [12, 16],
-  };
+    totalRow: prodTotal,
+    note: hasPlants ? undefined : "Bu seçim için GES verisi yok.",
+  });
+
+  return wb;
+}
+
+export async function exportConsumptionVsProductionXlsx(
+  result: ConsumptionVsProductionResult,
+): Promise<void> {
+  const wb = await buildConsumptionVsProductionWorkbook(result);
 
   const fileName = `tuketim-uretim-karsilastirma_${result.year}_${dayjsTR().format(
     "YYYYMMDD",
   )}.xlsx`;
 
-  downloadXlsxMulti({
-    sheets: [summarySheet, consSheet, prodSheet],
-    fileName,
-  });
+  await downloadWorkbook(wb, fileName);
 }

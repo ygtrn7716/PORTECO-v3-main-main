@@ -198,12 +198,6 @@ export default function YekdemMahsupDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uid, sessionLoading]);
 
-  const selectedSubLabel = (() => {
-    const s = subs.find((s) => s.subscriptionSerNo === selectedSub);
-    if (!s) return selectedSub != null ? `Tesis ${selectedSub}` : "Tesis seçilmedi";
-    return s.nickname ?? s.title ?? `Tesis ${s.subscriptionSerNo}`;
-  })();
-
   // 1) mahsup hesabı
   useEffect(() => {
     if (sessionLoading) return;
@@ -396,12 +390,6 @@ const mahsupView = useMemo(() => {
               ? `${payload.billingLabel} faturasında kullanılan mahsup hesabı (${payload.mahsupMonthLabel} verileri)`
               : "Mahsup hesabı detayı"}
           </p>
-          {selectedSub && (
-            <p className="mt-1 text-xs text-neutral-500">
-              Seçili tesis:{" "}
-              <span className="font-medium text-neutral-800">{selectedSubLabel}</span>
-            </p>
-          )}
         </div>
 
         <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center sm:justify-end md:w-auto">

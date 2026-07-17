@@ -4,10 +4,20 @@ import { useNavigate, useParams } from "react-router-dom";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { useSession } from "@/hooks/useSession";
 import { supabase } from "@/lib/supabase";
-import { getInvoiceSnapshot, type InvoiceSnapshotRow } from "@/components/utils/invoiceSnapshots";
-import { calculateInvoice, type InvoiceBreakdown, type TariffType } from "@/components/utils/calculateInvoice";
+import {
+  getInvoiceSnapshot,
+  buildSnapshotBreakdown,
+  type InvoiceSnapshotRow,
+} from "@/components/utils/invoiceSnapshots";
+import { type InvoiceBreakdown } from "@/components/utils/calculateInvoice";
+import {
+  fetchInvoiceOverrides,
+  applyReactivePayloadToSnapshot,
+  type InvoiceOverrides,
+} from "@/components/utils/invoiceOverrides";
 import GesUretimSatisiCard from "@/components/dashboard/shared/GesUretimSatisiCard";
 import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
+import { resolveGesSatisDagitimRate } from "@/lib/ges/gesSatisDagitimRate";
 
 const fmtMoney2 = (n: number | null | undefined) =>
   n == null || !Number.isFinite(Number(n))
@@ -37,6 +47,8 @@ export default function InvoiceSnapshotDetail() {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [row, setRow] = useState<InvoiceSnapshotRow | null>(null);
+  // Fatura kalem override'ları (admin müdahaleleri) — recompute + gösterim.
+  const [overrides, setOverrides] = useState<InvoiceOverrides | null>(null);
 
   useEffect(() => {
     if (sessionLoading) return;
@@ -49,18 +61,31 @@ export default function InvoiceSnapshotDetail() {
         setLoading(true);
         setErr(null);
 
-        const data = await getInvoiceSnapshot({
-          userId: uid,
-          subscriptionSerno: sub,
-          periodYear: year,
-          periodMonth: month,
-          invoiceType: "billed",
-        });
+        const [data, ov] = await Promise.all([
+          getInvoiceSnapshot({
+            userId: uid,
+            subscriptionSerno: sub,
+            periodYear: year,
+            periodMonth: month,
+            invoiceType: "billed",
+          }),
+          // Fail-open: sayfa yalnız okur; hata durumunda doğal değerler gösterilir.
+          fetchInvoiceOverrides({
+            userId: uid,
+            subscriptionSerno: sub,
+            periodYear: year,
+            periodMonth: month,
+          }).catch((e) => {
+            console.error("invoice overrides load error (snapshot):", e);
+            return null;
+          }),
+        ]);
 
         if (cancel) return;
         if (!data) throw new Error("Bu dönem için kayıtlı snapshot bulunamadı.");
 
         setRow(data);
+        setOverrides(ov);
       } catch (e: any) {
         if (!cancel) setErr(e?.message ?? "Fatura snapshot detayı yüklenemedi.");
       } finally {
@@ -104,29 +129,41 @@ const yekdemCell = useMemo(() => {
   const liveBreakdown = useMemo<InvoiceBreakdown | null>(() => {
     if (!row) return null;
     try {
-      return calculateInvoice({
-        totalConsumptionKwh: Number(row.total_consumption_kwh ?? 0),
-        unitPriceEnergy: Number(row.unit_price_energy ?? 0),
-        unitPriceDistribution: Number(row.unit_price_distribution ?? 0),
-        btvRate: Number(row.btv_rate ?? 0),
-        vatRate: Number(row.vat_rate ?? 0),
-        tariffType: ((row.tariff_type as TariffType) ?? "single"),
-        contractPowerKw: Number(row.contract_power_kw ?? 0),
-        monthFinalDemandKw: Number(row.month_final_demand_kw ?? 0),
-        powerPrice: Number(row.power_price ?? 0),
-        powerExcessPrice: Number(row.power_excess_price ?? 0),
-        reactivePenaltyCharge: Number(row.reactive_penalty_charge ?? 0),
-        trafoDegeri: Number(row.trafo_degeri ?? 0),
-        totalProductionKwh: Number(row.total_production_kwh ?? 0),
-        onYil: row.on_yil ?? true,
-        perakendeEnerjiBedeli: Number(row.perakende_enerji_bedeli ?? 0),
-        usdKur: Number(row.usd_kur ?? 0),
-        lisansliSatis: (row as any).lisansli_satis ?? false,
-      });
+      // buildSnapshotBreakdown: birebir aynı alan eşlemesi + kalem override desteği
+      // (reaktif payload dahil).
+      return buildSnapshotBreakdown(row, overrides);
     } catch {
       return null;
     }
-  }, [row]);
+  }, [row, overrides]);
+
+  // Efektif (override'lı) enerji birim fiyatı — kart + satır açıklamaları.
+  const effUnitPriceEnergyDisplay = useMemo(() => {
+    if (!row) return null;
+    const o = overrides?.enerji?.unitPriceOverride;
+    if (o != null && Number.isFinite(o)) return o;
+    return row.unit_price_energy != null ? Number(row.unit_price_energy) : null;
+  }, [row, overrides]);
+
+  // Reaktif payload varsa Ri%/Rc% gösterimi efektif değerlerden.
+  const effReactive = useMemo(() => {
+    if (!row) return null;
+    return applyReactivePayloadToSnapshot(
+      {
+        totalConsumptionKwh: Number(row.total_consumption_kwh ?? 0),
+        riPercent: Number(row.reactive_ri_percent ?? 0),
+        rcPercent: Number(row.reactive_rc_percent ?? 0),
+        penalty: Number(row.reactive_penalty_charge ?? 0),
+      },
+      overrides?.reaktif
+    );
+  }, [row, overrides]);
+
+  // Admin tarafından faturadan çıkarılan kalemler — satırları hiç render edilmez.
+  const excludedItems = useMemo(
+    () => new Set<string>(liveBreakdown?.appliedOverrides?.excludedItems ?? []),
+    [liveBreakdown]
+  );
 
   // Eski toplam (mahsup dahil) ile yeni toplamı tutarlı şekilde gösterelim.
   const liveTotalWithMahsup = useMemo(() => {
@@ -152,42 +189,16 @@ const yekdemCell = useMemo(() => {
       return;
     }
 
-    const stored = (row as any).ges_satis_dagitim_bedeli;
-    if (stored != null && Number.isFinite(Number(stored))) {
-      setGesSatisDagitimRate(Number(stored));
-      return;
-    }
-
     let cancel = false;
     (async () => {
-      try {
-        const settingsRes = await supabase
-          .from("subscription_settings")
-          .select("terim, gerilim, tarife, lisansli_satis")
-          .eq("user_id", uid)
-          .eq("subscription_serno", sub)
-          .maybeSingle();
-        if (cancel || !settingsRes.data) return;
-
-        const lisansliSatis =
-          (row as any).lisansli_satis ?? (settingsRes.data as any).lisansli_satis ?? false;
-
-        const tariff = await supabase
-          .from("distribution_tariff_official")
-          .select("dagitim_uretici_1, dagitim_uretici_2")
-          .eq("terim", settingsRes.data.terim)
-          .eq("gerilim", settingsRes.data.gerilim)
-          .eq("tarife", settingsRes.data.tarife)
-          .maybeSingle();
-        if (cancel) return;
-
-        const rate = lisansliSatis
-          ? Number(tariff.data?.dagitim_uretici_1) || 0
-          : Number(tariff.data?.dagitim_uretici_2) || 0;
-        setGesSatisDagitimRate(rate);
-      } catch {
-        if (!cancel) setGesSatisDagitimRate(0);
-      }
+      const rate = await resolveGesSatisDagitimRate({
+        supabase,
+        userId: uid,
+        subscriptionSerno: sub,
+        storedRate: (row as any).ges_satis_dagitim_bedeli,
+        lisansliSatis: (row as any).lisansli_satis,
+      });
+      if (!cancel) setGesSatisDagitimRate(rate);
     })();
 
     return () => {
@@ -249,7 +260,7 @@ const yekdemCell = useMemo(() => {
               <p className="text-xs text-neutral-500 mb-1">Enerji Birim Fiyatı</p>
               <p className="text-sm text-neutral-500">(PTF + YEKDEM) × KBK</p>
               <p className="mt-1 text-xl font-semibold text-neutral-900">
-                {fmtUnit(row.unit_price_energy)} TL/kWh
+                {fmtUnit(effUnitPriceEnergyDisplay)} TL/kWh
               </p>
             </div>
 
@@ -286,57 +297,69 @@ const yekdemCell = useMemo(() => {
                 </thead>
 
                 <tbody>
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">Enerji Bedeli</td>
-                    <td className="py-2 pr-4 text-neutral-600">
-                      {fmtUnit(row.unit_price_energy)} TL/kWh × {fmtKwh(row.total_consumption_kwh)} kWh
-                    </td>
-                    <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.energyCharge ?? row.energy_charge)}</td>
-                  </tr>
+                  {!excludedItems.has("enerji") && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">Enerji Bedeli</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        {fmtUnit(effUnitPriceEnergyDisplay)} TL/kWh × {fmtKwh(row.total_consumption_kwh)} kWh
+                      </td>
+                      <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.energyCharge ?? row.energy_charge)}</td>
+                    </tr>
+                  )}
 
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">Dağıtım Bedeli</td>
-                    <td className="py-2 pr-4 text-neutral-600">
-                      {fmtUnit(liveBreakdown?.effectiveDistributionUnitPrice ?? row.effective_distribution_unit_price ?? row.unit_price_distribution)} TL/kWh × {fmtKwh(liveBreakdown?.distributionChargeKwh ?? (Number(row.total_consumption_kwh ?? 0) - Number(row.veris_kwh ?? 0)))} kWh
-                    </td>
-                    <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.distributionCharge ?? row.distribution_charge)}</td>
-                  </tr>
+                  {!excludedItems.has("dagitim") && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">Dağıtım Bedeli</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        {fmtUnit(liveBreakdown?.effectiveDistributionUnitPrice ?? row.effective_distribution_unit_price ?? row.unit_price_distribution)} TL/kWh × {fmtKwh(liveBreakdown?.distributionChargeKwh ?? (Number(row.total_consumption_kwh ?? 0) - Number(row.veris_kwh ?? 0)))} kWh
+                      </td>
+                      <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.distributionCharge ?? row.distribution_charge)}</td>
+                    </tr>
+                  )}
 
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">BTV (%{((Number(row.btv_rate ?? 0)) * 100).toFixed(2)})</td>
-                    <td className="py-2 pr-4 text-neutral-600">Net enerji bedeli × BTV oranı</td>
-                    <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.btvCharge ?? row.btv_charge)}</td>
-                  </tr>
+                  {!excludedItems.has("btv") && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">BTV (%{((Number(row.btv_rate ?? 0)) * 100).toFixed(2)})</td>
+                      <td className="py-2 pr-4 text-neutral-600">Net enerji bedeli × BTV oranı</td>
+                      <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.btvCharge ?? row.btv_charge)}</td>
+                    </tr>
+                  )}
 
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">Güç Bedeli (Limit içi)</td>
-                    <td className="py-2 pr-4 text-neutral-600">
-                      {row.tariff_type === "dual" ? "Güç bedeli × sözleşme gücü" : "Tek terimde güç bedeli yok"}
-                    </td>
-                    <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.powerBaseCharge ?? row.power_base_charge)}</td>
-                  </tr>
+                  {!excludedItems.has("guc") && (
+                    <>
+                      <tr className="border-b border-neutral-100">
+                        <td className="py-2 pr-4">Güç Bedeli (Limit içi)</td>
+                        <td className="py-2 pr-4 text-neutral-600">
+                          {row.tariff_type === "dual" ? "Güç bedeli × sözleşme gücü" : "Tek terimde güç bedeli yok"}
+                        </td>
+                        <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.powerBaseCharge ?? row.power_base_charge)}</td>
+                      </tr>
 
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">Güç Bedeli Aşım</td>
-                    <td className="py-2 pr-4 text-neutral-600">
-                      {row.tariff_type === "dual" ? "Aşan kısım × aşım birim fiyatı" : "Tek terimde yok"}
-                    </td>
-                    <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.powerExcessCharge ?? row.power_excess_charge)}</td>
-                  </tr>
+                      <tr className="border-b border-neutral-100">
+                        <td className="py-2 pr-4">Güç Bedeli Aşım</td>
+                        <td className="py-2 pr-4 text-neutral-600">
+                          {row.tariff_type === "dual" ? "Aşan kısım × aşım birim fiyatı" : "Tek terimde yok"}
+                        </td>
+                        <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.powerExcessCharge ?? row.power_excess_charge)}</td>
+                      </tr>
+                    </>
+                  )}
 
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">Reaktif Ceza Bedeli</td>
-                    <td className="py-2 pr-4 text-neutral-600">
-                      Ri %{Number(row.reactive_ri_percent ?? 0).toFixed(1)} / Rc %{Number(row.reactive_rc_percent ?? 0).toFixed(1)}
-                    </td>
-                    <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.reactivePenaltyCharge ?? row.reactive_penalty_charge)}</td>
-                  </tr>
+                  {!excludedItems.has("reaktif") && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">Reaktif Ceza Bedeli</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        Ri %{Number(effReactive?.riPercent ?? row.reactive_ri_percent ?? 0).toFixed(1)} / Rc %{Number(effReactive?.rcPercent ?? row.reactive_rc_percent ?? 0).toFixed(1)}
+                      </td>
+                      <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.reactivePenaltyCharge ?? row.reactive_penalty_charge)}</td>
+                    </tr>
+                  )}
 
-                  {Number(row.trafo_degeri ?? 0) > 0 && (
+                  {Number(row.trafo_degeri ?? 0) > 0 && !excludedItems.has("trafo") && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Trafo Bedeli</td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {fmtUnit(row.unit_price_energy)} TL/kWh × {fmtKwh(row.trafo_degeri)} kWh
+                        {fmtUnit(effUnitPriceEnergyDisplay)} TL/kWh × {fmtKwh(row.trafo_degeri)} kWh
                       </td>
                       <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.trafoCharge ?? row.trafo_charge)}</td>
                     </tr>
@@ -348,7 +371,7 @@ const yekdemCell = useMemo(() => {
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4 text-emerald-700">Veriş Mahsup (Birim Fiyat)</td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {fmtUnit(row.unit_price_energy)} TL/kWh × {fmtKwh(Number(liveBreakdown?.verisMahsupKwh ?? 0))} kWh
+                        {fmtUnit(effUnitPriceEnergyDisplay)} TL/kWh × {fmtKwh(Number(liveBreakdown?.verisMahsupKwh ?? 0))} kWh
                       </td>
                       <td className="py-2 pr-4 text-right text-emerald-700">
                         −{fmtMoney2(liveBreakdown?.verisMahsupBedeli)}

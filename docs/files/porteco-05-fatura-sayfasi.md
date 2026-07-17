@@ -4,18 +4,22 @@ Bu doküman, fatura ile ilgili dört bileşeni kapsar: kapanmış ay (`billed`) 
 
 Kaynak dosyalar:
 
-- `src/components/utils/calculateInvoice.ts` (283 satır)
-- `src/components/utils/calculateInvoiceToDate.ts` (621 satır)
-- `src/components/utils/invoiceSnapshots.ts` (266 satır)
+- `src/components/utils/calculateInvoice.ts` (415 satır)
+- `src/components/utils/calculateInvoiceToDate.ts` (717 satır)
+- `src/components/utils/invoiceSnapshots.ts` (314 satır)
 - `src/components/utils/invoiceHistory.ts`
 - `src/components/utils/exportConsumptionXlsx.ts`
 - `src/components/utils/xlsx.ts`
+- `src/components/utils/gesAllocation.ts` — talep birleştirme tahsisi (caller katmanı)
+- `src/components/utils/calculateGesOlmasaydi.ts` — GES Olmasaydı 4 kartlı hesap
+- `src/lib/ges/gesUretimSatisi.ts`, `src/lib/ges/gesSatisDagitimRate.ts`
 - `src/components/dashboard/InvoiceDetail.tsx`
+- `src/components/dashboard/GesOlmasaydiPanel.tsx`, `src/components/dashboard/shared/GesUretimSatisiCard.tsx`
 - `src/pages/InvoiceHistory.tsx`
 - `src/pages/InvoiceSnapshotDetail.tsx`
 - `src/components/dashboard/invoiceDetail/AlternateTariffInvoiceSection.tsx`
 - `src/components/dashboard/GeneratedInvoicesSection.tsx`
-- Migration'lar: `20260403_001_add_distribution_adjustment_to_snapshots.sql`, `20260408_001_add_veris_and_effective_dist_to_snapshots.sql`, `20260410_001_add_perakende_to_tariff.sql`, `20260410_002_add_on_yil_to_settings.sql`, `20260410_003_add_veris_satis_to_snapshots.sql`
+- Migration'lar: `20260403_001_add_distribution_adjustment_to_snapshots.sql`, `20260408_001_add_veris_and_effective_dist_to_snapshots.sql`, `20260410_001_add_perakende_to_tariff.sql`, `20260410_002_add_on_yil_to_settings.sql`, `20260410_003_add_veris_satis_to_snapshots.sql`, `20260504_002_add_usd_kur_to_snapshots.sql`, `20260522_002_add_lisansli_satis_to_snapshots.sql`, `20260602_002_backfill_invoice_snapshots_recompute.sql`, `20260603_001_add_unit_price_adjustment.sql`, `20260603_002_add_ges_satis_dagitim_bedeli.sql`, `20260617_003_add_hourly_net_to_snapshots.sql`, `20260705_002_add_allocated_ges_kwh_to_snapshots.sql`
 
 ## 1. Fatura Türleri
 
@@ -29,14 +33,14 @@ Kaynak dosyalar:
 
 ## 2. `calculateInvoice()` İmzası
 
-`src/components/utils/calculateInvoice.ts:73`. Saf fonksiyondur, herhangi bir Supabase çağrısı yapmaz.
+`src/components/utils/calculateInvoice.ts:98`. Saf fonksiyondur, herhangi bir Supabase çağrısı yapmaz.
 
 ### 2.1 Girdi (`InvoiceInput`)
 
 | Alan | Tip | Birim | Anlam |
 | --- | --- | --- | --- |
 | `totalConsumptionKwh` | `number` | kWh | M-1 (veya cari ay) toplam çekiş tüketimi |
-| `unitPriceEnergy` | `number` | TL/kWh | `(PTF + YEKDEM) × KBK` |
+| `unitPriceEnergy` | `number` | TL/kWh | `(PTF + YEKDEM) × KBK + unit_price_adjustment` (adj caller katmanında eklenir) |
 | `unitPriceDistribution` | `number` | TL/kWh | `distribution_tariff_official.dagitim_bedeli` |
 | `btvRate` | `number` | oran (0.01 vb.) | `tariff.btv / 100`, `btv_enabled` false ise 0 |
 | `vatRate` | `number` | oran (0.20 vb.) | `tariff.kdv / 100` |
@@ -47,9 +51,13 @@ Kaynak dosyalar:
 | `powerExcessPrice` | `number` | TL/kW | `tariff.guc_bedeli_asim` |
 | `reactivePenaltyCharge` | `number?` | TL | Reaktif ceza (KDV öncesi); `Dashboard.tsx` ve InvoiceDetail tarafından önceden hesaplanır |
 | `trafoDegeri` | `number?` | kWh | `subscription_settings.trafo_degeri` (trafo kayıp kWh'ı) |
-| `totalProductionKwh` | `number?` | kWh | M-1 toplam veriş (gn) |
-| `onYil` | `boolean?` | — | `subscription_settings.on_yil` — 10+ yıl lisans (PTF satış); false ise ulusal tarife mahsubu |
-| `perakendeEnerjiBedeli` | `number?` | TL/kWh | `distribution_tariff_official.perakende_enerji_bedeli` |
+| `totalProductionKwh` | `number?` | kWh | M-1 toplam veriş (gn); talep birleştirme varsa tahsis uygulanmış efektif değer |
+| `onYil` | `boolean?` | — | `subscription_settings.on_yil` — 10+ yıl lisans; **yalnızca veriş FAZLASININ satış birim fiyatını** etkiler (USD modu). Varsayılan `false` |
+| `perakendeEnerjiBedeli` | `number?` | TL/kWh | `distribution_tariff_official.perakende_enerji_bedeli` — fazla satışın TL fallback birimi |
+| `usdKur` | `number?` | TL/USD | `subscription_yekdem.usd_kur`; `onYil && usdKur > 0` ise fazla satış birimi `0.133 × usdKur` (`calculateInvoice.ts:44,294-297`) |
+| `lisansliSatis` | `boolean?` | — | `subscription_settings.lisansli_satis`; true ise mahsuplaşma tamamen kapalı, tüm üretim satış (`calculateInvoice.ts:46-50`) |
+| `netPositiveDrawKwh` | `number?` | kWh | `Σ max(0, cn_saat − gn_saat)` — saatlik net çekiş (dağıtım/BTV bazı) |
+| `netExcessFeedKwh` | `number?` | kWh | `Σ max(0, gn_saat − cn_saat)` — saatlik net fazla veriş (satış kWh'ı) |
 
 ### 2.2 Dönüş (`InvoiceBreakdown`)
 
@@ -57,88 +65,115 @@ Kaynak dosyalar:
 | --- | --- | --- | --- |
 | `energyCharge` | `number` | TL | `unitPriceEnergy × totalConsumptionKwh` |
 | `trafoCharge` | `number` | TL | `unitPriceEnergy × trafoKwh` |
-| `distributionBaseKwh` | `number` | kWh | `totalConsumptionKwh + trafoKwh` (çekiş tarafı) |
+| `distributionBaseKwh` | `number` | kWh | Lisanslı: `totalConsumptionKwh`; aksi: `totalConsumptionKwh + trafoKwh` (`calculateInvoice.ts:137-139`) |
 | `verisKwh` | `number` | kWh | `max(0, totalProductionKwh ?? 0)` |
-| `distributionAdjustment` | `number` | TL | netKwh > 0 ise `(unitPriceDistribution / 2) × verisKwh`, aksi 0 |
-| `distributionCharge` | `number` | TL | `cekisCharge − distributionAdjustment` (negatife düşmez) |
-| `distributionChargeKwh` | `number` | kWh | netKwh > 0 ise `netKwh`, aksi `distributionBaseKwh` |
-| `effectiveDistributionUnitPrice` | `number` | TL/kWh | `distributionCharge / netKwh` (netKwh ≤ 0 ise `unitPriceDistribution`) |
-| `netEnergyKwh` | `number` | kWh | `\|totalConsumptionKwh − verisKwh\|` |
+| `distributionAdjustment` | `number` | TL | `cekisCharge − distributionCharge` (dağıtım mahsubu; lisanslıda 0) |
+| `distributionCharge` | `number` | TL | Aşağıdaki iki-durumlu formül; lisanslıda `cekisCharge` |
+| `distributionChargeKwh` | `number` | kWh | Mahsup bazı (`net_positive_draw_kwh` veya aylık fallback); lisanslıda `distributionBaseKwh`, baz 0 ise 0 |
+| `effectiveDistributionUnitPrice` | `number` | TL/kWh | `simplifiedCharge / mahsupBaz`; baz 0 ise 0 (UI'da "—"); lisanslıda `unitPriceDistribution` |
+| `netEnergyKwh` | `number` | kWh | Lisanslı: `totalConsumptionKwh`; saatlik net devrede: `netPositiveDrawKwh`; aksi: `\|totalConsumptionKwh − verisKwh\|` |
 | `netEnergyCharge` | `number` | TL | `unitPriceEnergy × netEnergyKwh` |
-| `btvCharge` | `number` | TL | `(netEnergyCharge + trafoCharge) × btvRate` |
+| `btvCharge` | `number` | TL | Lisanslı: `netEnergyCharge × btvRate`; aksi: `(netEnergyCharge + trafoCharge) × btvRate` |
 | `powerBaseCharge` | `number` | TL | `dual` ise `powerPrice × contractPowerKw`, aksi 0 |
 | `powerExcessCharge` | `number` | TL | `dual && monthFinalDemandKw > contractPowerKw` ise `(monthFinalDemandKw − contractPowerKw) × powerExcessPrice` |
 | `powerTotalCharge` | `number` | TL | `powerBaseCharge + powerExcessCharge` |
 | `reactivePenaltyCharge` | `number` | TL | Girdiden geçer (varsayılan 0) |
-| `verisMahsupKwh` | `number` | kWh | `!onYil && verisKwh > 0` ise `min(verisKwh, totalConsumptionKwh)`, aksi 0 |
-| `verisFazlaKwh` | `number` | kWh | `!onYil && verisKwh > 0` ise `max(0, verisKwh − totalConsumptionKwh)`, aksi 0 |
-| `verisSatisBedeli` | `number` | TL | `(verisMahsupKwh × unitPriceEnergy) + (verisFazlaKwh × perakendeEnerjiBedeli)`, sadece `!onYil` |
-| `subtotalBeforeVat` | `number` | TL | `energyCharge + trafoCharge + distributionCharge + btvCharge + powerTotalCharge + reactivePenaltyCharge − verisSatisBedeli` |
+| `verisMahsupKwh` | `number` | kWh | Lisanslı: 0; saatlik net: `max(0, totalConsumptionKwh − netPositiveDrawKwh)` (saat-içi örtüşme `Σ min(cn,gn)`); aksi: `min(verisKwh, totalConsumptionKwh)` |
+| `verisFazlaKwh` | `number` | kWh | Lisanslı: `verisKwh` (tamamı satış); saatlik net: `netExcessFeedKwh`; aksi: `max(0, verisKwh − totalConsumptionKwh)` |
+| `verisMahsupBedeli` | `number` | TL | `verisMahsupKwh × unitPriceEnergy` — **faturadan düşülen** kısım |
+| `verisFazlaBedeli` | `number` | TL | `verisFazlaKwh × verisFazlaBirim` — faturadan **düşülmez**; ayrı "GES Üretim Satışı" kartında gösterilir |
+| `verisSatisBedeli` | `number` | TL | `verisMahsupBedeli + verisFazlaBedeli` (geriye-uyum/audit; subtotal'a girmez) |
+| `subtotalBeforeVat` | `number` | TL | `energyCharge + trafoCharge + distributionCharge + btvCharge + powerTotalCharge + reactivePenaltyCharge − verisMahsupBedeli` |
 | `vatCharge` | `number` | TL | `subtotalBeforeVat × vatRate` |
 | `totalInvoice` | `number` | TL | `subtotalBeforeVat + vatCharge` (KDV dahil, **YEKDEM mahsup hariç**) |
 
 ### 2.3 Formüller
 
 ```
-energyCharge       = unitPriceEnergy × totalConsumptionKwh
-trafoCharge        = unitPriceEnergy × trafoKwh
-distributionBaseKwh = totalConsumptionKwh + trafoKwh
-verisKwh           = max(0, totalProductionKwh ?? 0)
-cekisCharge        = unitPriceDistribution × distributionBaseKwh
-netKwh             = totalConsumptionKwh − verisKwh
+energyCharge        = unitPriceEnergy × totalConsumptionKwh
+trafoCharge         = unitPriceEnergy × trafoKwh
+distributionBaseKwh = lisansliSatis ? totalConsumptionKwh : totalConsumptionKwh + trafoKwh
+verisKwh            = max(0, totalProductionKwh ?? 0)
+cekisCharge         = unitPriceDistribution × distributionBaseKwh
 
-If netKwh > 0:                                   # Tüketim, üretimden büyük → mahsup uygulanır
-  distributionAdjustment = (unitPriceDistribution / 2) × verisKwh
-  distributionCharge     = cekisCharge − distributionAdjustment
-Else:                                            # Üretim, tüketimden büyük/eşit → mahsup uygulanmaz
-  distributionAdjustment = 0
-  distributionCharge     = cekisCharge
+# Saatlik net gate (calculateInvoice.ts:152-156):
+useHourlyNet = !lisansliSatis && verisKwh > 0
+             && netPositiveDrawKwh != null && netExcessFeedKwh != null
 
-netEnergyKwh    = |netKwh|
+# ── Dağıtım bedeli (calculateInvoice.ts:158-215) ──
+If lisansliSatis:                                # Mahsup yok, tam tarife
+  distributionCharge = cekisCharge ; distributionAdjustment = 0
+Else:
+  mahsupBaz = netPositiveDrawKwh ?? max(0, totalConsumptionKwh − verisKwh)
+  netProducer = verisKwh > totalConsumptionKwh   # sınır (eşitlik) → Case 2
+  verisCharge = unitPriceDistribution × verisKwh
+  simplifiedCharge = netProducer
+    ? cekisCharge / 2                            # CASE 1 — net üretici
+    : cekisCharge − verisCharge / 2              # CASE 2 — net tüketici / sınır
+  If mahsupBaz > 0:                              # birim ÖNCE, tutar = birim × baz
+    effectiveDistributionUnitPrice = simplifiedCharge / mahsupBaz
+    distributionCharge = effectiveDistributionUnitPrice × mahsupBaz
+  Else:                                          # sıfıra bölme guard'ı
+    effectiveDistributionUnitPrice = 0 ; distributionCharge = simplifiedCharge
+  distributionAdjustment = cekisCharge − distributionCharge
+
+# ── BTV (calculateInvoice.ts:217-231) ──
+netEnergyKwh = lisansliSatis ? totalConsumptionKwh
+             : useHourlyNet  ? netPositiveDrawKwh
+             : |totalConsumptionKwh − verisKwh|
 netEnergyCharge = unitPriceEnergy × netEnergyKwh
-btvCharge       = (netEnergyCharge + trafoCharge) × btvRate
+btvCharge = lisansliSatis ? netEnergyCharge × btvRate
+                          : (netEnergyCharge + trafoCharge) × btvRate
 
 If tariffType == "dual":
   powerBaseCharge   = powerPrice × contractPowerKw
   if monthFinalDemandKw > contractPowerKw:
     powerExcessCharge = (monthFinalDemandKw − contractPowerKw) × powerExcessPrice
 
-If !onYil && verisKwh > 0:                       # Veriş satış bedeli (ulusal tarife mahsubu)
-  verisMahsupKwh = min(verisKwh, totalConsumptionKwh)
-  verisFazlaKwh  = max(0, verisKwh − totalConsumptionKwh)
-  verisSatisBedeli = verisMahsupKwh × unitPriceEnergy + verisFazlaKwh × perakendeEnerjiBedeli
+# ── Veriş satış bedeli, iki katman (calculateInvoice.ts:254-303) ──
+verisMahsupKwh = lisansliSatis ? 0
+               : useHourlyNet  ? max(0, totalConsumptionKwh − netPositiveDrawKwh)
+               : verisKwh > 0  ? min(verisKwh, totalConsumptionKwh) : 0
+verisFazlaKwh  = lisansliSatis ? verisKwh
+               : useHourlyNet  ? netExcessFeedKwh
+               : verisKwh > 0  ? max(0, verisKwh − totalConsumptionKwh) : 0
+verisFazlaBirim = (onYil && usdKur > 0) ? 0.133 × usdKur : perakendeEnerjiBedeli
+verisMahsupBedeli = verisMahsupKwh × unitPriceEnergy
+verisFazlaBedeli  = verisFazlaKwh × verisFazlaBirim
+verisSatisBedeli  = verisKwh > 0 ? verisMahsupBedeli + verisFazlaBedeli : 0
 
+# ── Ara toplam + KDV (calculateInvoice.ts:305-321) ──
 subtotalBeforeVat = energyCharge + trafoCharge + distributionCharge + btvCharge
-                  + powerTotalCharge + reactivePenaltyCharge − verisSatisBedeli
+                  + powerTotalCharge + reactivePenaltyCharge − verisMahsupBedeli
 vatCharge         = subtotalBeforeVat × vatRate
 totalInvoice      = subtotalBeforeVat + vatCharge
 ```
 
 > Önemli: `totalInvoice` YEKDEM mahsup ve `diger_degerler` alanlarını **içermez**. Bunlar ayrı eklenir: `totalWithMahsup = totalInvoice + yekdemMahsup + digerDegerler`.
 
-`Dashboard.tsx:134` üzerinde `console.log('[DAGITIM]', { ... })` debug satırı bulunmaktadır; production'a girmeden temizlenmelidir.
+> Faturadan **yalnızca `verisMahsupBedeli` düşülür**; `verisFazlaBedeli` (müşterinin devlete kendi kestiği fatura) toplama girmez, ayrı "GES Üretim Satışı" kartında gösterilir. Böylece fatura eksiye düşmez (`calculateInvoice.ts:305-310`). Dağıtımın aylık, GES satışının saatlik bazda hesaplanması **kasıtlı bir hibrittir** (`calculateInvoice.ts:162-163`).
 
 ## 3. `computeMonthInvoiceToDate()` Pipeline
 
-`src/components/utils/calculateInvoiceToDate.ts:250`. Cari ay (`year`, `month`) için günü gününe fatura tahmini hesaplar. 15 ana adımı vardır.
+`src/components/utils/calculateInvoiceToDate.ts:272`. Cari ay (`year`, `month`) için günü gününe fatura tahmini hesaplar. 15 ana adımı vardır.
 
 | # | Adım | Detay |
 | --- | --- | --- |
 | 1 | Tarih hesabı | `monthStart = m.startOf("month")`, `monthEndExclusive = +1 ay`, ISO formuna çevrilir |
-| 2 | Tesis-özel YEKDEM (`fetchSubYekdemValue`) | `subscription_yekdem.yekdem_value` ile o ayın değeri çekilir; null ise pipeline `null` döner |
+| 2 | Tesis-özel YEKDEM (`fetchSubYekdemValue`) | `subscription_yekdem`'den `yekdem_value` **ve `usd_kur`** çekilir (dönüş `{yekdem_value, usd_kur}`; `monthlyUsdKur` `calculateInvoiceToDate.ts:318`); `yekdem_value` null ise pipeline `null` döner |
 | 3 | PTF cutoff | `epias_ptf_hourly` tablosundan ay içinde **en son** `ts` bulunur (`limit 1, order desc`); satır yoksa `null` döner |
 | 4 | PTF map (`fetchPtfMapToDate`) | `ay başı → cutoff` arası saatlik PTF'ler okunur; kolon `ptf_tl_kwh` yoksa `ptf_tl_mwh / 1000` fallback'i |
 | 5 | Tüketim (`fetchAllConsumption`) | `ts, cn, ri, rc, gn` paginated çekilir, `endInclusive=true` |
 | 6 | PTF eşleşmeyen saatler | `skippedKwh`'a düşer; eşleşenler `billableKwh` ve `sumPtfWeighted`'e eklenir |
 | 7 | Ortalama PTF | `monthlyPTF = sumPtfWeighted / billableKwh` (tüketim ağırlıklı) |
-| 8 | Tesis ayarları | `subscription_settings`'tan `kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil` |
+| 8 | Tesis ayarları | `subscription_settings`'tan `kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis, unit_price_adjustment` (`calculateInvoiceToDate.ts:403`) |
 | 9 | Multiplier + BTV | `owner_subscriptions.multiplier`, `btv_enabled` (`uid` filtresi başarısızsa fallback olarak yalnızca serno) |
-| 10 | Tarife | `distribution_tariff_official` (`dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, perakende_enerji_bedeli`) |
+| 10 | Tarife | `distribution_tariff_official` (`dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, perakende_enerji_bedeli, dagitim_uretici_1, dagitim_uretici_2`, `calculateInvoiceToDate.ts:459`). `dagitimUreticiBedeli = lisansliSatis ? dagitim_uretici_1 : dagitim_uretici_2` (`:472-474`; `on_yil` bu seçimi etkilemez) |
 | 11 | Reaktif ceza | RI %20, RC %15 hard-limit kontrolü; `(riPenaltyEnergy + rcPenaltyEnergy) × reaktif_bedel` |
 | 12 | Demand | `demand_monthly` (`is_final = true`) → `max_demand_kw × multiplier` |
 | 13 | Diger değerler | `subscription_yekdem.diger_degerler` (legacy `(year, month)` öncelikli, yeni `(period_year, period_month)` fallback) |
-| 14 | `calculateInvoice` | Tüm parametrelerle çağrılır |
-| 15 | YEKDEM mahsup (M-1) | `consumption_daily.kwh_in` (öncelik) → `consumption_hourly.cn` (fallback); `subscription_yekdem` (`yekdem_value`, `yekdem_final`); `calculateYekdemMahsup` |
+| 14 | `calculateInvoice` | `unitPriceEnergy = (monthlyPTF + monthlyYekdem) × kbk + unitPriceAdjustment` (`:512`) ve `usdKur: monthlyUsdKur` (`:567`) dahil tüm parametrelerle çağrılır |
+| 15 | YEKDEM mahsup (M-1) | `consumption_daily.kwh_in` (öncelik) → `consumption_hourly.cn` (fallback); `subscription_yekdem` (`yekdem_value`, `yekdem_final`); `calculateYekdemMahsup`. **Lisanslı tesisler mahsup akışına hiç girmez** |
 
 Sonuç tipi `MonthInvoiceToDateResult`:
 
@@ -152,12 +187,13 @@ Sonuç tipi `MonthInvoiceToDateResult`:
 - `breakdown`: tam `InvoiceBreakdown`
 - Mahsup: `hasYekdemMahsup`, `yekdemMahsup`, `yekdemMissing` (`"none" | "value" | "final" | "both"`)
 - `totalWithMahsup`
+- Yeni alanlar: `onYil`, `lisansliSatis`, `perakendeEnerjiBedeli`, `dagitimUreticiBedeli` (GES satış kartının donmuş kesinti oranı kaynağı), `monthlyUsdKur`
 
-`requirePrevMonthMahsup` opsiyonel parametresi `true` ise mahsup yoksa `null` döner; varsayılan `false` (kart "to-date" değerini yine de gösterir).
+`requirePrevMonthMahsup` opsiyonel parametresi `true` ise mahsup yoksa `null` döner; varsayılan `false` (kart "to-date" değerini yine de gösterir). Lisanslı tesislerde bu guard bypass edilir: `if (requirePrevMonthMahsup && !hasYekdemMahsup && !lisansliSatis) return null` (`calculateInvoiceToDate.ts:658`).
 
 ## 4. Snapshot Yazma — `upsertInvoiceSnapshot()`
 
-`src/components/utils/invoiceSnapshots.ts:117`. `invoice_snapshots` tablosuna upsert yapar. Conflict key:
+`src/components/utils/invoiceSnapshots.ts:146`. `invoice_snapshots` tablosuna upsert yapar. Conflict key:
 
 ```
 (user_id, subscription_serno, period_year, period_month, invoice_type)
@@ -169,7 +205,7 @@ Yazılan alanlar (kullanılan SQL kolon adlarıyla):
 user_id, subscription_serno, period_year, period_month,
 invoice_type, month_label,
 total_consumption_kwh,
-unit_price_energy, unit_price_distribution,
+unit_price_energy, unit_price_distribution, unit_price_adjustment,
 btv_rate, vat_rate, tariff_type,
 contract_power_kw, month_final_demand_kw, has_demand_data,
 power_price, power_excess_price,
@@ -182,8 +218,12 @@ trafo_degeri, trafo_charge,
 diger_degerler,
 total_production_kwh,
 distribution_adjustment, veris_kwh, effective_distribution_unit_price,
-on_yil, veris_satis_bedeli, perakende_enerji_bedeli
+on_yil, lisansli_satis, veris_satis_bedeli, perakende_enerji_bedeli,
+usd_kur, ges_satis_dagitim_bedeli,
+net_positive_draw_kwh, net_excess_feed_kwh, allocated_ges_kwh
 ```
+
+Yeni alanların rolleri: `unit_price_adjustment` audit içindir (recompute kullanmaz, `unit_price_energy` zaten final değerdir); `ges_satis_dagitim_bedeli` fatura kesilirkenki dağıtım kesinti oranını dondurur (tarife sonradan değişse bile geçmiş "GES Üretim Satışı" kartı sabit kalır, null = eski snapshot → gösterimde canlı tarife fallback); `allocated_ges_kwh` talep birleştirme tahsis miktarının audit kaydıdır (hesaba girmez); `net_positive_draw_kwh` / `net_excess_feed_kwh` recompute'ta saatlik net formülünü yeniden üretmek için saklanır.
 
 Aynı dönem için yalnızca **bir** satır olur (invoice_type başına): `billed` ve `backdated` ayrı satırlar tutar.
 
@@ -194,19 +234,22 @@ Aynı dönem için yalnızca **bir** satır olur (invoice_type başına): `bille
 
 ## 6. Canlı Yeniden Hesaplama — `recomputeSnapshotTotalWithMahsup()`
 
-`invoiceSnapshots.ts:21`. Eski snapshot'ların `total_with_mahsup` alanını **görmezden** gelip bugünkü `calculateInvoice` formülüyle yeniden hesaplar. Hata varsa fallback olarak depolanan `total_with_mahsup` değeri döner.
+`invoiceSnapshots.ts:55`. Eski snapshot'ların `total_with_mahsup` alanını **görmezden** gelip bugünkü `calculateInvoice` formülüyle yeniden hesaplar; snapshot'taki `usd_kur`, `lisansli_satis`, `net_positive_draw_kwh`, `net_excess_feed_kwh` alanlarını da girdilere geçirir (`invoiceSnapshots.ts:48-51`). Hata varsa fallback olarak depolanan `total_with_mahsup` değeri döner.
 
-Bu yardımcı `Dashboard.tsx` Effect 5 ve Effect 6, `InvoiceDetail.tsx`, `InvoiceHistory.tsx` ve `InvoiceSnapshotDetail.tsx` tarafından kullanılır.
+Bu yardımcı `Dashboard.tsx` Effect 5 ve Effect 6, `InvoiceDetail.tsx`, `InvoiceHistory.tsx`, `InvoiceSnapshotDetail.tsx` ve rapor modülündeki `fetchInvoiceComparison.ts` tarafından kullanılır.
 
-`INVOICE_SNAPSHOT_RECOMPUTE_FIELDS` sabiti (`invoiceSnapshots.ts:56`):
+`INVOICE_SNAPSHOT_RECOMPUTE_FIELDS` sabiti (`invoiceSnapshots.ts:68-69`):
 
 ```
 total_consumption_kwh, unit_price_energy, unit_price_distribution,
 btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw,
 power_price, power_excess_price, reactive_penalty_charge, trafo_degeri,
-total_production_kwh, on_yil, perakende_enerji_bedeli,
+total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli,
+usd_kur, net_positive_draw_kwh, net_excess_feed_kwh,
 yekdem_mahsup, diger_degerler, total_with_mahsup
 ```
+
+> `20260602_002_backfill_invoice_snapshots_recompute.sql`, saklanan `total_with_mahsup` ile canlı recompute arasındaki tarihi sapmayı bir kerelik kapattı: eski `billed` snapshot'ların saklı toplam ve türetilmiş kalemleri güncel formülle yeniden hesaplanıp güncellendi (ham girdiler değişmedi, idempotent). Sebep: grafik saklı değeri okurken kart canlı recompute ediyordu.
 
 Bu metin Supabase select'lerine ekleyerek minimum alanlarla recompute mümkün olur.
 
@@ -218,11 +261,18 @@ Görev: Geçen ay (M-1) için kapanmış faturayı kalem kalem göstermek. Aşa�
 
 - Tarih aralığı ve tesis seçici (TopBar)
 - Birim fiyat satırları: PTF, YEKDEM, KBK, BTV, KDV
-- Hesaplama tablosu: enerji, trafo, dağıtım (mahsup öncesi/sonrası), BTV, güç bedeli, aşım, reaktif ceza, veriş satış bedeli, ara toplam, KDV, toplam, mahsup, diger_degerler, **ödenecek toplam**.
+- Hesaplama tablosu: enerji, trafo, dağıtım (mahsup öncesi/sonrası), BTV, güç bedeli, aşım, reaktif ceza, veriş mahsup düşümü, ara toplam, KDV, toplam, mahsup, diger_degerler, **ödenecek toplam**.
 - "Excel'e aktar" butonu — `exportConsumptionXlsx.ts` kullanır.
 - `AlternateTariffInvoiceSection` (`src/components/dashboard/invoiceDetail/AlternateTariffInvoiceSection.tsx`) — alternatif tarifelerle karşılaştırma; örneğin `dual` tarifeli tesis için `single` simülasyonu.
 
 Veri akışı: `Dashboard.tsx` Effect 5 ile **birebir aynı pipeline**. Tek fark, sayfa kalem kalem dökümle gösterir; Dashboard kartı yalnızca toplamı verir.
+
+**Talep birleştirme entegrasyonu caller katmanındadır**: `calculateInvoice` allocation modülünü import etmez. `InvoiceDetail.tsx:429` civarında `getFacilityAllocation` + `applyAllocationToHourlyRows` çağrılıp efektif `totalGn / netPositiveDrawKwh / netExcessFeedKwh / allocatedGesKwh` üretilir; bu değerler `calculateInvoice` girdilerine ve `upsertInvoiceSnapshot` parametrelerine geçirilir. Aynı desen `Dashboard.tsx`, `GesSavingsSection.tsx`, `EnergySoldCard.tsx` ve `InvoiceSnapshotDetail.tsx`'te tekrarlanır.
+
+### 7.1 GES Üretim Satışı Kartı ve GES Olmasaydı Paneli
+
+- **`GesUretimSatisiCard`** (`src/components/dashboard/shared/GesUretimSatisiCard.tsx`): "Fatura Kalemleri" altında ayrı bir kart; `calculateGesUretimSatisi(...)` (`src/lib/ges/gesUretimSatisi.ts`) sonucunu alır ve brüt gelir / dağıtım kesintisi / net tutarı gösterir (`InvoiceDetail.tsx:1547-1553`). **Bu tutar fatura toplamına girmez** — müşterinin devlete kendi kestiği faturadır. Brüt: USD modunda `satisKwh × 0.133 × usd_kur`, aksi halde `satisKwh × perakende_enerji_bedeli`. Kesinti oranı `lisansli_satis`'a göre `dagitim_uretici_1/2`; snapshot görünümünde `ges_satis_dagitim_bedeli` donmuş oranı, yoksa `resolveGesSatisDagitimRate` canlı fallback'i kullanılır.
+- **`GesOlmasaydiPanel`** (`src/components/dashboard/GesOlmasaydiPanel.tsx`): `calculateGesOlmasaydi(...)` (`InvoiceDetail.tsx:1029`) sonucunu 4 kartla sunar — **1) Mevcut Faturanız** (pass-through), **2) Satılan Enerji** (satış kWh > 0 ise), **3) GES Olmasaydı Faturanız** (karşı-olgu), **4) GES Tasarrufu** (= Kart 3 − Kart 1 + Kart 2). Hesap dört ayrı dala ayrılır: alıcı (receiver), lisanslı satış, arazi GES (`anlik_uretim_kullanimi === false`) ve öz tüketim (behind-the-meter; saatlik + günlük fallback). `subscription_settings.anlik_uretim_kullanimi` **nullable boolean**'dır (üç durum): `null`/`true` → öz tüketim varsayımı, `false` → arazi GES dalı (`20260710_001_add_anlik_uretim_kullanimi.sql`).
 
 ## 8. InvoiceHistory Sayfası
 
@@ -244,6 +294,8 @@ Route: `/dashboard/invoices/:sub/:year/:month` (`src/pages/InvoiceSnapshotDetail
 
 Görev: Belirli bir snapshot satırının tüm kalemlerini göstermek. `getInvoiceSnapshot()` ile satır çekilir, `recomputeSnapshotTotalWithMahsup()` ile mahsup dahil toplam hesaplanır. UI yapısı `InvoiceDetail` ile benzerdir; ama veriler doğrudan snapshot'tan gelir, anlık Supabase pipeline çalışmaz.
 
+Snapshot'ta veriş varsa `GesUretimSatisiCard` da render edilir (`InvoiceSnapshotDetail.tsx:391`); dağıtım kesinti oranı `resolveGesSatisDagitimRate({...})` ile çözülür (`InvoiceSnapshotDetail.tsx:162`): snapshot'taki donmuş `ges_satis_dagitim_bedeli` varsa o, yoksa `subscription_settings.lisansli_satis` + `distribution_tariff_official.dagitim_uretici_1/2` canlı fallback'i.
+
 `AlternateTariffInvoiceSection` ve `GeneratedInvoicesSection` bu sayfada da kullanılabilir.
 
 ## 10. AlternateTariffInvoiceSection
@@ -259,6 +311,8 @@ Görev: Belirli bir snapshot satırının tüm kalemlerini göstermek. `getInvoi
 
 Dosya adı tipik olarak `<tesis>_<ay>_<yıl>.xlsx` formatındadır (örn. `123456789_04_2026.xlsx`).
 
+> Fatura sayfası exportları **SheetJS'te (xlsx paketi) bilinçli olarak bırakılmıştır**. ExcelJS tabanlı markalı export altyapısı (`src/components/dashboard/reports/brandedExcel.ts`) yalnızca Raporlar modülünün 4 raporu için kullanılır (`brandedExcel.ts:4-5` yorumunda bu kapsam açıkça belirtilir); ExcelJS dynamic import ile yüklenir, PORTECO logosu ve markalı şablon (zebra satırlar, toplam satırı, dipnot) uygular.
+
 ## 12. Snapshot Şema Değişiklikleri
 
 `invoice_snapshots` tablosuna 2026 yılında eklenen alanlar:
@@ -271,8 +325,15 @@ Dosya adı tipik olarak `<tesis>_<ay>_<yıl>.xlsx` formatındadır (örn. `12345
 | `20260410_001_add_perakende_to_tariff.sql` | 2026-04-10 | `distribution_tariff_official.perakende_enerji_bedeli` |
 | `20260410_002_add_on_yil_to_settings.sql` | 2026-04-10 | `subscription_settings.on_yil` |
 | `20260410_003_add_veris_satis_to_snapshots.sql` | 2026-04-10 | `veris_mahsup_kwh`, `veris_fazla_kwh`, `veris_satis_bedeli`, `perakende_enerji_bedeli` (snapshot'ta) |
+| `20260504_002_add_usd_kur_to_snapshots.sql` | 2026-05-04 | `usd_kur` — snapshot bütünlüğü için ay kurunun kopyası |
+| `20260522_002_add_lisansli_satis_to_snapshots.sql` | 2026-05-22 | `lisansli_satis` |
+| `20260602_002_backfill_invoice_snapshots_recompute.sql` | 2026-06-02 | (kolon eklemez) eski `billed` snapshot'ları güncel formülle bir kerelik backfill |
+| `20260603_001_add_unit_price_adjustment.sql` | 2026-06-03 | `subscription_settings.unit_price_adjustment` + `invoice_snapshots.unit_price_adjustment` (audit) |
+| `20260603_002_add_ges_satis_dagitim_bedeli.sql` | 2026-06-03 | `ges_satis_dagitim_bedeli` — donmuş dağıtım kesinti oranı |
+| `20260617_003_add_hourly_net_to_snapshots.sql` | 2026-06-17 | `net_positive_draw_kwh`, `net_excess_feed_kwh` + Europe/Istanbul ay sınırıyla `consumption_hourly`'den bir kerelik backfill |
+| `20260705_002_add_allocated_ges_kwh_to_snapshots.sql` | 2026-07-05 | `allocated_ges_kwh` — talep birleştirme tahsis audit'i |
 
-> 2026-04 öncesi snapshot'lar bu alanları içermez; `recomputeSnapshotTotalWithMahsup()` eksik alanları `0` veya varsayılan değerle tamamlayıp güncel formülle hesaplar.
+> 2026-04 öncesi snapshot'lar bu alanları içermez; `recomputeSnapshotTotalWithMahsup()` eksik alanları `0` veya varsayılan değerle tamamlayıp güncel formülle hesaplar. 2026-06-02 backfill'i, eski `billed` satırların saklı toplamlarını da güncel formülle eşitlemiştir.
 
 ## 13. GeneratedInvoicesSection
 
@@ -310,12 +371,17 @@ Dosya adı tipik olarak `<tesis>_<ay>_<yıl>.xlsx` formatındadır (örn. `12345
 - **`total_with_mahsup` saklı değer**: Eski Dashboard sürümleri snapshot'taki `total_with_mahsup` alanını **doğrudan** kullanıyordu. Şu an her okuma `recomputeSnapshotTotalWithMahsup` ile geçirilir. Snapshot'a hâlâ depolanır (geri uyumluluk için), ama gösterilen değer recompute sonucudur.
 - **`fetchAllPtf` paginated** çağrısı 1000+ saatlik veri için zorunlu hale geldi (PostgREST `max_rows` limiti). Eski `computeMonthInvoiceToDate` doğrudan `.from("epias_ptf_hourly")` ile sınırlıydı, şu an sayfalı çekim kullanıyor.
 - **`AlternateTariffInvoiceSection`** önceden ayrı `calculateInvoiceAlt` benzeri bir fonksiyon kullanıyordu. Şu an aynı `calculateInvoice` fonksiyonu farklı parametrelerle çağrılır; çift implementasyon kaldırılmıştır.
+- **Tek-durumlu `/2` dağıtım mahsubu** (`netKwh > 0` ise `adj = (D/2) × veriş`, aksi mahsupsuz) yerini **iki-durumlu kullanıcı-bazlı formüle** bıraktı: net üretici `cekisCharge / 2`, net tüketici `cekisCharge − verisCharge / 2`; birim fiyat önce hesaplanıp saatlik net baz (`net_positive_draw_kwh`) ile çarpılır. Sıfıra bölme guard'ı eklendi.
+- **`verisSatisBedeli`'nin tamamı faturadan düşülüyordu** (fatura eksiye düşebiliyordu). Artık yalnızca `verisMahsupBedeli` düşülür; `verisFazlaBedeli` ayrı "GES Üretim Satışı" kartına taşındı ve fatura toplamına girmez.
+- **`onYil` varsayılanı `true` idi**; artık `false` (`calculateInvoice.ts:265`). Ayrıca `onYil` eskiden veriş satış bedelini tamamen kapatıyordu (`!onYil` şartı); artık yalnızca fazla satışın birim fiyat modunu (USD vs perakende) belirler — mahsup katmanı her tesiste aynıdır.
+- **BTV bazı aylık `|net|` idi**; saatlik net devredeyken BTV bazı `net_positive_draw_kwh` olur, lisanslı tesiste tüketimin tamamıdır ve trafo BTV'ye dahil edilmez.
+- **Eski saat-bazlı PTF satış hesabı** (`EnergySoldCard`'ın verişi saatlik PTF ile fiyatlaması) kaldırıldı; satış geliri artık tek kaynak `calculateGesUretimSatisi` ile (USD modu `0.133 × usd_kur` veya perakende TL) hesaplanır.
 
 ---
 
 ## Son Güncelleme
 
-- **Tarih:** 2026-05-03
+- **Tarih:** 2026-07-12
 - **Branch:** main
-- **Son commit:** `03aa828` — valla bişeler yaptık da hatırlamıyom amk
-- **Kapsanan dosyalar:** `src/components/utils/calculateInvoice.ts`, `src/components/utils/calculateInvoiceToDate.ts`, `src/components/utils/invoiceSnapshots.ts`, `src/components/utils/invoiceHistory.ts`, `src/components/utils/exportConsumptionXlsx.ts`, `src/components/utils/xlsx.ts`, `src/components/dashboard/InvoiceDetail.tsx`, `src/components/dashboard/invoiceDetail/AlternateTariffInvoiceSection.tsx`, `src/components/dashboard/GeneratedInvoicesSection.tsx`, `src/pages/InvoiceHistory.tsx`, `src/pages/InvoiceSnapshotDetail.tsx`, `supabase/migrations/20260403_*.sql`, `20260408_*.sql`, `20260410_*.sql`
+- **Son commit:** `500506c` — commit (çalışma ağacındaki commit edilmemiş değişiklikler dahil belgelendi)
+- **Kapsanan dosyalar:** `src/components/utils/calculateInvoice.ts`, `src/components/utils/calculateInvoiceToDate.ts`, `src/components/utils/invoiceSnapshots.ts`, `src/components/utils/invoiceHistory.ts`, `src/components/utils/exportConsumptionXlsx.ts`, `src/components/utils/xlsx.ts`, `src/components/utils/gesAllocation.ts`, `src/components/utils/calculateGesOlmasaydi.ts`, `src/lib/ges/gesUretimSatisi.ts`, `src/lib/ges/gesSatisDagitimRate.ts`, `src/components/dashboard/InvoiceDetail.tsx`, `src/components/dashboard/GesOlmasaydiPanel.tsx`, `src/components/dashboard/shared/GesUretimSatisiCard.tsx`, `src/components/dashboard/invoiceDetail/AlternateTariffInvoiceSection.tsx`, `src/components/dashboard/GeneratedInvoicesSection.tsx`, `src/pages/InvoiceHistory.tsx`, `src/pages/InvoiceSnapshotDetail.tsx`, `supabase/migrations/20260403_*.sql`, `20260408_*.sql`, `20260410_*.sql`, `20260504_002_*.sql`, `20260522_002_*.sql`, `20260602_002_*.sql`, `20260603_*.sql`, `20260617_003_*.sql`, `20260705_002_*.sql`, `20260710_001_*.sql`

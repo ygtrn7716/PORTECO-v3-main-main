@@ -21,6 +21,10 @@ import { supabase } from "@/lib/supabase";
 import { dayjsTR } from "@/lib/dayjs";
 import { fetchAllConsumption } from "@/lib/paginatedFetch";
 import { getInvoiceSnapshot } from "@/components/utils/invoiceSnapshots";
+import {
+  getFacilityAllocation,
+  applyAllocationToHourlyRows,
+} from "@/components/utils/gesAllocation";
 import { calcYearlySatisHakkiUsage } from "@/components/utils/yearlySatisHakki";
 import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
 
@@ -221,34 +225,60 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
         }
 
         const hourlyData = hourlyRes.data ?? [];
-        if (hourlyData.length === 0) {
+
+        // Saat bazında: toplam çekiş + veriş + saatlik net fazla veriş.
+        let toplamVerisKwh = 0;
+        let toplamCekisKwh = 0;
+        let netExcessFeedKwh = 0; // Σ max(0, gn − cn)
+        for (const hour of hourlyData) {
+          const cnH = Number((hour as any).cn) || 0;
+          const gnH = Number(hour.gn) || 0;
+          toplamCekisKwh += cnH;
+          toplamVerisKwh += gnH;
+          netExcessFeedKwh += Math.max(0, gnH - cnH);
+        }
+
+        // Talep Birleştirme: tahsis/kaynak rolü varsa efektif değerler —
+        // kaynak sayaçta veriş 0 sayılır (kart gizlenir); p1'de satış = havuz
+        // artığı; p2+ tesiste satış 0 (fatura ile birebir).
+        const allocView = await getFacilityAllocation({
+          supabase,
+          userId: uid,
+          subscriptionSerno: selectedSerno,
+          startIso,
+          endIso,
+          endInclusive: true,
+        });
+        if (cancel) return;
+        if (allocView) {
+          const eff = applyAllocationToHourlyRows(hourlyData, allocView);
+          toplamVerisKwh = eff.totalGn;
+          netExcessFeedKwh = eff.netExcessFeedKwh;
+        }
+
+        // Üretimi/tahsisi olmayan tesis (efektif veriş = 0): satış/mahsup yok → gizle.
+        // Not: saatlik satır hiç olmasa bile p1 tesise havuz artığı yazılabilir;
+        // bu yüzden boş-veri kontrolü de bu efektif değer üzerinden yapılır.
+        if (!(toplamVerisKwh > 0)) {
           setError("Seçilen tesiste geçen ay veriş kaydı bulunamadı.");
           setLoading(false);
           return;
         }
 
-        // Saat bazında: toplam çekiş + veriş (sağ kart için satisKwh bölüşümünde kullanılır)
-        let toplamVerisKwh = 0;
-        let toplamCekisKwh = 0;
-        for (const hour of hourlyData) {
-          toplamCekisKwh += Number((hour as any).cn) || 0;
-          toplamVerisKwh += Number(hour.gn) || 0;
-        }
+        // Sağ kart için satış kWh = SAATLİK net fazla veriş (Σ max(0, gn−cn)) —
+        // üretimi olan HER tesiste (net üretici + net tüketici) fatura ile birebir.
+        const satisKwh = netExcessFeedKwh;
 
-        // Sağ kart için satış kWh: net fazla üretim (veriş - çekiş, negatife düşmez).
-        // Mahsup miktarı (sol kart) snapshot'tan ayrı çekiliyor; bu hesabı etkilemez.
-        const satisKwh = Math.max(0, toplamVerisKwh - toplamCekisKwh);
-
-        // Sol kart: fatura ile birebir tutmak için snapshot'tan oku
+        // Sol kart (mahsup) = SAAT-İÇİ öz-tüketim Σ min(cn,gn) = toplam veriş − net fazla veriş.
+        // Fatura'nın verisMahsupKwh'ı ile birebir (aynı consumption_hourly + aynı saatlik netleme;
+        // aylık min(veriş,çekiş) DEĞİL). Enerji birim fiyatı (TL tutarı için) snapshot'tan; snapshot
+        // yoksa sol kart boş kalır.
+        const mahsupKwh = Math.max(0, toplamVerisKwh - netExcessFeedKwh);
         let hasSnapshot = false;
-        let mahsupKwh = 0;
         let unitPriceEnergy = 0;
         let mahsupTutari = 0;
         if (snapshotData) {
           hasSnapshot = true;
-          const snapVeris = Number(snapshotData.veris_kwh) || 0;
-          const snapCekis = Number(snapshotData.total_consumption_kwh) || 0;
-          mahsupKwh = Math.min(snapCekis, snapVeris);
           unitPriceEnergy = Number(snapshotData.unit_price_energy) || 0;
           mahsupTutari = mahsupKwh * unitPriceEnergy;
         }

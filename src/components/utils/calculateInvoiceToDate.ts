@@ -6,6 +6,11 @@ import {
   calculateYekdemMahsup,
 } from "@/components/utils/calculateInvoice";
 import type { InvoiceBreakdown, TariffType } from "@/components/utils/calculateInvoice";
+import {
+  fetchInvoiceOverrides,
+  applyReactiveValueOverrides,
+  resolveUnitPriceOverride,
+} from "@/components/utils/invoiceOverrides";
 import { fetchAllConsumption, fetchAllPtf } from "@/lib/paginatedFetch";
 
 type TariffRow = {
@@ -260,6 +265,13 @@ export type MonthInvoiceToDateResult = {
   yekdemMissing: "none" | "value" | "final" | "both";
 
   totalWithMahsup: number;
+
+  // ── Ay-içi paneli için opsiyonel davranışlar ──
+  isProjected: boolean;            // projectToMonthEnd uygulandı mı
+  projectionFactor: number;        // f = aydakiToplamGun / gecenGun (yoksa 1)
+  projectedConsumptionKwh: number; // billableKwh × f (ay sonu tahmini tüketim)
+  projectedTrafoKwh: number;       // trafoDegeri × f (ay sonu tahmini trafo kaybı)
+  gesMahsupExcluded: boolean;      // GES/veriş kaynaklı mahsup hesaba katılmadı mı
 };
 
 export async function computeMonthInvoiceToDate(params: {
@@ -269,6 +281,15 @@ export async function computeMonthInvoiceToDate(params: {
   year: number;
   month: number; // 1-12
   requirePrevMonthMahsup?: boolean; // default: false (card’ı öldürmesin)
+  // ── ConsumptionDetail (/dashboard/consumption) ay-içi tahmini fatura paneli için ──
+  // GES/veriş kaynaklı mahsubu hesaptan çıkar (veriş kWh = 0 kabul edilir):
+  //  • dağıtımdaki yarı-mahsup (D/2 × veriş) devre dışı → dağıtım tam çekiş üzerinden
+  //  • "GES Üretim Satışı" (veriş satış) kalemi tetiklenmez
+  // NOT: "Önceki Dönem YEKDEM Mahsubu" bundan ETKİLENMEZ (o YEKDEM mahsubu, GES değil).
+  excludeGesMahsup?: boolean; // default: false
+  // Tüketimi ay sonuna projekte et (günlük ortalama × kalan gün). kWh ile çarpılan
+  // tüm kalemler (enerji, dağıtım, trafo, BTV) ve reaktif ceza bu faktörle ölçeklenir.
+  projectToMonthEnd?: boolean; // default: false
 }): Promise<MonthInvoiceToDateResult | null> {
   const {
     supabase,
@@ -277,6 +298,8 @@ export async function computeMonthInvoiceToDate(params: {
     year,
     month,
     requirePrevMonthMahsup = false,
+    excludeGesMahsup = false,
+    projectToMonthEnd = false,
   } = params;
 
   // M (bu ay)
@@ -298,6 +321,18 @@ export async function computeMonthInvoiceToDate(params: {
   if (yekRow.yekdem_value == null) return null;
   const monthlyYekdem = yekRow.yekdem_value;
   const monthlyUsdKur = yekRow.usd_kur ?? 0;
+
+  // Fatura kalem override'ları (cari ay) — admin müdahaleleri to-date tahmine de
+  // yansır. Fail-open: tahmin paneli hiçbir yere yazmaz, hata → doğal değerler.
+  const lineOverrides = await fetchInvoiceOverrides({
+    userId: uid,
+    subscriptionSerno: subscriptionSerNo,
+    periodYear: year,
+    periodMonth: month,
+  }).catch((e) => {
+    console.error("invoice overrides load error (to-date):", e);
+    return null;
+  });
 
   // PTF cutoff (bu ay içinde en son ts)
   const maxPtf = await supabase
@@ -345,6 +380,8 @@ export async function computeMonthInvoiceToDate(params: {
   let totalRi = 0;
   let totalRc = 0;
   let totalGn = 0;
+  let netPositiveDrawKwh = 0; // Σ max(0, cn − gn) — saatlik net pozitif çekiş
+  let netExcessFeedKwh = 0;   // Σ max(0, gn − cn) — saatlik net fazla veriş
 
   for (const row of cons.data ?? []) {
     const cn = num((row as any).cn, 0);
@@ -355,6 +392,9 @@ export async function computeMonthInvoiceToDate(params: {
     totalRi += ri;
     totalRc += rc;
     totalGn += gn;
+    // cn>0 atlamasından ÖNCE birik: yalnız-verişli saatler de net fazla verişe saysın.
+    netPositiveDrawKwh += Math.max(0, cn - gn);
+    netExcessFeedKwh += Math.max(0, gn - cn);
 
     if (!(cn > 0)) continue;
 
@@ -459,12 +499,19 @@ export async function computeMonthInvoiceToDate(params: {
   const REACTIVE_LIMIT_RI = 20;
   const REACTIVE_LIMIT_RC = 15;
 
-  const riPercent = billableKwh > 0 ? (totalRi / billableKwh) * 100 : 0;
-  const rcPercent = billableKwh > 0 ? (totalRc / billableKwh) * 100 : 0;
+  // Payload override'ı varsa Ri/Rc toplamları mutlak değiştirilir.
+  const { riSum: effTotalRi, rcSum: effTotalRc } = applyReactiveValueOverrides(
+    totalRi,
+    totalRc,
+    lineOverrides
+  );
+
+  const riPercent = billableKwh > 0 ? (effTotalRi / billableKwh) * 100 : 0;
+  const rcPercent = billableKwh > 0 ? (effTotalRc / billableKwh) * 100 : 0;
 
   const reactiveUnitPrice = num(t.reaktif_bedel, 0);
-  const riPenaltyEnergy = riPercent > REACTIVE_LIMIT_RI ? totalRi : 0;
-  const rcPenaltyEnergy = rcPercent > REACTIVE_LIMIT_RC ? totalRc : 0;
+  const riPenaltyEnergy = riPercent > REACTIVE_LIMIT_RI ? effTotalRi : 0;
+  const rcPenaltyEnergy = rcPercent > REACTIVE_LIMIT_RC ? effTotalRc : 0;
   const penaltyEnergy = riPenaltyEnergy + rcPenaltyEnergy;
   const reactivePenaltyCharge = penaltyEnergy * reactiveUnitPrice; // KDV öncesi
 
@@ -487,6 +534,16 @@ export async function computeMonthInvoiceToDate(params: {
 
   // unitPriceEnergy (InvoiceDetail ile aynı)
   const unitPriceEnergy = (monthlyPTF + monthlyYekdem) * kbk + unitPriceAdjustment;
+  // Efektif (override'lı) birim fiyatlar — sonuç gösterim alanları için.
+  // calculateInvoice'a DOĞAL fiyatlar geçilir; override içeride uygulanır.
+  const effectiveUnitPriceEnergy = resolveUnitPriceOverride(
+    unitPriceEnergy,
+    lineOverrides?.enerji
+  );
+  const effectiveUnitPriceDistribution = resolveUnitPriceOverride(
+    unitPriceDistribution,
+    lineOverrides?.dagitim
+  );
 
   // diger_degerler (KDV dahil gibi ekleniyor)
   const digerDegerler = await fetchSubDigerDegerler(supabase, {
@@ -496,9 +553,37 @@ export async function computeMonthInvoiceToDate(params: {
     month,
   });
 
+  // ── Ay sonu projeksiyonu (opsiyonel) ──
+  // gecenGun       = bugünün ayın kaçıncı günü (TR, now.getDate())
+  // gunlukOrtalama = billableKwh / gecenGun
+  // tahmini        = billableKwh + (kalanGun × gunlukOrtalama)
+  // f = tahmini / billableKwh = aydakiToplamGun / gecenGun  (matematiksel olarak aynı)
+  // Guard: gecenGun=0 veya billableKwh=0 ise projeksiyon YOK (f=1, ham değer kullanılır).
+  const gecenGun = dayjsTR().date();
+  const aydakiToplamGun = m.daysInMonth();
+  const projectionFactor =
+    projectToMonthEnd && gecenGun > 0 && billableKwh > 0 && aydakiToplamGun > 0
+      ? aydakiToplamGun / gecenGun
+      : 1;
+
+  const projConsumptionKwh = billableKwh * projectionFactor;
+  const projTrafoKwh = trafoDegeri * projectionFactor;
+  // Reaktif ceza: RI/RC oranları (eşik kararı) değişmez; yalnız mutlak tutar f ile ölçeklenir.
+  const projReactivePenaltyCharge = reactivePenaltyCharge * projectionFactor;
+
+  // GES mahsubu hariç tutulacaksa veriş 0 kabul edilir (yarı-mahsup + veriş satış kapanır).
+  // Aksi halde veriş ve saatlik net değerleri de projeksiyon faktörüyle ölçeklenir.
+  const productionForCalc = excludeGesMahsup ? 0 : totalGn * projectionFactor;
+  const netPositiveDrawForCalc = excludeGesMahsup
+    ? undefined
+    : netPositiveDrawKwh * projectionFactor;
+  const netExcessFeedForCalc = excludeGesMahsup
+    ? undefined
+    : netExcessFeedKwh * projectionFactor;
+
   // base invoice (mahsup hariç)
   const breakdown = calculateInvoice({
-    totalConsumptionKwh: billableKwh,
+    totalConsumptionKwh: projConsumptionKwh,
     unitPriceEnergy,
     unitPriceDistribution,
     btvRate,
@@ -508,14 +593,16 @@ export async function computeMonthInvoiceToDate(params: {
     monthFinalDemandKw,
     powerPrice,
     powerExcessPrice,
-    reactivePenaltyCharge,
-    trafoDegeri,
-    totalProductionKwh: totalGn,
+    reactivePenaltyCharge: projReactivePenaltyCharge,
+    trafoDegeri: projTrafoKwh,
+    totalProductionKwh: productionForCalc,
     onYil,
     perakendeEnerjiBedeli,
     usdKur: monthlyUsdKur,
     lisansliSatis,
-  });
+    netPositiveDrawKwh: netPositiveDrawForCalc,
+    netExcessFeedKwh: netExcessFeedForCalc,
+  }, lineOverrides);
 
   // YEKDEM mahsup: M-1 (tam ay)  — InvoiceDetail ile aynı mantık
   // Lisanslı Satış tesisleri mahsup akışına hiç girmez.
@@ -624,8 +711,9 @@ export async function computeMonthInvoiceToDate(params: {
     monthlyUsdKur,
 
     kbk,
-    unitPriceEnergy,
-    unitPriceDistribution,
+    // Gösterim alanları efektif (override'lı) birim fiyatlar.
+    unitPriceEnergy: effectiveUnitPriceEnergy,
+    unitPriceDistribution: effectiveUnitPriceDistribution,
 
     btvRate,
     vatRate,
@@ -635,7 +723,8 @@ export async function computeMonthInvoiceToDate(params: {
     monthFinalDemandKw,
     hasDemandData,
 
-    reactivePenaltyCharge,
+    // Kalem override'ı (amount/exclude) dahil nihai ceza.
+    reactivePenaltyCharge: breakdown.reactivePenaltyCharge,
     reactiveRiPercent: riPercent,
     reactiveRcPercent: rcPercent,
 
@@ -654,5 +743,11 @@ export async function computeMonthInvoiceToDate(params: {
     yekdemMissing,
 
     totalWithMahsup,
+
+    isProjected: projectToMonthEnd,
+    projectionFactor,
+    projectedConsumptionKwh: projConsumptionKwh,
+    projectedTrafoKwh: projTrafoKwh,
+    gesMahsupExcluded: excludeGesMahsup,
   };
 }

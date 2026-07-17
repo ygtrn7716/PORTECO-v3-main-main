@@ -4,6 +4,7 @@ import { dayjsTR } from "@/lib/dayjs";
 import { supabase } from "@/lib/supabase";
 import { useSession } from "@/hooks/useSession";
 import { fetchAllConsumption } from "@/lib/paginatedFetch";
+import SegmentedTabs from "@/components/dashboard/shared/SegmentedTabs";
 
 type Props = {
   subscriptionSerNo: number | null;
@@ -325,34 +326,18 @@ return (
     {displayMode === "toggle" && (
       <div className="flex flex-col gap-5">
         {/* Segmented control */}
-        <div className="inline-flex rounded-lg bg-neutral-100 p-1 self-start w-full sm:w-auto">
-          <button
-            type="button"
-            onClick={() => setActiveTab("cekis")}
-            className={
-              "flex-1 sm:flex-none rounded-md px-4 py-2 text-sm font-medium transition-all " +
-              (activeTab === "cekis"
-                ? "bg-white text-neutral-900 shadow-sm"
-                : "text-neutral-500 hover:text-neutral-700")
-            }
-          >
-            Çekiş Değerleri
-          </button>
-          {hasGes && (
-            <button
-              type="button"
-              onClick={() => setActiveTab("veris")}
-              className={
-                "flex-1 sm:flex-none rounded-md px-4 py-2 text-sm font-medium transition-all " +
-                (activeTab === "veris"
-                  ? "bg-white text-neutral-900 shadow-sm"
-                  : "text-neutral-500 hover:text-neutral-700")
-              }
-            >
-              Veriş Değerleri
-            </button>
-          )}
-        </div>
+        <SegmentedTabs
+          tabs={
+            hasGes
+              ? [
+                  { key: "cekis" as const, label: "Çekiş Değerleri" },
+                  { key: "veris" as const, label: "Veriş Değerleri" },
+                ]
+              : [{ key: "cekis" as const, label: "Çekiş Değerleri" }]
+          }
+          value={activeTab}
+          onChange={setActiveTab}
+        />
 
         {/* Seçili sekmenin kartları */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">

@@ -1,9 +1,15 @@
 // src/components/dashboard/EnergyTable.tsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import dayjs from "dayjs";
+import { ChevronDown } from "lucide-react";
 import { supabase } from "@/lib/supabase";
+import { dayjsTR } from "@/lib/dayjs";
 import { useSession } from "@/hooks/useSession";
 import { fetchHiddenSernos } from "@/lib/subscriptionVisibility";
+import {
+  exportConsumptionHourlyXlsx,
+  exportConsumptionAllTotalsXlsx,
+} from "@/components/utils/exportConsumptionXlsx";
 
 type HourRow = {
   ts: string;
@@ -16,12 +22,22 @@ type HourRow = {
 
 type SubRow = { subscription_serno: number; title: string | null; nickname: string | null };
 
-export default function EnergyTable() {
+// CSV, Excel ve "Daha Fazla" butonları için ortak stil (8px radius, marka #00AEEF focus).
+const BTN_CLS =
+  "h-9 rounded-lg border border-neutral-300 bg-white px-3 text-sm text-neutral-700 hover:bg-neutral-50 focus:outline-none focus:ring-1 focus:ring-[#00AEEF] disabled:opacity-50";
+
+// Seçim controlled: ana "Tesis:" seçici ile ConsumptionDetail üzerinden paylaşılır
+// (biri değişince diğeri de aynı seçimi yansıtır).
+type EnergyTableProps = {
+  selectedSub: "ALL" | number;
+  onSelectedSubChange: (v: "ALL" | number) => void;
+};
+
+export default function EnergyTable({ selectedSub, onSelectedSubChange }: EnergyTableProps) {
   const { session } = useSession();
   const uid = session?.user?.id ?? null;
 
   const [subs, setSubs] = useState<SubRow[]>([]);
-  const [selectedSub, setSelectedSub] = useState<"ALL" | number>("ALL");
 
   const [from, setFrom] = useState<string>(() =>
     dayjs().subtract(7, "day").format("YYYY-MM-DD")
@@ -34,9 +50,14 @@ export default function EnergyTable() {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // xlsx export durumu (CSV hariç tüm xlsx butonları için ortak)
+  const [xlsxBusy, setXlsxBusy] = useState(false);
+
+  // "Daha Fazla" dropdown
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreRef = useRef<HTMLDivElement | null>(null);
+
   const pageSize = 1000;
-  const [page, setPage] = useState(0);
-  const canLoadMore = useMemo(() => rows.length === (page + 1) * pageSize, [rows, page]);
 
   // Sadece kendi tesisatları (RLS zaten filtreliyor) + gizli tesisleri cikar
   useEffect(() => {
@@ -79,7 +100,7 @@ export default function EnergyTable() {
     })();
   }, [uid]);
 
-  async function fetchRows(reset = true) {
+  async function fetchRows() {
     setLoading(true); setErr(null);
 
     let q = supabase
@@ -88,7 +109,7 @@ export default function EnergyTable() {
       .gte("ts", dayjs(from).startOf("day").toISOString())
       .lte("ts", dayjs(to).endOf("day").toISOString())
       .order("ts", { ascending: true })
-      .range(page * pageSize, page * pageSize + pageSize - 1);
+      .limit(pageSize);
 
     if (selectedSub !== "ALL") q = q.eq("subscription_serno", selectedSub);
 
@@ -96,26 +117,35 @@ export default function EnergyTable() {
 
     if (error) {
       setErr(error.message);
-      setRows(reset ? [] : rows);
+      setRows([]);
     } else {
-      setRows(reset ? (data || []) : [...rows, ...(data || [])]);
+      setRows(data || []);
     }
     setLoading(false);
   }
 
   // İlk yükleme & filtre değişimi
   useEffect(() => {
-    setPage(0);
-    fetchRows(true);
+    fetchRows();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [from, to, selectedSub]);
 
-  // Sayfalama: page değişince fetch
+  // Dropdown: dışarı tıkla / Escape ile kapan
   useEffect(() => {
-    if (page === 0) return;
-    fetchRows(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [page]);
+    if (!moreOpen) return;
+    function onDown(e: MouseEvent) {
+      if (moreRef.current && !moreRef.current.contains(e.target as Node)) setMoreOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setMoreOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [moreOpen]);
 
   function downloadCsv() {
     const header = ["Tarih-Saat", "Tesisat", "CN(kWh)", "GN(kWh)", "RI(kvarh)", "RC(kvarh)"];
@@ -135,6 +165,83 @@ export default function EnergyTable() {
     URL.revokeObjectURL(url);
   }
 
+  // Tesis etiketi: dropdown ile birebir aynı format ("serno — ünvan/nickname").
+  function subLabel(serno: number): string {
+    const s = subs.find((x) => x.subscription_serno === serno);
+    const name = s ? (s.nickname ?? s.title) : null;
+    return name ? `${serno} — ${name}` : String(serno);
+  }
+
+  type ExportDisplay = { periodLabel: string; fileStart: string; fileEnd: string };
+
+  // Ortak xlsx export: tek tesis → seçili tesisatın markalı dökümü; "Tümü" → tüm
+  // tesislerin saatlik toplamı tek markalı sayfada.
+  async function exportXlsxForRange(
+    fromIso: string,
+    toExclusiveIso: string,
+    display: ExportDisplay,
+  ) {
+    if (!uid) return;
+    setXlsxBusy(true);
+    setErr(null);
+    try {
+      if (selectedSub !== "ALL") {
+        await exportConsumptionHourlyXlsx({
+          userId: uid,
+          subscriptionSerno: selectedSub,
+          fromIso,
+          toExclusiveIso,
+          facilityLabel: subLabel(selectedSub),
+          ...display,
+        });
+        return;
+      }
+
+      // "Tümü": tüm tesislerin saatlik toplamı tek markalı sayfada.
+      await exportConsumptionAllTotalsXlsx({
+        fromIso,
+        toExclusiveIso,
+        facilities: subs.map((s) => subLabel(s.subscription_serno)),
+        ...display,
+      });
+    } catch (e: any) {
+      console.error("excel export error:", e);
+      setErr(e?.message ?? "Excel çıkartılamadı.");
+    } finally {
+      setXlsxBusy(false);
+    }
+  }
+
+  // [Excel] — CSV ile aynı tesis + aynı tarih aralığı, .xlsx üretir.
+  function handleExcel() {
+    const fromIso = dayjs(from).startOf("day").toISOString();
+    const toExclusiveIso = dayjs(to).add(1, "day").startOf("day").toISOString();
+    void exportXlsxForRange(fromIso, toExclusiveIso, {
+      periodLabel: `${dayjs(from).format("DD.MM.YYYY")} – ${dayjs(to).format("DD.MM.YYYY")}`,
+      fileStart: dayjs(from).format("YYYYMMDD"),
+      fileEnd: dayjs(to).format("YYYYMMDD"),
+    });
+  }
+
+  // [Daha Fazla ▼] — tam dönem (bu ay / geçen ay) xlsx export.
+  function handleMonthExport(range: "curr" | "prev") {
+    setMoreOpen(false);
+    const startD =
+      range === "prev"
+        ? dayjsTR().subtract(1, "month").startOf("month")
+        : dayjsTR().startOf("month");
+    // Çekim penceresi sonu (exclusive) ve gösterim/dosya için dahil edilen son gün.
+    const toExclusiveD =
+      range === "prev" ? dayjsTR().startOf("month") : dayjsTR().add(1, "minute");
+    const endInclusiveD =
+      range === "prev" ? dayjsTR().startOf("month").subtract(1, "day") : dayjsTR();
+    void exportXlsxForRange(startD.toDate().toISOString(), toExclusiveD.toDate().toISOString(), {
+      periodLabel: `${startD.format("DD.MM.YYYY")} – ${endInclusiveD.format("DD.MM.YYYY")}`,
+      fileStart: startD.format("YYYYMMDD"),
+      fileEnd: endInclusiveD.format("YYYYMMDD"),
+    });
+  }
+
   return (
     <section className="w-full">
       {/* Filtreler */}
@@ -146,7 +253,7 @@ export default function EnergyTable() {
             value={selectedSub === "ALL" ? "ALL" : String(selectedSub)}
             onChange={(e) => {
               const v = e.target.value;
-              setSelectedSub(v === "ALL" ? "ALL" : Number(v));
+              onSelectedSubChange(v === "ALL" ? "ALL" : Number(v));
             }}
           >
             <option value="ALL">Tümü</option>
@@ -178,23 +285,70 @@ export default function EnergyTable() {
           />
         </div>
 
-        <div className="flex items-end gap-2">
-          <button
-            className="rounded-xl border px-3 py-2 text-sm"
-            onClick={() => setPage(p => p + 1)}
-            disabled={!canLoadMore || loading}
-            title="Daha fazla getir"
-          >
-            Daha Fazla
-          </button>
-          <button
-            className="rounded-xl border px-3 py-2 text-sm"
-            onClick={downloadCsv}
-            disabled={rows.length === 0}
-            title="CSV indir"
-          >
-            CSV
-          </button>
+        {/* Export buton grubu: [CSV] [Excel] [Daha Fazla ▼] */}
+        <div className="flex items-end">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              className={BTN_CLS}
+              onClick={downloadCsv}
+              disabled={rows.length === 0}
+              title="Görüntülenen veriyi CSV indir"
+            >
+              CSV
+            </button>
+
+            <button
+              type="button"
+              className={BTN_CLS}
+              onClick={handleExcel}
+              disabled={!uid || xlsxBusy}
+              title="Seçili tesis + tarih aralığını Excel (.xlsx) indir"
+            >
+              {xlsxBusy ? "…" : "Excel"}
+            </button>
+
+            <div className="relative" ref={moreRef}>
+              <button
+                type="button"
+                className={BTN_CLS + " inline-flex items-center gap-1"}
+                onClick={() => setMoreOpen((o) => !o)}
+                disabled={!uid || xlsxBusy}
+                aria-haspopup="menu"
+                aria-expanded={moreOpen}
+                title="Tam dönem Excel export"
+              >
+                Daha Fazla
+                <ChevronDown
+                  className={"h-4 w-4 transition-transform duration-200 " + (moreOpen ? "rotate-180" : "")}
+                />
+              </button>
+
+              {moreOpen && (
+                <div
+                  role="menu"
+                  className="absolute right-0 z-10 mt-1 w-52 rounded-lg border border-neutral-200 bg-white py-1 shadow-lg"
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className="block w-full px-3 py-2 text-left text-sm text-neutral-700 hover:bg-neutral-50"
+                    onClick={() => handleMonthExport("curr")}
+                  >
+                    Bu ayı Excel’e çıkart
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className="block w-full px-3 py-2 text-left text-sm text-neutral-700 hover:bg-neutral-50"
+                    onClick={() => handleMonthExport("prev")}
+                  >
+                    Geçen ayı Excel’e çıkart
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       </div>
 

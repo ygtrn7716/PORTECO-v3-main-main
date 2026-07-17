@@ -32,6 +32,8 @@ type SettingsForm = {
   satis_hakki: number | null;
   lisansli_satis: boolean;
   unit_price_adjustment: number | null;
+  // GES Olmasaydı: null/true = behind-the-meter, false = anlık kullanım yok (arazi GES).
+  anlik_uretim_kullanimi: boolean | null;
 };
 
 type YekdemMonth = {
@@ -42,7 +44,20 @@ type YekdemMonth = {
   usd_kur: number | null;
 };
 
-type RightTab = "settings" | "yekdem";
+type RightTab = "settings" | "yekdem" | "kayseri";
+
+// Kayseri OSB ek bedel birim fiyatları (kayseri_ek_bedeller, TL/kWh)
+type KayseriForm = {
+  iletim_bedeli_aktif_tuketim: number | null;
+  osb_dagitim_kullanim_bedeli: number | null;
+  lisanssiz_uretim_cekis_bedeli: number | null;
+};
+
+const EMPTY_KAYSERI: KayseriForm = {
+  iletim_bedeli_aktif_tuketim: null,
+  osb_dagitim_kullanim_bedeli: null,
+  lisanssiz_uretim_cekis_bedeli: null,
+};
 
 const EMPTY_SETTINGS: SettingsForm = {
   kbk: null,
@@ -56,6 +71,7 @@ const EMPTY_SETTINGS: SettingsForm = {
   satis_hakki: null,
   lisansli_satis: false,
   unit_price_adjustment: null,
+  anlik_uretim_kullanimi: null,
 };
 
 const MONTH_NAMES = [
@@ -108,6 +124,12 @@ export default function AdminUsersPage() {
   const [yekdemDraft, setYekdemDraft] = useState<Record<number, Partial<YekdemMonth>>>({});
   const [yekdemSaving, setYekdemSaving] = useState<number | null>(null);
   const [yekdemSaved, setYekdemSaved] = useState<Record<number, "ok" | "err">>({});
+
+  // Kayseri OSB ek bedelleri
+  const [kayseri, setKayseri] = useState<KayseriForm>(EMPTY_KAYSERI);
+  const [kayseriLoading, setKayseriLoading] = useState(false);
+  const [kayseriSaving, setKayseriSaving] = useState(false);
+  const [kayseriMsg, setKayseriMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
   /* ================================================================ */
   /*  Data fetching                                                    */
@@ -208,7 +230,7 @@ export default function AdminUsersPage() {
     (async () => {
       const { data } = await supabase
         .from("subscription_settings")
-        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil, satis_hakki, lisansli_satis, unit_price_adjustment")
+        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil, satis_hakki, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi")
         .eq("user_id", selectedUserId)
         .eq("subscription_serno", selectedSerno)
         .maybeSingle();
@@ -247,6 +269,30 @@ export default function AdminUsersPage() {
     return () => { mounted = false; };
   }, [selectedUserId, selectedSerno, rightTab, yekdemYear]);
 
+  // 5. Load Kayseri ek bedelleri when subscription selected
+  useEffect(() => {
+    if (!selectedUserId || selectedSerno == null) return;
+    if (rightTab !== "kayseri") return;
+    let mounted = true;
+    setKayseriLoading(true);
+    setKayseriMsg(null);
+
+    (async () => {
+      const { data } = await supabase
+        .from("kayseri_ek_bedeller")
+        .select("iletim_bedeli_aktif_tuketim, osb_dagitim_kullanim_bedeli, lisanssiz_uretim_cekis_bedeli")
+        .eq("user_id", selectedUserId)
+        .eq("subscription_serno", selectedSerno)
+        .maybeSingle();
+
+      if (!mounted) return;
+      setKayseri(data ?? { ...EMPTY_KAYSERI });
+      setKayseriLoading(false);
+    })();
+
+    return () => { mounted = false; };
+  }, [selectedUserId, selectedSerno, rightTab]);
+
   /* ================================================================ */
   /*  Save handlers                                                    */
   /* ================================================================ */
@@ -282,6 +328,25 @@ export default function AdminUsersPage() {
       setSettingsMsg({ type: "err", text: msg });
     }
     setSettingsSaving(false);
+  };
+
+  const handleKayseriSave = async () => {
+    if (!selectedUserId || selectedSerno == null) return;
+    setKayseriSaving(true);
+    setKayseriMsg(null);
+
+    try {
+      const { error } = await supabase.from("kayseri_ek_bedeller").upsert(
+        { user_id: selectedUserId, subscription_serno: selectedSerno, ...kayseri },
+        { onConflict: "user_id,subscription_serno" },
+      );
+      if (error) throw error;
+      setKayseriMsg({ type: "ok", text: "Kaydedildi." });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Hata oluştu.";
+      setKayseriMsg({ type: "err", text: msg });
+    }
+    setKayseriSaving(false);
   };
 
   const saveYekdemMonth = async (month: number) => {
@@ -527,6 +592,14 @@ export default function AdminUsersPage() {
                 >
                   YEKDEM
                 </button>
+                <button
+                  onClick={() => setRightTab("kayseri")}
+                  className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
+                    rightTab === "kayseri" ? "bg-black text-white" : "bg-neutral-100 text-neutral-700 hover:bg-neutral-200"
+                  }`}
+                >
+                  Kayseri
+                </button>
               </div>
 
               {/* --------- SETTINGS TAB --------- */}
@@ -688,6 +761,38 @@ export default function AdminUsersPage() {
                       />
                       <span className="text-xs font-medium text-neutral-600">
                         Lisanslı Satış Üretim Tesisi
+                      </span>
+                    </label>
+
+                    {/* GES Anlık Üretim Kullanımı (üç durumlu: NULL / true / false) */}
+                    <label className="block mt-1">
+                      <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                        GES Anlık Üretim Kullanımı
+                      </span>
+                      <select
+                        value={
+                          settings.anlik_uretim_kullanimi == null
+                            ? ""
+                            : settings.anlik_uretim_kullanimi
+                              ? "true"
+                              : "false"
+                        }
+                        onChange={(e) =>
+                          setSettings((p) => ({
+                            ...p,
+                            anlik_uretim_kullanimi:
+                              e.target.value === "" ? null : e.target.value === "true",
+                          }))
+                        }
+                        className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                      >
+                        <option value="">Varsayılan (anlık kullanım var)</option>
+                        <option value="true">Anlık kullanım var (behind-the-meter)</option>
+                        <option value="false">Anlık kullanım yok (arazi GES)</option>
+                      </select>
+                      <span className="mt-1 block text-[10px] text-neutral-400">
+                        "GES Olmasaydı" modülü: "yok" seçilirse ham tüketim = çekiş kabul edilir,
+                        GES olmasaydı fatura veriş mahsubu uygulanmadan hesaplanır.
                       </span>
                     </label>
 
@@ -875,6 +980,94 @@ export default function AdminUsersPage() {
                     >
                       {yekdemSaving === -1 ? "Kaydediliyor..." : "Tümünü Kaydet"}
                     </button>
+                  </div>
+                )
+              )}
+
+              {/* --------- KAYSERİ TAB --------- */}
+              {rightTab === "kayseri" && (
+                kayseriLoading ? (
+                  <div className="space-y-3">
+                    {Array.from({ length: 3 }).map((_, i) => (
+                      <div key={i} className="animate-pulse rounded-lg bg-neutral-100 h-10" />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    <p className="text-xs text-neutral-500">
+                      Kayseri OSB ek bedel birim fiyatları (TL/kWh). Yalnız provider'ı
+                      vhs_kayseri olan tesislerin fatura sayfasında "Ek Bedeller" kartı
+                      olarak kullanılır; boş bırakılan tesiste kart gösterilmez.
+                    </p>
+
+                    <label className="block">
+                      <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                        İletim Bedeli (Aktif Tüketim Payı) — TL/kWh
+                      </span>
+                      <input
+                        type="number"
+                        step="0.0001"
+                        placeholder="0.2400"
+                        value={d(kayseri.iletim_bedeli_aktif_tuketim)}
+                        onChange={(e) =>
+                          setKayseri((p) => ({ ...p, iletim_bedeli_aktif_tuketim: numOrNull(e.target.value) }))
+                        }
+                        className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                      />
+                    </label>
+
+                    <label className="block">
+                      <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                        OSB Dağıtım Sistemi Kullanım Bedeli — TL/kWh
+                      </span>
+                      <input
+                        type="number"
+                        step="0.0001"
+                        placeholder="0.0720"
+                        value={d(kayseri.osb_dagitim_kullanim_bedeli)}
+                        onChange={(e) =>
+                          setKayseri((p) => ({ ...p, osb_dagitim_kullanim_bedeli: numOrNull(e.target.value) }))
+                        }
+                        className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                      />
+                    </label>
+
+                    <label className="block">
+                      <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                        Lisanssız Üretim Çekiş Dağ. Bed. (Sanayi) — TL/kWh
+                      </span>
+                      <input
+                        type="number"
+                        step="0.0001"
+                        placeholder="0.0360"
+                        value={d(kayseri.lisanssiz_uretim_cekis_bedeli)}
+                        onChange={(e) =>
+                          setKayseri((p) => ({ ...p, lisanssiz_uretim_cekis_bedeli: numOrNull(e.target.value) }))
+                        }
+                        className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                      />
+                    </label>
+
+                    {/* Save */}
+                    <button
+                      disabled={kayseriSaving}
+                      onClick={handleKayseriSave}
+                      className="rounded-lg bg-black px-4 py-2 text-sm text-white font-medium disabled:opacity-50 transition-opacity"
+                    >
+                      {kayseriSaving ? "Kaydediliyor..." : "Kaydet"}
+                    </button>
+
+                    {kayseriMsg && (
+                      <div
+                        className={`rounded-xl border p-3 text-sm ${
+                          kayseriMsg.type === "ok"
+                            ? "border-green-200 bg-green-50 text-green-700"
+                            : "border-red-200 bg-red-50 text-red-700"
+                        }`}
+                      >
+                        {kayseriMsg.text}
+                      </div>
+                    )}
                   </div>
                 )
               )}

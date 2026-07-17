@@ -2,6 +2,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useTesisListForReports } from "./useTesisListForReports";
 import { fetchConsumptionVsProduction } from "./fetchConsumptionVsProduction";
 import { exportConsumptionVsProductionXlsx } from "./exportConsumptionVsProductionXlsx";
+import { fetchPtfAnalysis } from "./fetchPtfAnalysis";
+import { exportPtfAnalysisXlsx } from "./exportPtfAnalysisXlsx";
+import { fetchInvoiceComparison } from "./fetchInvoiceComparison";
+import { exportInvoiceComparisonXlsx } from "./exportInvoiceComparisonXlsx";
+import { fetchMahsupPerformance } from "./fetchMahsupPerformance";
+import { exportMahsupPerformanceXlsx } from "./exportMahsupPerformanceXlsx";
 import type { ReportType, ReportTypeMeta, TesisOption } from "./types";
 
 type Props = {
@@ -19,20 +25,20 @@ const REPORT_TYPES: ReportTypeMeta[] = [
   {
     id: "ptf_analysis",
     title: "PTF Analizi",
-    description: "Saatlik PTF değişimini ve tesis bazlı maliyet etkisini görün.",
-    enabled: false,
+    description: "Aylık PTF ortalaması ve tesis bazlı maliyet etkisini görün.",
+    enabled: true,
   },
   {
     id: "invoice_comparison",
     title: "Fatura Karşılaştırması",
     description: "Tesisler arasında ve dönemler arasında fatura kalemleri.",
-    enabled: false,
+    enabled: true,
   },
   {
     id: "settlement_performance",
     title: "Mahsup Performansı",
     description: "YEKDEM mahsup ve net fayda dökümü.",
-    enabled: false,
+    enabled: true,
   },
 ];
 
@@ -73,12 +79,12 @@ export function ReportsSection({ uid, sessionLoading }: Props) {
     return out;
   }, []);
 
-  const canExport =
-    selectedSernos.length > 0 &&
-    !exporting &&
-    reportType === "consumption_vs_production";
+  const canExport = selectedSernos.length > 0 && !exporting;
 
-  const summaryLine = `${selectedSernos.length} tesis seçildi · ${year} · 12 ay`;
+  const activeReport =
+    REPORT_TYPES.find((rt) => rt.id === reportType) ?? REPORT_TYPES[0];
+
+  const summaryLine = `${activeReport.title} · ${selectedSernos.length} tesis · ${year}`;
 
   const handleExport = async () => {
     if (!uid || selectedSernos.length === 0 || exporting) return;
@@ -90,13 +96,32 @@ export function ReportsSection({ uid, sessionLoading }: Props) {
       const selectedTesisler = tesisler.filter((t) =>
         sernoSet.has(t.subscriptionSerNo),
       );
-      const result = await fetchConsumptionVsProduction({
-        uid,
-        selectedTesisler,
-        year,
-        onProgress: (done, total) => setProgress({ done, total }),
-      });
-      exportConsumptionVsProductionXlsx(result);
+      const onProgress = (done: number, total: number) =>
+        setProgress({ done, total });
+      const fetchArgs = { uid, selectedTesisler, year, onProgress };
+
+      switch (reportType) {
+        case "ptf_analysis": {
+          const result = await fetchPtfAnalysis(fetchArgs);
+          await exportPtfAnalysisXlsx(result);
+          break;
+        }
+        case "invoice_comparison": {
+          const result = await fetchInvoiceComparison(fetchArgs);
+          await exportInvoiceComparisonXlsx(result);
+          break;
+        }
+        case "settlement_performance": {
+          const result = await fetchMahsupPerformance(fetchArgs);
+          await exportMahsupPerformanceXlsx(result);
+          break;
+        }
+        default: {
+          const result = await fetchConsumptionVsProduction(fetchArgs);
+          await exportConsumptionVsProductionXlsx(result);
+          break;
+        }
+      }
     } catch (e: any) {
       console.error("Excel export error:", e);
       setExportErr(e?.message ?? "Excel oluşturulamadı.");

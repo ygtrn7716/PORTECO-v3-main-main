@@ -12,7 +12,14 @@ import {
   calculateGesOlmasaydi,
   type GesOlmasaydiResult,
 } from "@/components/utils/calculateGesOlmasaydi";
-import { getInvoiceSnapshot, recomputeSnapshotTotalWithMahsup } from "@/components/utils/invoiceSnapshots";
+import {
+  getInvoiceSnapshot,
+  buildSnapshotBreakdown,
+  recomputeSnapshotTotalWithMahsup,
+} from "@/components/utils/invoiceSnapshots";
+import { fetchInvoiceOverrides } from "@/components/utils/invoiceOverrides";
+import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
+import { resolveGesSatisDagitimRate } from "@/lib/ges/gesSatisDagitimRate";
 import GesSavingsCard from "@/components/dashboard/shared/GesSavingsCard";
 
 interface Props {
@@ -27,6 +34,8 @@ async function fetchYekdemValue(
   year: number,
   month: number,
 ): Promise<number> {
+  let val: number | null = null;
+
   const r1 = await supabase
     .from("subscription_yekdem")
     .select("yekdem_value")
@@ -37,19 +46,39 @@ async function fetchYekdemValue(
     .maybeSingle();
 
   if (!r1.error) {
-    return Number(r1.data?.yekdem_value) || 0;
+    val = r1.data?.yekdem_value != null ? Number(r1.data.yekdem_value) : null;
+  } else {
+    const msg = String(r1.error?.message ?? "");
+    if (msg.includes("period_year") || msg.includes("period_month")) {
+      const r2 = await supabase
+        .from("subscription_yekdem")
+        .select("yekdem_value")
+        .eq("user_id", uid)
+        .eq("subscription_serno", sub)
+        .eq("year", year)
+        .eq("month", month)
+        .maybeSingle();
+      val = r2.data?.yekdem_value != null ? Number(r2.data.yekdem_value) : null;
+    }
   }
-  const msg = String(r1.error?.message ?? "");
-  if (msg.includes("period_year") || msg.includes("period_month")) {
-    const r2 = await supabase
-      .from("subscription_yekdem")
-      .select("yekdem_value")
-      .eq("user_id", uid)
-      .eq("subscription_serno", sub)
+
+  if (val != null) return val || 0;
+
+  // Tesise özel değer yoksa resmi YEKDEM'e düş (InvoiceDetail ile aynı sıra) —
+  // aksi halde Kart 3 iki yüzeyde farklı çıkar. Tablo/satır yoksa 0.
+  try {
+    const off = await supabase
+      .from("yekdem_official")
+      .select("yekdem_value, yekdem_tl_per_kwh")
       .eq("year", year)
       .eq("month", month)
       .maybeSingle();
-    return Number(r2.data?.yekdem_value) || 0;
+    if (!off.error && off.data) {
+      if (off.data.yekdem_value != null) return Number(off.data.yekdem_value) || 0;
+      if (off.data.yekdem_tl_per_kwh != null) return Number(off.data.yekdem_tl_per_kwh) || 0;
+    }
+  } catch {
+    // yekdem_official erişilemiyorsa (lansman DB'de tablo olmayabilir) sessizce 0
   }
   return 0;
 }
@@ -84,7 +113,7 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
         const periodYear = prev.year();
         const periodMonth = prev.month() + 1;
 
-        const [snap, kbkRow, yekdem] = await Promise.all([
+        const [snap, kbkRow, yekdem, plantsRes] = await Promise.all([
           getInvoiceSnapshot({
             userId,
             subscriptionSerno,
@@ -94,11 +123,19 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
           }),
           supabase
             .from("subscription_settings")
-            .select("kbk, lisansli_satis")
+            .select("kbk, lisansli_satis, anlik_uretim_kullanimi")
             .eq("user_id", userId)
             .eq("subscription_serno", subscriptionSerno)
             .maybeSingle(),
           fetchYekdemValue(userId, subscriptionSerno, periodYear, periodMonth),
+          // Bu aboneliğe BAĞLI plant var mı? Yoksa ama mahsup tahsisi varsa
+          // (talep birleştirme alıcısı) modül "receiver" modunda çalışır.
+          supabase
+            .from("ges_plants")
+            .select("id")
+            .eq("user_id", userId)
+            .eq("is_active", true)
+            .eq("linked_serno", subscriptionSerno),
         ]);
 
         if (cancel) return;
@@ -121,6 +158,55 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
         }
 
         const kbk = Number(kbkRow.data?.kbk) || 1;
+        const hasOwnPlants = (plantsRes.data?.length ?? 0) > 0;
+        const allocatedKwh =
+          snap.allocated_ges_kwh != null ? Number(snap.allocated_ges_kwh) : null;
+        const mode =
+          !hasOwnPlants && (allocatedKwh ?? 0) > 0 ? ("receiver" as const) : ("producer" as const);
+
+        // Kart 1/2 girdileri fatura sayfasıyla (InvoiceDetail/InvoiceSnapshotDetail)
+        // aynı kaynaktan: snapshot girdilerinden canlı recompute edilen breakdown.
+        let verisMahsupKwh = 0;
+        let satisKwh = 0;
+        let satisNetGelir = 0;
+        try {
+          const bd = buildSnapshotBreakdown(snap);
+          verisMahsupKwh = bd.verisMahsupKwh;
+          satisKwh = bd.verisFazlaKwh;
+          if (satisKwh > 0) {
+            const dagitimRate = await resolveGesSatisDagitimRate({
+              supabase,
+              userId,
+              subscriptionSerno,
+              storedRate: snap.ges_satis_dagitim_bedeli,
+              lisansliSatis: snap.lisansli_satis,
+            });
+            satisNetGelir = calculateGesUretimSatisi({
+              satisKwh,
+              onYil: snap.on_yil ?? false,
+              usdKur: Number(snap.usd_kur) || 0,
+              perakendeEnerjiBedeli: Number(snap.perakende_enerji_bedeli) || 0,
+              dagitimBedeli: dagitimRate,
+            }).satisNetGelir;
+          }
+        } catch {
+          // recompute başarısızsa (eksik eski snapshot) mahsup/satış alt bilgileri 0 kalır
+        }
+        if (cancel) return;
+
+        // Fatura kalem override'ları — YALNIZ Kart 1'in (Mevcut Faturanız)
+        // recompute'una geçirilir (fatura sayfasıyla birebir eşleşme korunur).
+        // GES karşı-olgu hesabı ve mahsup/satış kWh alanları doğal kalır.
+        const lineOverrides = await fetchInvoiceOverrides({
+          userId,
+          subscriptionSerno,
+          periodYear,
+          periodMonth,
+        }).catch((e) => {
+          console.error("invoice overrides load error (ges savings):", e);
+          return null;
+        });
+        if (cancel) return;
 
         const res = await calculateGesOlmasaydi({
           supabase,
@@ -128,11 +214,21 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
           subscriptionSerno,
           periodYear,
           periodMonth,
-          // Eski snapshot'larda dağıtım bedeli yanlış kayıtlı olabileceği
-          // için canlı recompute ile düzeltilmiş "ödenecek toplam"ı kullanıyoruz.
-          mevcutFatura: recomputeSnapshotTotalWithMahsup(snap),
+          mode,
+          // Canlı okunur (snapshot kolonu gerekmez): fiziksel tesis özelliği;
+          // sonradan düzeltilirse karşı-olgusalın geriye dönük düzelmesi istenir.
+          anlikUretimKullanimi: (kbkRow.data as any)?.anlik_uretim_kullanimi ?? null,
+          // Kart 1 = fatura sayfasındaki Ödenecek Toplam ile birebir
+          // (canlı recompute + kalem override'ları; eski snapshot'larda stored total'a düşer).
+          mevcutFatura: recomputeSnapshotTotalWithMahsup(snap, lineOverrides ?? undefined),
           mevcutBirimFiyat: Number(snap.unit_price_energy) || 0,
           mevcutTuketimKwh: Number(snap.total_consumption_kwh) || 0,
+          verisMahsupKwh,
+          satisKwh,
+          satisNetGelir,
+          yekdemMahsup: Number(snap.yekdem_mahsup) || 0,
+          digerDegerler: Number(snap.diger_degerler) || 0,
+          allocatedKwh,
           monthlyYekdem: yekdem,
           kbk,
           // Snapshot'a yazılan düzeltmeyi kullan → karşı-olgusal birim fiyat,
@@ -141,7 +237,7 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
           unitPriceDistribution: Number(snap.unit_price_distribution) || 0,
           btvRate: Number(snap.btv_rate) || 0,
           vatRate: Number(snap.vat_rate) || 0,
-          tariffType: (snap.tariff_type as any) ?? "tek",
+          tariffType: (snap.tariff_type as any) ?? "single",
           contractPowerKw: Number(snap.contract_power_kw) || 0,
           monthFinalDemandKw: Number(snap.month_final_demand_kw) || 0,
           powerPrice: Number(snap.power_price) || 0,

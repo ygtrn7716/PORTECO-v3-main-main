@@ -18,11 +18,14 @@ const quickLinks = [
   { title: "Reaktif Uyarı Durumları", to: "/dashboard/admin/reactive-alerts" },
   { title: "Bildirim Olayları", to: "/dashboard/admin/notification-events" },
   { title: "EPIAS PTF", to: "/dashboard/admin/epias-ptf" },
+  { title: "Veri Sağlığı", to: "/dashboard/admin/veri-sagligi" },
+  { title: "Fatura Düzenleme", to: "/dashboard/admin/faturalar" },
   { title: "Kaydedilen Faturalar", to: "/dashboard/admin/invoice-snapshots" },
   { title: "Aylık Özet", to: "/dashboard/admin/monthly-overview" },
   { title: "İletişim Mesajları", to: "/dashboard/admin/contact-messages" },
   { title: "Kullanıcı Emailleri", to: "/dashboard/admin/user-emails" },
   { title: "Email Kayıtları", to: "/dashboard/admin/email-logs" },
+  { title: "Finans Takip", to: "/dashboard/admin/finans" },
 ];
 
 type ReactiveRow = {

@@ -1,7 +1,22 @@
 // src/components/utils/calculateGesOlmasaydi.ts
 //
-// GES olmasaydı fatura karşılaştırma hesaplaması.
-// Ham tüketim = çekiş + GES üretim - veriş (saat bazında)
+// GES olmasaydı fatura karşılaştırma hesaplaması — 4 kartlı modelin çekirdeği.
+//
+//  Kart 1 (Mevcut Faturanız)        = caller'dan gelen ödenecek toplam (totalWithMahsup).
+//                                     Fatura sayfasındaki "Genel Toplam (YEKDEM Mahsubu
+//                                     Dahil)" ile birebir aynı — burada YENİDEN HESAPLANMAZ.
+//  Kart 2 (Satılan Enerji Bedeli)   = caller'ın calculateGesUretimSatisi ile hesapladığı
+//                                     net gelir (satisKwh > 0 ise gösterilir).
+//  Kart 3 (GES Olmasaydı Faturanız) = karşı-olgusal fatura. Producer modunda ham tüketim
+//                                     (= çekiş + GES üretim − veriş, saat bazında) üzerinden
+//                                     GES'siz birim fiyatla; receiver modunda mevcut girdilerle
+//                                     ama mahsup tahsisi sıfırlanarak hesaplanır. Kart 1 ile
+//                                     simetri için YEKDEM mahsubu + diğer bedeller eklenir.
+//  Kart 4 (GES Tasarrufu)           = Kart 3 − Kart 1 + Kart 2.
+//
+// mode = "receiver": Talep Birleştirme ile mahsup ALAN, kendi üretimi olmayan tesis.
+// Üretim/veriş verisi yok → DB fetch yapılmaz; ham tüketim = çekiş kabul edilir ve
+// "GES olmasaydı fatura" = tahsis uygulanmadan yeniden çalıştırılan fatura motoru.
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { fetchAllConsumption, fetchAllPtf } from "@/lib/paginatedFetch";
@@ -9,15 +24,25 @@ import { calculateInvoice, type InvoiceBreakdown, type TariffType } from "./calc
 
 const PAGE = 1000;
 
+export type GesOlmasaydiMode = "producer" | "receiver";
+
 export interface GesOlmasaydiResult {
-  hamTuketimKwh: number;
+  mode: GesOlmasaydiMode;
+  /** false = üretim anlık tüketimi beslemiyor (arazi GES): ham tüketim = çekiş,
+   *  karşı-olgusal = mahsupsuz fatura. UI'ın DETAY varyant anahtarı. */
+  anlikUretimKullanimi: boolean;
+  hamTuketimKwh: number;      // receiver / anlık-kullanımsız: = mevcutTuketimKwh
   mevcutTuketimKwh: number;
-  gesUretimKwh: number;
-  gesOlmasaydiFatura: number;
-  mevcutFatura: number;
-  tasarruf: number;
-  tasarrufYuzde: number;
-  hamBirimFiyat: number;
+  gesUretimKwh: number;       // receiver: 0
+  verisMahsupKwh: number;     // Kart 1 alt metni (uygulanan mahsup)
+  allocatedKwh: number | null; // receiver DETAY satırı (tahsis edilen mahsup)
+  /** Kart 2 — satış yoksa null → kart render edilmez. */
+  satis: { satisKwh: number; satisNetGelir: number } | null;
+  gesOlmasaydiFatura: number; // Kart 3 = breakdown.totalInvoice + yekdemMahsup + digerDegerler
+  mevcutFatura: number;       // Kart 1 (pass-through)
+  tasarruf: number;           // Kart 4 = gesOlmasaydiFatura − mevcutFatura + satisNetGelir
+  tasarrufYuzde: number;      // tasarruf / gesOlmasaydiFatura × 100
+  hamBirimFiyat: number;      // receiver: = mevcutBirimFiyat
   mevcutBirimFiyat: number;
   gesOlmasaydiBreakdown: InvoiceBreakdown;
 }
@@ -28,10 +53,28 @@ export interface GesOlmasaydiParams {
   subscriptionSerno: number;
   periodYear: number;
   periodMonth: number;
-  // Mevcut fatura hesabından gelen değerler (yeniden sorgulamayı önlemek için)
+  /** default "producer". "receiver" = talep birleştirme ile mahsup alan üretimsiz tesis. */
+  mode?: GesOlmasaydiMode;
+  /** subscription_settings.anlik_uretim_kullanimi: null/undefined/true = behind-the-meter
+   *  (mevcut davranış). false = üretim anlık tüketimi beslemez (arazi GES): ham tüketim =
+   *  çekiş; karşı-olgusal fatura mahsupsuz + dağıtım düzeltmesiz hesaplanır. */
+  anlikUretimKullanimi?: boolean | null;
+  // Mevcut fatura hesabından gelen değerler (yeniden sorgulamayı önlemek için).
+  // mevcutFatura = ÖDENECEK TOPLAM (totalWithMahsup) — fatura sayfasıyla birebir.
   mevcutFatura: number;
   mevcutBirimFiyat: number;
   mevcutTuketimKwh: number;
+  /** breakdown.verisMahsupKwh — Kart 1 alt metni. */
+  verisMahsupKwh: number;
+  /** Kart 2 girdileri — caller calculateGesUretimSatisi ile hesaplar; 0/undefined → kart yok. */
+  satisKwh?: number;
+  satisNetGelir?: number;
+  /** Kart 3 simetrisi: mevcut faturadaki YEKDEM mahsubu + diğer bedeller karşı-olgusal
+   *  faturaya da eklenir → Kart 4 = Kart 3 − Kart 1 + Kart 2 ekranda birebir tutar. */
+  yekdemMahsup?: number;
+  digerDegerler?: number;
+  /** Talep Birleştirme: bu faturaya tahsis edilen mahsup kWh (receiver DETAY satırı). */
+  allocatedKwh?: number | null;
   monthlyYekdem: number;
   kbk: number;
   // Birim fiyat düzeltmesi (TL/kWh, +/-): karşı-olgusal birim fiyata da uygulanır ki
@@ -52,8 +95,54 @@ export interface GesOlmasaydiParams {
   onYil?: boolean;
   perakendeEnerjiBedeli?: number;
   // Lisanslı Satış: true ise GES tüketim faturasını etkilemez; tasarruf =
-  // satılan enerjinin geliri olarak ortaya çıkar (gesOlmasaydiFatura - mevcut).
+  // satılan enerjinin net geliri olarak ortaya çıkar.
   lisansliSatis?: boolean;
+}
+
+/** Tasarruf formülü TEK yerde: tüm modlar bu montajdan geçer. */
+function assembleResult(args: {
+  params: GesOlmasaydiParams;
+  mode: GesOlmasaydiMode;
+  breakdown: InvoiceBreakdown;
+  hamTuketimKwh: number;
+  gesUretimKwh: number;
+  hamBirimFiyat: number;
+  anlikUretimKullanimi?: boolean; // default true (behind-the-meter)
+}): GesOlmasaydiResult {
+  const { params, mode, breakdown } = args;
+
+  const gesOlmasaydiFatura =
+    breakdown.totalInvoice + (params.yekdemMahsup ?? 0) + (params.digerDegerler ?? 0);
+
+  const satisKwh = params.satisKwh ?? 0;
+  const satis =
+    satisKwh > 0
+      ? { satisKwh, satisNetGelir: params.satisNetGelir ?? 0 }
+      : null;
+
+  // Tasarruf = GES Olmasaydı Faturanız − Mevcut Fatura + Satılan Enerji Net Geliri.
+  // Fatura ile satış gelirinin birbirini götürmesinin her iki yönünü de kapsar.
+  const tasarruf = gesOlmasaydiFatura - params.mevcutFatura + (satis?.satisNetGelir ?? 0);
+  const tasarrufYuzde =
+    gesOlmasaydiFatura > 0 ? (tasarruf / gesOlmasaydiFatura) * 100 : 0;
+
+  return {
+    mode,
+    anlikUretimKullanimi: args.anlikUretimKullanimi ?? true,
+    hamTuketimKwh: args.hamTuketimKwh,
+    mevcutTuketimKwh: params.mevcutTuketimKwh,
+    gesUretimKwh: args.gesUretimKwh,
+    verisMahsupKwh: params.verisMahsupKwh,
+    allocatedKwh: params.allocatedKwh ?? null,
+    satis,
+    gesOlmasaydiFatura,
+    mevcutFatura: params.mevcutFatura,
+    tasarruf,
+    tasarrufYuzde,
+    hamBirimFiyat: args.hamBirimFiyat,
+    mevcutBirimFiyat: params.mevcutBirimFiyat,
+    gesOlmasaydiBreakdown: breakdown,
+  };
 }
 
 /** GES production_hourly'den paginated fetch */
@@ -116,6 +205,45 @@ async function fetchAllGesProductionDaily(
   return { data: all, error: null };
 }
 
+/** Dönem toplam GES üretimi (kWh) — DETAY satırı için. Hourly tablo öncelikli,
+ *  satır yoksa/hata varsa daily fallback; ikisi de yoksa 0 (hesabı engellemez). */
+async function fetchTotalGesProductionKwh(
+  supabase: SupabaseClient,
+  plantIds: string[],
+  periodYear: number,
+  periodMonth: number,
+): Promise<number> {
+  const start = new Date(periodYear, periodMonth - 1, 1);
+  const end = new Date(periodYear, periodMonth, 1);
+  const gesRes = await fetchAllGesProduction(
+    supabase,
+    plantIds,
+    start.toISOString(),
+    end.toISOString(),
+  );
+  if (!gesRes.error && gesRes.data.length > 0) {
+    return gesRes.data.reduce(
+      (s: number, r: { energy_kwh: number | null }) => s + (Number(r.energy_kwh) || 0),
+      0,
+    );
+  }
+
+  const { startDate, endDateExclusive } = monthDateBounds(periodYear, periodMonth);
+  const dailyRes = await fetchAllGesProductionDaily(
+    supabase,
+    plantIds,
+    startDate,
+    endDateExclusive,
+  );
+  if (!dailyRes.error) {
+    return dailyRes.data.reduce(
+      (s: number, r: { energy_kwh: number | null }) => s + (Number(r.energy_kwh) || 0),
+      0,
+    );
+  }
+  return 0;
+}
+
 function hourKey(ts: string): number {
   return Math.floor(new Date(ts).getTime() / 3_600_000) * 3_600_000;
 }
@@ -141,9 +269,41 @@ export async function calculateGesOlmasaydi(
 ): Promise<GesOlmasaydiResult | null> {
   const { supabase, userId, subscriptionSerno, periodYear, periodMonth } = params;
 
-  // Lisanslı Satış: GES tüketim faturasını etkilemez. "GES olmasaydı fatura"
-  // = mevcut tüketim faturası (satış indirimi yokken). Tasarruf doğal olarak
-  // satılan enerjinin geliri (×KDV) olarak hesaplanır.
+  // ── Receiver modu: Talep Birleştirme ile mahsup alan üretimsiz tesis ──────
+  // Üretim/veriş yok → ham tüketim = çekiş; DB fetch gerekmez. "GES olmasaydı
+  // fatura" = tahsis SIFIRLANARAK yeniden çalıştırılan fatura motoru (Veriş
+  // Mahsup kalemiyle birlikte dağıtım D/2 avantajı ve BTV etkisi de kalkar).
+  if (params.mode === "receiver") {
+    const breakdown = calculateInvoice({
+      totalConsumptionKwh: params.mevcutTuketimKwh,
+      unitPriceEnergy: params.mevcutBirimFiyat,
+      unitPriceDistribution: params.unitPriceDistribution,
+      btvRate: params.btvRate,
+      vatRate: params.vatRate,
+      tariffType: params.tariffType,
+      contractPowerKw: params.contractPowerKw,
+      monthFinalDemandKw: params.monthFinalDemandKw,
+      powerPrice: params.powerPrice,
+      powerExcessPrice: params.powerExcessPrice,
+      reactivePenaltyCharge: params.reactivePenaltyCharge,
+      trafoDegeri: params.trafoDegeri,
+      totalProductionKwh: 0, // tahsis yok → veriş/mahsup yok
+      // netPositiveDraw/netExcessFeed bilinçli geçilmiyor → aylık davranış (mahsup 0)
+    });
+
+    return assembleResult({
+      params,
+      mode: "receiver",
+      breakdown,
+      hamTuketimKwh: params.mevcutTuketimKwh,
+      gesUretimKwh: 0,
+      hamBirimFiyat: params.mevcutBirimFiyat,
+    });
+  }
+
+  // ── Lisanslı Satış: GES tüketim faturasını etkilemez ──────────────────────
+  // Karşı-olgusal fatura ≈ mevcut dönem faturası → tasarruf = satış net geliri.
+  // Üretim yalnızca DETAY satırı (gesUretimKwh) için çekilir.
   if (params.lisansliSatis) {
     let totalGesKwh = 0;
     const { data: plantsData } = await supabase
@@ -154,39 +314,12 @@ export async function calculateGesOlmasaydi(
       .eq("linked_serno", subscriptionSerno);
 
     if (plantsData && plantsData.length > 0) {
-      const plantIds = plantsData.map((p: { id: string }) => p.id);
-      const start = new Date(periodYear, periodMonth - 1, 1);
-      const end = new Date(periodYear, periodMonth, 1);
-      const gesRes = await fetchAllGesProduction(
+      totalGesKwh = await fetchTotalGesProductionKwh(
         supabase,
-        plantIds,
-        start.toISOString(),
-        end.toISOString(),
+        plantsData.map((p: { id: string }) => p.id),
+        periodYear,
+        periodMonth,
       );
-      if (!gesRes.error) {
-        totalGesKwh = gesRes.data.reduce(
-          (s: number, r: { energy_kwh: number | null }) =>
-            s + (Number(r.energy_kwh) || 0),
-          0,
-        );
-      }
-      // Hourly tablosunda bu dönem için satır yoksa daily fallback.
-      if ((gesRes.error || gesRes.data.length === 0)) {
-        const { startDate, endDateExclusive } = monthDateBounds(periodYear, periodMonth);
-        const dailyRes = await fetchAllGesProductionDaily(
-          supabase,
-          plantIds,
-          startDate,
-          endDateExclusive,
-        );
-        if (!dailyRes.error) {
-          totalGesKwh = dailyRes.data.reduce(
-            (s: number, r: { energy_kwh: number | null }) =>
-              s + (Number(r.energy_kwh) || 0),
-            0,
-          );
-        }
-      }
     }
 
     const breakdown = calculateInvoice({
@@ -206,23 +339,73 @@ export async function calculateGesOlmasaydi(
       lisansliSatis: true,
     });
 
-    const gesOlmasaydiFatura = breakdown.totalInvoice;
-    const tasarruf = gesOlmasaydiFatura - params.mevcutFatura;
-    return {
+    return assembleResult({
+      params,
+      mode: "producer",
+      breakdown,
       hamTuketimKwh: params.mevcutTuketimKwh,
-      mevcutTuketimKwh: params.mevcutTuketimKwh,
       gesUretimKwh: totalGesKwh,
-      gesOlmasaydiFatura,
-      mevcutFatura: params.mevcutFatura,
-      tasarruf,
-      tasarrufYuzde:
-        gesOlmasaydiFatura > 0 ? (tasarruf / gesOlmasaydiFatura) * 100 : 0,
       hamBirimFiyat: params.mevcutBirimFiyat,
-      mevcutBirimFiyat: params.mevcutBirimFiyat,
-      gesOlmasaydiBreakdown: breakdown,
-    };
+    });
   }
 
+  // ── Anlık üretim kullanımı YOK (arazi GES): ham tüketim = çekiş ───────────
+  // Üretim tesisin anlık tüketimini beslemez (tamamı ayrı sayaçtan şebekeye
+  // verilir) → çekiş zaten gerçek ham tüketimdir; saatlik üretim ekleme/veriş
+  // çıkarma YAPILMAZ. "GES olmasaydı fatura" = veriş mahsubu VE dağıtımdaki
+  // mahsup düzeltmesi (distributionAdjustment) uygulanmadan yeniden çalıştırılan
+  // fatura motoru — receiver dalıyla aynı çağrı şekli. Tüketim profili
+  // değişmediği için birim fiyat da mevcutBirimFiyat'tır (PTF ağırlığı yeniden
+  // türetilmez). Üretim yalnız DETAY satırı için çekilir; veri yoksa 0 ile
+  // devam edilir (hesap üretime bağımlı değil).
+  // NOT: lisanslı satış kontrolünden SONRA gelmeli — lisanslı dal motoru
+  // lisansliSatis:true ile çağırır (dağıtım tabanı/BTV farklı hesaplanır).
+  if (params.anlikUretimKullanimi === false) {
+    const { data: plants, error: plantsErr } = await supabase
+      .from("ges_plants")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("is_active", true)
+      .eq("linked_serno", subscriptionSerno);
+
+    if (plantsErr || !plants || plants.length === 0) return null;
+
+    const totalGesKwh = await fetchTotalGesProductionKwh(
+      supabase,
+      plants.map((p: { id: string }) => p.id),
+      periodYear,
+      periodMonth,
+    );
+
+    const breakdown = calculateInvoice({
+      totalConsumptionKwh: params.mevcutTuketimKwh,
+      unitPriceEnergy: params.mevcutBirimFiyat,
+      unitPriceDistribution: params.unitPriceDistribution,
+      btvRate: params.btvRate,
+      vatRate: params.vatRate,
+      tariffType: params.tariffType,
+      contractPowerKw: params.contractPowerKw,
+      monthFinalDemandKw: params.monthFinalDemandKw,
+      powerPrice: params.powerPrice,
+      powerExcessPrice: params.powerExcessPrice,
+      reactivePenaltyCharge: params.reactivePenaltyCharge,
+      trafoDegeri: params.trafoDegeri,
+      totalProductionKwh: 0, // mahsup yok → dağıtım düzeltmesiz, tam BTV
+      // netPositiveDraw/netExcessFeed bilinçli geçilmiyor → aylık davranış (mahsup 0)
+    });
+
+    return assembleResult({
+      params,
+      mode: "producer",
+      breakdown,
+      hamTuketimKwh: params.mevcutTuketimKwh,
+      gesUretimKwh: totalGesKwh,
+      hamBirimFiyat: params.mevcutBirimFiyat,
+      anlikUretimKullanimi: false,
+    });
+  }
+
+  // ── Producer modu: ham tüketim üzerinden karşı-olgusal fatura ─────────────
   // 1) Bu tüketim aboneliğine (subscription_serno) BAĞLI aktif GES plant'ları bul.
   //    linked_serno filtresi sayesinde her tüketim tesisi sadece kendi GES
   //    üretimini görür. Birden fazla plant aynı abonelikle eşleşebilir
@@ -373,22 +556,12 @@ export async function calculateGesOlmasaydi(
     // on_yil ve perakende irrelevant — veriş 0
   });
 
-  const gesOlmasaydiFatura = gesOlmasaydiBreakdown.totalInvoice;
-  const tasarruf = gesOlmasaydiFatura - params.mevcutFatura;
-  const tasarrufYuzde = gesOlmasaydiFatura > 0
-    ? (tasarruf / gesOlmasaydiFatura) * 100
-    : 0;
-
-  return {
+  return assembleResult({
+    params,
+    mode: "producer",
+    breakdown: gesOlmasaydiBreakdown,
     hamTuketimKwh: totalHamKwh,
-    mevcutTuketimKwh: params.mevcutTuketimKwh,
     gesUretimKwh: totalGesKwh,
-    gesOlmasaydiFatura,
-    mevcutFatura: params.mevcutFatura,
-    tasarruf,
-    tasarrufYuzde,
     hamBirimFiyat: hamUnitPriceEnergy,
-    mevcutBirimFiyat: params.mevcutBirimFiyat,
-    gesOlmasaydiBreakdown,
-  };
+  });
 }

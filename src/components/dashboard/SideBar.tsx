@@ -1,5 +1,5 @@
 // src/components/dashboard/SideBar.tsx
-import { NavLink } from "react-router-dom";
+import { Link, NavLink } from "react-router-dom";
 import { useEffect, useState, type ReactNode } from "react";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import {
@@ -13,9 +13,10 @@ import {
   PanelLeftOpen,
   Menu,
   X,
-  Zap,
   Sun,
 } from "lucide-react";
+import logoFull from "@/assets/porteco-logo-horizontal.svg";
+import logoIcon from "@/assets/porteco-icon.svg";
 
 type Item = {
   label: string;
@@ -130,15 +131,13 @@ export default function SideBar({
         >
           {/* header */}
           <div className="px-5 py-5 flex items-center justify-between border-b border-neutral-100">
-            <div className="flex items-center gap-3">
-              <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-[#0A66FF] to-[#0A66FF]/80 flex items-center justify-center shrink-0 shadow-md shadow-[#0A66FF]/20">
-                <Zap className="h-5 w-5 text-white" />
-              </div>
-              <div className="leading-tight">
-                <div className="text-[14px] font-bold text-neutral-900">ECO Enerji</div>
-                <div className="text-[11px] font-medium text-[#0A66FF]/70 tracking-wide uppercase">PORTECO</div>
-              </div>
-            </div>
+            <Link
+              to="/dashboard"
+              onClick={() => setOpen(false)}
+              className="flex h-10 items-center hover:opacity-80 transition-opacity duration-200"
+            >
+              <img src={logoFull} alt="PortEco" className="h-9 w-auto" />
+            </Link>
 
             <button
               type="button"
@@ -222,19 +221,17 @@ export default function SideBar({
               "flex items-center w-full transition-all duration-300",
               expanded ? "justify-between" : "justify-center",
             ].join(" ")}>
-              {/* Logo + Title */}
-              <div className="flex items-center gap-3 min-w-0">
-                <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-[#0A66FF] to-[#0A66FF]/80 flex items-center justify-center shrink-0 shadow-md shadow-[#0A66FF]/20 transition-transform duration-300 hover:scale-105">
-                  <Zap className="h-5 w-5 text-white" />
-                </div>
-
-                {expanded && (
-                  <div className="leading-tight overflow-hidden">
-                    <div className="text-[14px] font-bold text-neutral-900 whitespace-nowrap">ECO Enerji</div>
-                    <div className="text-[11px] font-medium text-[#0A66FF]/70 tracking-wide uppercase whitespace-nowrap">PORTECO</div>
-                  </div>
+              {/* Logo */}
+              <Link
+                to="/dashboard"
+                className="flex h-10 items-center min-w-0 hover:opacity-80 transition-opacity duration-200"
+              >
+                {expanded ? (
+                  <img src={logoFull} alt="PortEco" className="h-9 w-auto" />
+                ) : (
+                  <img src={logoIcon} alt="PortEco" className="h-8 w-8" />
                 )}
-              </div>
+              </Link>
 
               {/* Toggle button - expanded */}
               {expanded && (

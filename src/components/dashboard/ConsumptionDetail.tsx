@@ -1,12 +1,13 @@
 // src/components/dashboard/ConsumptionDetail.tsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import EnergyTable from "@/components/dashboard/EnergyTable";
+import ConsumptionCharts from "@/components/dashboard/ConsumptionCharts";
+import ManualUploadPanel from "@/components/dashboard/manualUpload/ManualUploadPanel";
 import { useSession } from "@/hooks/useSession";
 import { supabase } from "@/lib/supabase";
 import { dayjsTR } from "@/lib/dayjs";
-import { exportConsumptionHourlyXlsx } from "@/components/utils/exportConsumptionXlsx";
 import { computeMonthInvoiceToDate } from "@/components/utils/calculateInvoiceToDate";
 import GesUretimSatisiCard from "@/components/dashboard/shared/GesUretimSatisiCard";
 import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
@@ -19,6 +20,7 @@ type SubscriptionOption = {
   subscriptionSerNo: number;
   meterSerial: string | null;
   nickname: string | null;
+  dataSource: string | null; // 'api' | 'manual'
 };
 
 const fmtTl0 = (n: number) =>
@@ -38,6 +40,9 @@ const fmtKwh = (n: number | null | undefined) =>
 const fmtDT = (iso: string) => dayjsTR(iso).format("DD.MM.YYYY HH:mm");
 
 const LS_SUB_KEY = "eco_selected_sub";
+// Consumption sayfasına özel seçim (numara veya "ALL"). LS_SUB_KEY'i bozmaz → diğer
+// sayfalar (Charts, Dashboard) "ALL"'dan etkilenmez.
+const LS_CONS_KEY = "eco_sel_consumption";
 
 const fmtMoney2 = (n: number | null | undefined) =>
   n == null || !Number.isFinite(Number(n))
@@ -57,6 +62,67 @@ const fmtUnit6 = (n: number | null | undefined) =>
 
 
 
+// Bir tarih aralığındaki toplam tüketimi (kWh) çeker. Önce consumption_daily,
+// yoksa consumption_hourly fallback. sernos tek tesis veya "Tümü" (çoklu) olabilir.
+async function fetchRangeKwh(params: {
+  uid: string;
+  sernos: number[];
+  dailyGte: string; // YYYY-MM-DD
+  dailyLt?: string; // exclusive
+  dailyLte?: string; // inclusive
+  hourlyStartIso: string;
+  hourlyEndIso: string;
+  hourlyEndInclusive?: boolean;
+}): Promise<number> {
+  const {
+    uid,
+    sernos,
+    dailyGte,
+    dailyLt,
+    dailyLte,
+    hourlyStartIso,
+    hourlyEndIso,
+    hourlyEndInclusive,
+  } = params;
+
+  if (sernos.length === 0) return 0;
+
+  // Tesis başına: önce consumption_daily (tarih aralığı küçük → tek sayfa yeterli),
+  // o tesiste daily yoksa hourly fallback. Böylece daily/hourly karışık tesisler
+  // doğru toplanır ve çoklu-tesis "Tümü"de 1000-satır kesintisi olmaz.
+  let total = 0;
+  for (const sn of sernos) {
+    let dq = supabase
+      .from("consumption_daily")
+      .select("kwh_in")
+      .eq("user_id", uid)
+      .eq("subscription_serno", sn)
+      .gte("day", dailyGte);
+    if (dailyLt) dq = dq.lt("day", dailyLt);
+    if (dailyLte) dq = dq.lte("day", dailyLte);
+
+    const daily = await dq;
+    if (!daily.error && daily.data && daily.data.length > 0) {
+      total += daily.data.reduce((s: number, r: any) => s + (Number(r.kwh_in) || 0), 0);
+      continue;
+    }
+
+    // fallback: saatlik (bu serno, paginated)
+    const h = await fetchAllConsumption({
+      supabase,
+      userId: uid,
+      subscriptionSerno: sn,
+      columns: "ts, cn",
+      startIso: hourlyStartIso,
+      endIso: hourlyEndIso,
+      endInclusive: hourlyEndInclusive ?? false,
+    });
+    if (h.error) throw h.error;
+    total += (h.data ?? []).reduce((s: number, r: any) => s + (Number(r.cn) || 0), 0);
+  }
+  return total;
+}
+
 export default function ConsumptionDetail() {
   const navigate = useNavigate();
   const { session: authSession, loading: sessionLoading } = useSession();
@@ -64,14 +130,26 @@ export default function ConsumptionDetail() {
 
   // Tesis state'leri
   const [subs, setSubs] = useState<SubscriptionOption[]>([]);
-  const [selectedSub, setSelectedSub] = useState<number | null>(() => {
-    const raw =
-      typeof window !== "undefined" ? localStorage.getItem(LS_SUB_KEY) : null;
+  // "ALL" = Tümü (görünür tüm tesisler toplamı), bu sayfaya özel.
+  const [selectedSub, setSelectedSub] = useState<"ALL" | number | null>(() => {
+    if (typeof window === "undefined") return null;
+    const rawC = localStorage.getItem(LS_CONS_KEY);
+    if (rawC === "ALL") return "ALL";
+    const raw = localStorage.getItem(LS_SUB_KEY);
     const n = raw ? Number(raw) : NaN;
     return Number.isFinite(n) ? n : null;
   });
   const [subsLoading, setSubsLoading] = useState(false);
   const [subsErr, setSubsErr] = useState<string | null>(null);
+
+  // Manuel veri girişine açık TÜM tesisler (is_hidden dahil) — Excel'deki
+  // abone no doğrulaması gizli tesisleri de tanımalı; subs listesi is_hidden
+  // filtreli olduğu için buradan türetilmez, sorgudan ham olarak alınır.
+  const [manualSernos, setManualSernos] = useState<number[]>([]);
+
+  // Manuel yükleme/silme sonrası sayfadaki verileri tazelemek için sayaç.
+  // Effect dep'lerine girer; ConsumptionCharts ve EnergyTable key ile remount edilir.
+  const [dataVersion, setDataVersion] = useState(0);
 
   // Özet kart state'leri
   const [prevMonthKwh, setPrevMonthKwh] = useState<number | null>(null);
@@ -87,11 +165,6 @@ export default function ConsumptionDetail() {
   const currStart = dayjsTR().startOf("month");
   const now = dayjsTR();
 
-  // Export
-  const [exportRange, setExportRange] = useState<"curr" | "prev">("curr");
-  const [exporting, setExporting] = useState(false);
-  const [exportErr, setExportErr] = useState<string | null>(null);
-
   // ✅ Ay içi fatura (PTF cutoff) state
   const [invoiceToDate, setInvoiceToDate] =
     useState<Awaited<ReturnType<typeof computeMonthInvoiceToDate>>>(null);
@@ -99,6 +172,12 @@ export default function ConsumptionDetail() {
 
 
   const [estimateOpen, setEstimateOpen] = useState(false);
+
+  // Admin tarafından faturadan çıkarılan kalemler (fatura kalem override'ları) —
+  // tahmin panelinde de satırları hiç render edilmez.
+  const estimateExcludedItems = new Set<string>(
+    invoiceToDate?.breakdown.appliedOverrides?.excludedItems ?? []
+  );
   // ─────────────────────────────
   // 0) Tesis listesini yükle
   // ─────────────────────────────
@@ -119,6 +198,7 @@ export default function ConsumptionDetail() {
             `
             subscription_serno,
             meter_serial,
+            data_source,
             subscription_settings:subscription_settings (
               title,
               nickname,
@@ -150,21 +230,37 @@ export default function ConsumptionDetail() {
               subscriptionSerNo: Number(r.subscription_serno),
               meterSerial: r.meter_serial ?? null,
               nickname: nick,
+              dataSource: (r.data_source ?? null) as string | null,
             };
           });
 
         setSubs(list);
 
-        const next = resolveSelectedSub(
-          list.map((s) => s.subscriptionSerNo),
-          selectedSub,
+        // is_hidden filtresinden ÖNCEKİ ham veriden: gizli manuel tesislerin
+        // satırları da Excel doğrulamasında tanınsın.
+        setManualSernos(
+          (data ?? [])
+            .filter((r: any) => r.data_source === "manual")
+            .map((r: any) => Number(r.subscription_serno))
+            .filter((n: number) => Number.isFinite(n)),
         );
-        setSelectedSub(next);
+
+        // "Tümü" seçiliyse koru; aksi halde görünür listeden geçerli tek tesisi çöz.
+        if (selectedSub === "ALL") {
+          // koru (en az 1 görünür tesis varsa anlamlı)
+        } else {
+          const next = resolveSelectedSub(
+            list.map((s) => s.subscriptionSerNo),
+            typeof selectedSub === "number" ? selectedSub : null,
+          );
+          setSelectedSub(next);
+        }
       } catch (e: any) {
         if (!cancel) {
           console.error("subscription list (consumption) error:", e);
           setSubsErr(e?.message ?? "Tesisler yüklenemedi");
           setSubs([]);
+          setManualSernos([]);
           setSelectedSub(null);
         }
       } finally {
@@ -178,20 +274,56 @@ export default function ConsumptionDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uid, sessionLoading]);
 
-  const selectedMeterSerial =
-    subs.find((s) => s.subscriptionSerNo === selectedSub)?.meterSerial ?? null;
-
   const subLabel = (s: SubscriptionOption) => {
     const tesisNo = s.meterSerial ?? `Tesis ${s.subscriptionSerNo}`;
     const nick = (s.nickname ?? "").trim();
     return nick ? `${tesisNo} - ${nick}` : tesisNo;
   };
 
-  const selectedSubObj =
-    subs.find((s) => s.subscriptionSerNo === selectedSub) ?? null;
-  const selectedSubLabel = selectedSubObj
-    ? subLabel(selectedSubObj)
-    : "Tesis seçilmedi";
+  // Görünür tesis serno listesi ("Tümü" toplamı + grafikler için)
+  const visibleSernos = subs.map((s) => s.subscriptionSerNo);
+
+  // Seçili tekil tesis manuel mi?
+  const selectedManualSub =
+    selectedSub !== "ALL" && selectedSub != null
+      ? subs.find(
+          (s) => s.subscriptionSerNo === selectedSub && s.dataSource === "manual",
+        ) ?? null
+      : null;
+
+  // Silme modalı seçicisi + "Tümü" modu görünürlüğü için görünür manuel
+  // tesisler (etiketli). "Tümü" görünür tesisleri kapsadığından panelin
+  // "Tümü" koşulu da bu listeye bakar.
+  const manualFacilities = subs
+    .filter((s) => s.dataSource === "manual")
+    .map((s) => ({ serno: s.subscriptionSerNo, label: subLabel(s) }));
+
+  // Panel görünürlüğü: tekil manuel tesis seçili VEYA "Tümü" seçili ve en az
+  // bir manuel tesis var. API tesisi tekil seçiliyken görünmez.
+  const showManualPanel =
+    selectedManualSub != null ||
+    (selectedSub === "ALL" && manualFacilities.length > 0);
+
+  // Seçimi state + localStorage'a yazan tek giriş (ana seçici ↔ saatlik tablo paylaşır).
+  const handleSelectSub = (v: "ALL" | number) => {
+    setSelectedSub(v);
+    if (v === "ALL") {
+      localStorage.setItem(LS_CONS_KEY, "ALL");
+    } else {
+      localStorage.setItem(LS_SUB_KEY, String(v));
+      localStorage.setItem(LS_CONS_KEY, String(v));
+    }
+  };
+
+  // Grafik kartında gösterilecek seçim etiketi
+  const selectionLabel =
+    selectedSub === "ALL"
+      ? `Tümü (${visibleSernos.length} tesis)`
+      : (() => {
+          const s = subs.find((x) => x.subscriptionSerNo === selectedSub);
+          return s ? subLabel(s) : "Tesis seçilmedi";
+        })();
+
 
   // ─────────────────────────────────────────────
   // 1) Geçen ay toplam tüketim (kWh)
@@ -224,39 +356,18 @@ export default function ConsumptionDetail() {
           )} (TR)`
         );
 
-        const daily = await supabase
-          .from("consumption_daily")
-          .select("day, kwh_in")
-          .eq("user_id", uid)
-          .eq("subscription_serno", selectedSub)
-          .gte("day", start.format("YYYY-MM-DD"))
-          .lt("day", endCurrentMonth.format("YYYY-MM-DD"));
+        const sernos = selectedSub === "ALL" ? visibleSernos : [selectedSub as number];
 
-        if (!cancel && !daily.error && daily.data?.length) {
-          const sum = daily.data.reduce(
-            (s: number, r: any) => s + (Number(r.kwh_in) || 0),
-            0
-          );
-          setPrevMonthKwh(sum);
-          return;
-        }
-
-        const hourly = await fetchAllConsumption({
-          supabase,
-          userId: uid,
-          subscriptionSerno: selectedSub,
-          columns: "ts, cn",
-          startIso: start.toDate().toISOString(),
-          endIso: endCurrentMonth.toDate().toISOString(),
+        const sum = await fetchRangeKwh({
+          uid,
+          sernos,
+          dailyGte: start.format("YYYY-MM-DD"),
+          dailyLt: endCurrentMonth.format("YYYY-MM-DD"),
+          hourlyStartIso: start.toDate().toISOString(),
+          hourlyEndIso: endCurrentMonth.toDate().toISOString(),
         });
 
         if (cancel) return;
-        if (hourly.error) throw hourly.error;
-
-        const sum = (hourly.data ?? []).reduce(
-          (s: number, r: any) => s + (Number(r.cn) || 0),
-          0
-        );
         setPrevMonthKwh(sum);
       } catch (e: any) {
         if (!cancel) {
@@ -272,7 +383,8 @@ export default function ConsumptionDetail() {
     return () => {
       cancel = true;
     };
-  }, [uid, sessionLoading, selectedSub]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uid, sessionLoading, selectedSub, subs, dataVersion]);
 
   // ─────────────────────────────────────────────
   // 2) Bu ay (şu ana kadar) toplam tüketim (kWh)
@@ -291,40 +403,19 @@ export default function ConsumptionDetail() {
         const start = dayjsTR().startOf("month");
         const nowLocal = dayjsTR();
 
-        const daily = await supabase
-          .from("consumption_daily")
-          .select("day, kwh_in")
-          .eq("user_id", uid)
-          .eq("subscription_serno", selectedSub)
-          .gte("day", start.format("YYYY-MM-DD"))
-          .lte("day", nowLocal.format("YYYY-MM-DD"));
+        const sernos = selectedSub === "ALL" ? visibleSernos : [selectedSub as number];
 
-        if (!cancel && !daily.error && daily.data?.length) {
-          const sum = daily.data.reduce(
-            (s: number, r: any) => s + (Number(r.kwh_in) || 0),
-            0
-          );
-          setCurrMonthKwh(sum);
-          return;
-        }
-
-        const hourly = await fetchAllConsumption({
-          supabase,
-          userId: uid,
-          subscriptionSerno: selectedSub,
-          columns: "ts, cn",
-          startIso: start.toDate().toISOString(),
-          endIso: nowLocal.toDate().toISOString(),
-          endInclusive: true,
+        const sum = await fetchRangeKwh({
+          uid,
+          sernos,
+          dailyGte: start.format("YYYY-MM-DD"),
+          dailyLte: nowLocal.format("YYYY-MM-DD"),
+          hourlyStartIso: start.toDate().toISOString(),
+          hourlyEndIso: nowLocal.toDate().toISOString(),
+          hourlyEndInclusive: true,
         });
 
         if (cancel) return;
-        if (hourly.error) throw hourly.error;
-
-        const sum = (hourly.data ?? []).reduce(
-          (s: number, r: any) => s + (Number(r.cn) || 0),
-          0
-        );
         setCurrMonthKwh(sum);
       } catch (e: any) {
         if (!cancel) {
@@ -340,7 +431,8 @@ export default function ConsumptionDetail() {
     return () => {
       cancel = true;
     };
-  }, [uid, sessionLoading, selectedSub]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uid, sessionLoading, selectedSub, subs, dataVersion]);
 
   // ─────────────────────────────────────────────
   // 3) Bu ay (PTF tablosundaki en son saate göre) fatura (TL)
@@ -348,7 +440,8 @@ export default function ConsumptionDetail() {
 useEffect(() => {
   if (sessionLoading) return;
 
-  if (!uid || !selectedSub) {
+  // "Tümü" seçiliyken fatura tek tesis gerektirdiği için hesaplanmaz (panel gizli).
+  if (!uid || !selectedSub || selectedSub === "ALL") {
     setInvoiceToDate(null);
     return;
   }
@@ -368,6 +461,8 @@ useEffect(() => {
         year: m.year(),
         month: m.month() + 1,
         requirePrevMonthMahsup: false, // istersen true yaparız
+        excludeGesMahsup: true,        // GES/veriş mahsubu bu panelde uygulanmaz
+        projectToMonthEnd: true,       // tüketim ay sonuna projekte edilir
       });
 
       if (!cancel) setInvoiceToDate(res);
@@ -382,49 +477,9 @@ useEffect(() => {
   return () => {
     cancel = true;
   };
-}, [uid, sessionLoading, selectedSub]);
+}, [uid, sessionLoading, selectedSub, dataVersion]);
 
 
-  const exportLabel = useMemo(() => {
-    if (exportRange === "prev") {
-      const m = dayjsTR().subtract(1, "month");
-      return `gecen_ay_${m.format("YYYY_MM")}`;
-    }
-    return `bu_ay_${dayjsTR().format("YYYY_MM")}`;
-  }, [exportRange]);
-
-  async function handleExportXlsx() {
-    if (!uid || !selectedSub) return;
-
-    try {
-      setExporting(true);
-      setExportErr(null);
-
-      const from =
-        exportRange === "prev"
-          ? dayjsTR().subtract(1, "month").startOf("month")
-          : dayjsTR().startOf("month");
-
-      const toExclusive =
-        exportRange === "prev"
-          ? dayjsTR().startOf("month")
-          : dayjsTR().add(1, "minute");
-
-      await exportConsumptionHourlyXlsx({
-        userId: uid,
-        subscriptionSerno: selectedSub,
-        rangeLabel: exportLabel,
-        fromIso: from.toDate().toISOString(),
-        toExclusiveIso: toExclusive.toDate().toISOString(),
-        meterSerialLabel: selectedMeterSerial ?? String(selectedSub),
-      });
-    } catch (e: any) {
-      console.error("export xlsx error:", e);
-      setExportErr(e?.message ?? "Excel çıkartılamadı.");
-    } finally {
-      setExporting(false);
-    }
-  }
 
   return (
     <DashboardShell>
@@ -433,38 +488,22 @@ useEffect(() => {
           <h1 className="text-2xl font-semibold text-neutral-900">
             Tüketim Detayı
           </h1>
-
-          {selectedSub && (
-            <p className="mt-1 text-xs text-neutral-500 flex items-center gap-2">
-              Seçili tesis:{" "}
-              <button
-                type="button"
-                onClick={() => navigate("/dashboard/profile")}
-                className="inline-flex items-center justify-center rounded-md border border-neutral-200 bg-white px-2 py-0.5 text-[11px] text-neutral-600 hover:bg-neutral-50"
-                title="Tesis adını (nickname) düzenle"
-                aria-label="Tesis adını (nickname) düzenle"
-              >
-                <span className="font-medium text-neutral-800">
-                  {selectedSubLabel}
-                </span>
-              </button>
-            </p>
-          )}
         </div>
 
         <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center sm:justify-end md:w-auto">
           <div className="flex items-center gap-2 min-w-0">
             <span className="text-xs text-neutral-600">Tesis:</span>
             <select
-              value={selectedSub ?? ""}
+              value={selectedSub == null ? "" : String(selectedSub)}
               onChange={(e) => {
-                const v = e.target.value ? Number(e.target.value) : null;
-                setSelectedSub(v);
-                if (v != null) localStorage.setItem(LS_SUB_KEY, String(v));
+                const val = e.target.value;
+                if (!val) return;
+                handleSelectSub(val === "ALL" ? "ALL" : Number(val));
               }}
               className="h-10 md:h-9 w-full sm:w-[420px] md:w-auto min-w-0 max-w-full rounded-lg border border-neutral-300 bg-white px-3 md:px-2 text-[16px] md:text-xs text-neutral-800 focus:outline-none focus:ring-1 focus:ring-[#0A66FF]"
             >
               {subs.length === 0 && <option value="">Tesis bulunamadı</option>}
+              {subs.length > 0 && <option value="ALL">Tümü</option>}
               {subs.map((s) => (
                 <option key={s.subscriptionSerNo} value={s.subscriptionSerNo}>
                   {subLabel(s)}
@@ -486,13 +525,25 @@ useEffect(() => {
         </div>
       </div>
 
-      {(subsErr || prevErr || currErr || exportErr) && (
+      {(subsErr || prevErr || currErr) && (
         <div className="mb-4 rounded border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
           {subsErr && <>Tesisler: {subsErr}. </>}
           {prevErr && <>Geçen ay: {prevErr}. </>}
           {currErr && <>Bu ay: {currErr}. </>}
-          {exportErr && <>Excel: {exportErr}</>}
         </div>
+      )}
+
+      {/* Manuel tesis yükleme paneli — tekil manuel tesis seçiliyken veya
+          "Tümü" seçiliyken (en az bir manuel tesis varsa) */}
+      {uid && showManualPanel && (
+        <ManualUploadPanel
+          uid={uid}
+          selectedSerno={selectedManualSub ? selectedManualSub.subscriptionSerNo : null}
+          facilityLabel={selectedManualSub ? subLabel(selectedManualSub) : null}
+          manualSernos={manualSernos}
+          manualFacilities={manualFacilities}
+          onDataChanged={() => setDataVersion((v) => v + 1)}
+        />
       )}
 
       {/* Özet kartlar */}
@@ -519,12 +570,17 @@ useEffect(() => {
 
 
 
-{/* Bu ay (PTF'e göre) fatura kalemleri (şu ana kadar) */}
-{(invoiceToDateLoading || invoiceToDate) && (
+{/* Bu ay (PTF'e göre) fatura kalemleri (şu ana kadar) — "Tümü"de gizli */}
+{selectedSub !== "ALL" && (invoiceToDateLoading || invoiceToDate) && (
   <div className="mb-6 rounded-2xl border border-neutral-200 bg-white p-5 shadow-sm">
     <div className="flex items-start justify-between gap-4">
       <div className="min-w-0">
-        <div className="text-sm font-semibold text-neutral-900">Ay İçi Tahmini Fatura</div>
+        <div className="text-sm font-semibold text-neutral-900">
+          Tahmini Ay İçi Fatura
+          {(invoiceToDate?.totalProductionKwh ?? 0) > 0
+            ? " (GES Mahsubu Dahil Değildir)"
+            : ""}
+        </div>
         {invoiceToDate && (
           <p className="mt-1 text-xs text-neutral-500">
             {invoiceToDate.rangeStart} – {invoiceToDate.rangeEnd} (TR)
@@ -578,23 +634,29 @@ useEffect(() => {
                 </thead>
 
                 <tbody>
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">Enerji Bedeli</td>
-                    <td className="py-2 pr-4 text-neutral-600">
-                      {fmtUnit6(invoiceToDate.unitPriceEnergy)} TL/kWh ×{" "}
-                      {fmtKwh(invoiceToDate.totalConsumptionKwh)} kWh
-                    </td>
-                    <td className="py-2 pr-4 text-right">
-                      {fmtMoney2(invoiceToDate.breakdown.energyCharge)}
-                    </td>
-                  </tr>
+                  {!estimateExcludedItems.has("enerji") && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">Enerji Bedeli</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        {fmtUnit6(invoiceToDate.unitPriceEnergy)} TL/kWh ×{" "}
+                        <span className="font-medium text-amber-600">
+                          {fmtKwh(invoiceToDate.projectedConsumptionKwh)} kWh
+                        </span>
+                      </td>
+                      <td className="py-2 pr-4 text-right">
+                        {fmtMoney2(invoiceToDate.breakdown.energyCharge)}
+                      </td>
+                    </tr>
+                  )}
 
-                  {invoiceToDate.trafoDegeri > 0 && (
+                  {invoiceToDate.trafoDegeri > 0 && !estimateExcludedItems.has("trafo") && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Trafo Kaybı</td>
                       <td className="py-2 pr-4 text-neutral-600">
                         {fmtUnit6(invoiceToDate.unitPriceEnergy)} TL/kWh ×{" "}
-                        {fmtKwh(invoiceToDate.trafoDegeri)} kWh
+                        <span className="font-medium text-amber-600">
+                          {fmtKwh(invoiceToDate.projectedTrafoKwh)} kWh
+                        </span>
                       </td>
                       <td className="py-2 pr-4 text-right">
                         {fmtMoney2(invoiceToDate.breakdown.trafoCharge)}
@@ -602,30 +664,36 @@ useEffect(() => {
                     </tr>
                   )}
 
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">Dağıtım Bedeli</td>
-                    <td className="py-2 pr-4 text-neutral-600">
-                      {fmtUnit6(invoiceToDate.breakdown.effectiveDistributionUnitPrice)} TL/kWh ×{" "}
-                      {fmtKwh(invoiceToDate.breakdown.distributionChargeKwh)} kWh
-                    </td>
-                    <td className="py-2 pr-4 text-right">
-                      {fmtMoney2(invoiceToDate.breakdown.distributionCharge)}
-                    </td>
-                  </tr>
+                  {!estimateExcludedItems.has("dagitim") && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">Dağıtım Bedeli</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        {fmtUnit6(invoiceToDate.breakdown.effectiveDistributionUnitPrice)} TL/kWh ×{" "}
+                        <span className="font-medium text-amber-600">
+                          {fmtKwh(invoiceToDate.breakdown.distributionChargeKwh)} kWh
+                        </span>
+                      </td>
+                      <td className="py-2 pr-4 text-right">
+                        {fmtMoney2(invoiceToDate.breakdown.distributionCharge)}
+                      </td>
+                    </tr>
+                  )}
 
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">
-                      BTV (%{(invoiceToDate.btvRate * 100).toFixed(2)})
-                    </td>
-                    <td className="py-2 pr-4 text-neutral-600">
-                      Enerji bedeli × BTV oranı
-                    </td>
-                    <td className="py-2 pr-4 text-right">
-                      {fmtMoney2(invoiceToDate.breakdown.btvCharge)}
-                    </td>
-                  </tr>
+                  {!estimateExcludedItems.has("btv") && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">
+                        BTV (%{(invoiceToDate.btvRate * 100).toFixed(2)})
+                      </td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        Enerji bedeli × BTV oranı
+                      </td>
+                      <td className="py-2 pr-4 text-right">
+                        {fmtMoney2(invoiceToDate.breakdown.btvCharge)}
+                      </td>
+                    </tr>
+                  )}
 
-                  {invoiceToDate.tariffType === "dual" && (
+                  {invoiceToDate.tariffType === "dual" && !estimateExcludedItems.has("guc") && (
                     <>
                       <tr className="border-b border-neutral-100">
                         <td className="py-2 pr-4">Güç Bedeli (Limit içi)</td>
@@ -649,16 +717,18 @@ useEffect(() => {
                     </>
                   )}
 
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">Reaktif Ceza Bedeli</td>
-                    <td className="py-2 pr-4 text-neutral-600">
-                      Ri %{invoiceToDate.reactiveRiPercent.toFixed(1)} / Rc %
-                      {invoiceToDate.reactiveRcPercent.toFixed(1)}
-                    </td>
-                    <td className="py-2 pr-4 text-right">
-                      {fmtMoney2(invoiceToDate.reactivePenaltyCharge)}
-                    </td>
-                  </tr>
+                  {!estimateExcludedItems.has("reaktif") && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">Reaktif Ceza Bedeli</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        Ri %{invoiceToDate.reactiveRiPercent.toFixed(1)} / Rc %
+                        {invoiceToDate.reactiveRcPercent.toFixed(1)}
+                      </td>
+                      <td className="py-2 pr-4 text-right">
+                        {fmtMoney2(invoiceToDate.reactivePenaltyCharge)}
+                      </td>
+                    </tr>
+                  )}
 
                   <tr className="border-t border-neutral-200">
                     <td className="py-2 pr-4 font-semibold">KDV Hariç Toplam</td>
@@ -766,34 +836,33 @@ useEffect(() => {
 )}
 
 
-    
-      {/* Saatlik tüketim tablosu */}
-      <div className="w-full rounded-2xl border border-neutral-200 bg-white p-5 shadow-sm">
-        <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="text-sm font-semibold text-neutral-900">Saatlik Tüketim</div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <select
-              value={exportRange}
-              onChange={(e) => setExportRange(e.target.value as any)}
-              className="h-9 rounded-lg border border-neutral-300 bg-white px-3 text-xs text-neutral-800 focus:outline-none focus:ring-1 focus:ring-[#0A66FF]"
-            >
-              <option value="curr">Bu ayı Excel’e çıkar</option>
-              <option value="prev">Geçen ayı Excel’e çıkar</option>
-            </select>
+      {/* Tüketim grafikleri (fatura kartı ile saatlik tablo arasında) */}
+      {selectedSub != null && (
+        <ConsumptionCharts
+          key={`charts-${dataVersion}`}
+          uid={uid}
+          selectedSub={selectedSub}
+          visibleSernos={visibleSernos}
+          selectionLabel={selectionLabel}
+        />
+      )}
 
-            <button
-              onClick={handleExportXlsx}
-              disabled={!uid || !selectedSub || exporting}
-              className="h-9 rounded-lg border border-neutral-300 bg-white px-3 text-xs text-neutral-700 hover:bg-neutral-50 disabled:opacity-50"
-            >
-              {exporting ? "Çıkartılıyor…" : "Excel’e Çıkar (.xlsx)"}
-            </button>
+      {/* Saatlik tüketim tablosu — seçim çözülmeden render etme (null→"ALL"
+          coercion'ı ile ana seçicinin uyumsuz görünmesini engeller) */}
+      {selectedSub != null && (
+        <div className="w-full rounded-2xl border border-neutral-200 bg-white p-5 shadow-sm">
+          <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="text-sm font-semibold text-neutral-900">Saatlik Tüketim</div>
           </div>
-        </div>
 
-        <EnergyTable />
-      </div>
+          <EnergyTable
+            key={`table-${dataVersion}`}
+            selectedSub={selectedSub}
+            onSelectedSubChange={handleSelectSub}
+          />
+        </div>
+      )}
     </DashboardShell>
   );
 }

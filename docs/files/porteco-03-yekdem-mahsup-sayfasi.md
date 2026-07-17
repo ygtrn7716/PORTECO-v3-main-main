@@ -4,7 +4,7 @@
 
 Kaynak dosyalar:
 
-- `src/components/dashboard/YekdemMahsupDetail.tsx` (540 satır)
+- `src/components/dashboard/YekdemMahsupDetail.tsx` (528 satır)
 - `src/components/utils/calculateInvoice.ts` (`calculateYekdemMahsup` fonksiyonu)
 - `src/lib/paginatedFetch.ts`
 - `src/lib/subscriptionVisibility.ts`
@@ -20,7 +20,7 @@ Sayfa M-1 dönemine ait tüketim (kWh), tahmini YEKDEM ve kesin YEKDEM değerler
 
 ## 2. Hesaplama Formülü
 
-`calculateYekdemMahsup()` fonksiyonu (`src/components/utils/calculateInvoice.ts:232`) dört adımı sırayla uygular:
+`calculateYekdemMahsup()` fonksiyonu (`src/components/utils/calculateInvoice.ts:365`) dört adımı sırayla uygular:
 
 ```
 diffYekdem        = yekdemNew - yekdemOld                       // TL/kWh
@@ -52,7 +52,7 @@ Sayısal örnek: `yekdemOld = 0.250000`, `yekdemNew = 0.275000`, `kbk = 1.05`, `
 
 Sayfada işaret kullanıcı dostudur (lehine `+`, aleyhine `-`). Dashboard kartında ise sayı doğrudan TL biçiminde gösterilir; renk kodu aynı mantıkla uygulanır.
 
-UI yorumu (`YekdemMahsupDetail.tsx:531-534`):
+UI yorumu (`YekdemMahsupDetail.tsx:520-521`):
 
 > "Pozitif mahsup (deltaTotal > 0) kullanıcı aleyhine olduğu için "-" (kırmızı) gösterilir. Negatif mahsup kullanıcı lehine olduğu için "+" (yeşil) gösterilir."
 
@@ -69,7 +69,7 @@ Bağımlılık: `[uid, sessionLoading]`.
 3. Eğer `subscription_settings` boş ise `owner_subscriptions` üzerinden fallback liste üret.
 4. `resolveSelectedSub(visibleSernos, selectedSub)` ile localStorage seçimini doğrula.
 
-### Effect 1 — Mahsup Hesabı (`YekdemMahsupDetail.tsx:208`)
+### Effect 1 — Mahsup Hesabı (`YekdemMahsupDetail.tsx:202`)
 
 Bağımlılık: `[uid, sessionLoading, selectedSub]`.
 
@@ -142,7 +142,7 @@ subscription_settings (kbk, terim, gerilim, tarife)
 
 ## 5. Renklendirme Mantığı (Kod Referansı)
 
-`YekdemMahsupDetail.tsx:380-386`:
+`YekdemMahsupDetail.tsx:374-380`:
 
 ```typescript
 const mahsupView = useMemo(() => {
@@ -154,7 +154,7 @@ const mahsupView = useMemo(() => {
 }, [payload]);
 ```
 
-Üç adet ana özet kart (`YekdemMahsupDetail.tsx:450-478`) gösterilir:
+Üç adet ana özet kart (`YekdemMahsupDetail.tsx:441-456` civarı) gösterilir:
 
 | Kart | İçerik |
 | --- | --- |
@@ -184,12 +184,16 @@ Mahsup hesabını mümkün kılan tek veri kaynağı `subscription_yekdem` tablo
 | `yekdem_value` | numeric | Tahmini YEKDEM (TL/kWh) |
 | `yekdem_final` | numeric | Kesin YEKDEM (TL/kWh) |
 | `diger_degerler` | numeric | Bu döneme ait ek mahsup/iade kalemleri (TL); fatura toplamına eklenir |
+| `usd_kur` | numeric(10,4) | Ay-sonu USD/TL kuru (`20260504_001`); 10 yıl üstü tesislerin veriş fazlası satış bedelinde kullanılır, mahsup hesabına girmez |
 
 Tipik akış:
 
 1. Faturanın kesildiği gün: `yekdem_value` doldurulur. `yekdem_final` boş bırakılır.
 2. EPDK kesin değeri açıkladığında: `yekdem_final` güncellenir.
-3. `Dashboard.tsx` ve `YekdemMahsupDetail.tsx` `period_year/period_month` (yeni şema) ile, eski ortamlarda `(year, month)` (legacy) ile satırı okur.
+3. 10 yıl üstü (`on_yil = true`) tesisler için ay kapanınca `usd_kur` girilir; giriş noktası `AdminUsersPage` YEKDEM sekmesindeki ay-bazlı "USD/TL Kuru" input'udur.
+4. `Dashboard.tsx` ve `YekdemMahsupDetail.tsx` `period_year/period_month` (yeni şema) ile, eski ortamlarda `(year, month)` (legacy) ile satırı okur.
+
+> **Lisanslı Satış istisnası:** `subscription_settings.lisansli_satis = true` olan tesisler YEKDEM mahsup akışına hiç girmez — Dashboard Effect 5 mahsup bloğunu atlar ve `yekdemMissing = "none"` set eder; `calculateInvoiceToDate` pipeline'ı da mahsup zorunluluğunu bypass eder. Bu tesislerde üretimin tamamı satış sayılır, mahsuplaşma yoktur.
 
 > Eğer `yekdem_value` ya da `yekdem_final` boş ise YekdemMahsupDetail sayfası net hata mesajı verir. Dashboard kartında ise yalnızca "—" görünür ve `yekdemMissing` state'i ihtimallerden birine düşer (`"value" | "final" | "both"`).
 
@@ -197,7 +201,7 @@ Tipik akış:
 
 ### 7.1 `subscription_settings` Yoksa Sessiz Çıkış (Dashboard)
 
-`Dashboard.tsx:805-810` (Effect 5) içinde:
+`Dashboard.tsx:864-868` (Effect 5) içinde:
 
 ```typescript
 if (!settings) {
@@ -208,7 +212,7 @@ if (!settings) {
 }
 ```
 
-Settings yoksa Dashboard kartları **sessizce** "—" gösterir; kullanıcıya neyin eksik olduğu söylenmez. Aynı şekilde `terim/gerilim/tarife` boşsa hata mesajı verilmez (`Dashboard.tsx:825-829`). YekdemMahsupDetail sayfası **bu kontroldeki açığı kapatır**: ayrıntılı hata mesajını UI'a basar (`Tesis ayarları eksik: terim/gerilim/tarife`).
+Settings yoksa Dashboard kartları **sessizce** "—" gösterir; kullanıcıya neyin eksik olduğu söylenmez. Aynı şekilde `terim/gerilim/tarife` boşsa hata mesajı verilmez (`Dashboard.tsx:885-890`). YekdemMahsupDetail sayfası **bu kontroldeki açığı kapatır**: ayrıntılı hata mesajını UI'a basar (`Tesis ayarları eksik: terim/gerilim/tarife`).
 
 Önerilen düzeltme: Dashboard tarafında da `setInvoiceErr("Tesis ayarları eksik: …")` mesajı set etmek. Şu anda yalnızca `console.error` ile loglanır.
 
@@ -238,7 +242,7 @@ durumlarında ortaya çıkar.
 
 `YekdemMahsupDetail.tsx` `DashboardShell` içine yerleşir:
 
-- **Üst başlık satırı:** Sayfa başlığı, alt etiket (`<billingLabel> faturasında kullanılan mahsup hesabı (<mahsupMonthLabel> verileri)`), seçili tesis adı.
+- **Üst başlık satırı:** Sayfa başlığı, alt etiket (`<billingLabel> faturasında kullanılan mahsup hesabı (<mahsupMonthLabel> verileri)`). Eski "Seçili tesis: X" etiketi başlıktan kaldırılmıştır; tesis bilgisi yalnızca seçici dropdown'da görünür.
 - **Tesis seçici:** `<select>` bileşeni, seçim `localStorage["eco_selected_sub"]`'a yazılır. "Panele dön" butonu `navigate(-1)` çağırır.
 - **Hata kutusu:** Tesis listesi veya mahsup hesabı hatası tek bir kırmızı blokta birleştirilir (`subsErr` ve `err`).
 - **Loading metni:** Hesap sürerken `"Yükleniyor…"` ifadesi.
@@ -254,7 +258,7 @@ Dashboard Effect 5 ve `YekdemMahsupDetail.tsx` Effect 1 aynı `calculateYekdemMa
 | Hata gösterimi | `console.error` + sessiz "—" | UI'da net hata mesajı |
 | `kbk` null davranışı | `monthlyKbk = null` → Effect 5 erken çıkar | `kbk = 1` varsayılan |
 | Mahsup eksik durumu | `yekdemMissing` state'i set edilir | `Error` fırlatılır, sayfa kırmızı kutu gösterir |
-| Tarafe alanları | `subscription_settings` SELECT → `terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil` | Yalnızca `kbk, terim, gerilim, tarife` |
+| Tarafe alanları | `subscription_settings` SELECT → `terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis` | Yalnızca `kbk, terim, gerilim, tarife` |
 | Tariff tablosu | `dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, perakende_enerji_bedeli` | Yalnızca `kdv, btv` |
 
 Bu farkın sebebi: Dashboard kartı tüm faturayı hesaplar (mahsup yalnızca bir bileşen), bu sayfa ise yalnızca mahsup adımını gösterir.
@@ -266,12 +270,14 @@ Bu farkın sebebi: Dashboard kartı tüm faturayı hesaplar (mahsup yalnızca bi
 - **`yekdem_official`** tablosu Dashboard kartı için fallback olarak kullanılır (tesis-özel kayıt yoksa). YekdemMahsupDetail sayfası `yekdem_official` fallback'ini **kullanmaz**: tesis-özel kayıt yoksa hata fırlatır. Bu davranış bilinçlidir; mahsup hesabı için tesis-özel `(yekdem_value, yekdem_final)` çiftine ihtiyaç vardır.
 - **Eski `mahsup` formülü** (önceki dokümanda yer alan tek aşamalı çarpım) kullanılmıyor; güncel formül BTV → KDV iki adımlı katlama uygular ve KDV dahil tutar döner.
 - **Kart üzerindeki ikon değişikliği**: dashboardCards.ts içindeki `files` key'inin label'ı `"YEKDEM Mahsup Tutarı"` olarak güncellenmiştir; eski sürümlerde `"Dosyalar"` etiketi vardı (`/dashboard/files` ile karıştırılmaması için).
+- **"Seçili tesis: X" başlık etiketi** (`selectedSubLabel`) sayfa başlığından kaldırıldı; YekdemDetail sayfasında da aynı sadeleştirme yapıldı. Veri mantığı değişmedi.
+- **Lisanslı Satış tesisleri** (2026-05-22, `20260522_001`) mahsup akışının tamamen dışındadır; eski davranışta her tesis için mahsup hesaplanırdı.
 
 ---
 
 ## Son Güncelleme
 
-- **Tarih:** 2026-05-03
+- **Tarih:** 2026-07-12
 - **Branch:** main
-- **Son commit:** `03aa828` — valla bişeler yaptık da hatırlamıyom amk
-- **Kapsanan dosyalar:** `src/components/dashboard/YekdemMahsupDetail.tsx`, `src/components/utils/calculateInvoice.ts`, `src/lib/paginatedFetch.ts`, `src/lib/subscriptionVisibility.ts`, `src/pages/Dashboard.tsx` (Effect 3, Effect 5), `src/pages/admin/SubscriptionYekdemAdmin.tsx`, `supabase/migrations/20260326_*.sql`
+- **Son commit:** `500506c` — commit (çalışma ağacındaki commit edilmemiş değişiklikler dahil belgelendi)
+- **Kapsanan dosyalar:** `src/components/dashboard/YekdemMahsupDetail.tsx`, `src/components/utils/calculateInvoice.ts`, `src/lib/paginatedFetch.ts`, `src/lib/subscriptionVisibility.ts`, `src/pages/Dashboard.tsx` (Effect 3, Effect 5), `src/pages/admin/SubscriptionYekdemAdmin.tsx`, `src/pages/admin/AdminUsersPage.tsx` (YEKDEM sekmesi, usd_kur), `supabase/migrations/20260326_*.sql`, `supabase/migrations/20260504_001_add_usd_kur_to_yekdem.sql`, `supabase/migrations/20260522_001_add_lisansli_satis_to_settings.sql`

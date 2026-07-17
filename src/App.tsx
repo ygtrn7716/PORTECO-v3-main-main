@@ -50,6 +50,7 @@ import MonthlyOverviewAdmin from "@/pages/admin/MonthlyOverviewAdmin";
 import ContactMessagesAdmin from "@/pages/admin/ContactMessagesAdmin";
 import UserEmailsAdmin from "@/pages/admin/UserEmailsAdmin";
 import EmailLogsAdmin from "@/pages/admin/EmailLogsAdmin";
+import FinanceAdmin from "@/pages/admin/FinanceAdmin";
 
 // GES pages
 import GesDetail from "@/components/dashboard/GesDetail";
@@ -60,9 +61,12 @@ import GesProductionAdmin from "@/pages/admin/GesProductionAdmin";
 import GesProductionUploadAdmin from "@/pages/admin/GesProductionUploadAdmin";
 import GesSyncLogAdmin from "@/pages/admin/GesSyncLogAdmin";
 import GesSatisHakkiAdmin from "@/pages/admin/GesSatisHakkiAdmin";
+import TalepBirlestirmeAdmin from "@/pages/admin/TalepBirlestirmeAdmin";
 import AdminUsersPage from "@/pages/admin/AdminUsersPage";
 import IntakeFormPage from "@/pages/IntakeFormPage";
 import IntakeFormsAdmin from "@/pages/admin/IntakeFormsAdmin";
+import DataHealthAdmin from "@/pages/admin/DataHealthAdmin";
+import InvoiceOverridesAdmin from "@/pages/admin/InvoiceOverridesAdmin";
 
 export default function App() {
   const { pathname } = useLocation();
@@ -120,6 +124,7 @@ export default function App() {
               <Route path="reactive-alerts" element={<ReactiveAlertsAdmin />} />
               <Route path="notification-events" element={<NotificationEventsAdmin />} />
               <Route path="epias-ptf" element={<EpiasPtfAdmin />} />
+              <Route path="veri-sagligi" element={<DataHealthAdmin />} />
               <Route path="invoice-snapshots" element={<InvoiceSnapshotsAdmin />} />
               <Route path="monthly-overview" element={<MonthlyOverviewAdmin />} />
               <Route path="contact-messages" element={<ContactMessagesAdmin />} />
@@ -132,8 +137,11 @@ export default function App() {
               <Route path="ges-production-upload" element={<GesProductionUploadAdmin />} />
               <Route path="ges-sync-logs" element={<GesSyncLogAdmin />} />
               <Route path="ges-satis-hakki" element={<GesSatisHakkiAdmin />} />
+              <Route path="talep-birlestirme" element={<TalepBirlestirmeAdmin />} />
               <Route path="kullanıcılar" element={<AdminUsersPage />} />
               <Route path="tanimlama" element={<IntakeFormsAdmin />} />
+              <Route path="finans" element={<FinanceAdmin />} />
+              <Route path="faturalar" element={<InvoiceOverridesAdmin />} />
             </Route>
           </Route>
         </Routes>

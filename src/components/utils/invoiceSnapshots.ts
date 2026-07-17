@@ -1,6 +1,10 @@
 //src/components/utils/invoiceSnapshots.ts
 import { supabase } from "@/lib/supabase";
 import { calculateInvoice, type InvoiceBreakdown, type TariffType } from "@/components/utils/calculateInvoice";
+import {
+  applyReactivePayloadToSnapshot,
+  type InvoiceOverrides,
+} from "@/components/utils/invoiceOverrides";
 
 /**
  * Saklı snapshot satırından "ödenecek toplam"ı (mahsup + diğer dahil) canlı
@@ -18,33 +22,63 @@ import { calculateInvoice, type InvoiceBreakdown, type TariffType } from "@/comp
  * total_production_kwh, on_yil, perakende_enerji_bedeli, yekdem_mahsup,
  * diger_degerler) bulunması gerekir; eksikse stored total_with_mahsup'a düşer.
  */
+type RecomputeRow = Partial<InvoiceSnapshotRow> & {
+  total_with_mahsup?: number | null;
+  yekdem_mahsup?: number | null;
+  diger_degerler?: number | null;
+};
+
+/** Saklı snapshot satırından calculateInvoice breakdown'ını TEK noktada üretir.
+ *  Saatlik net kolonları (varsa) geçirilir → net üretici/tüketici faturalarda
+ *  dağıtım/satış/enerji bazı saatlik nete döner. null (eski snapshot) → undefined
+ *  → aylık davranışa fallback. */
+export function buildSnapshotBreakdown(
+  row: RecomputeRow,
+  overrides?: InvoiceOverrides | null
+): InvoiceBreakdown {
+  // Reaktif payload (ri_kwh/rc_kwh) snapshot'ta ham toplam olmadığı için saklı
+  // yüzdelerden geri türetilerek ceza girdisine uygulanır (invoiceOverrides.ts).
+  const reactivePenaltyCharge = overrides?.reaktif?.payload
+    ? applyReactivePayloadToSnapshot(
+        {
+          totalConsumptionKwh: Number(row.total_consumption_kwh ?? 0),
+          riPercent: Number(row.reactive_ri_percent ?? 0),
+          rcPercent: Number(row.reactive_rc_percent ?? 0),
+          penalty: Number(row.reactive_penalty_charge ?? 0),
+        },
+        overrides.reaktif
+      ).penalty
+    : Number(row.reactive_penalty_charge ?? 0);
+
+  return calculateInvoice({
+    totalConsumptionKwh: Number(row.total_consumption_kwh ?? 0),
+    unitPriceEnergy: Number(row.unit_price_energy ?? 0),
+    unitPriceDistribution: Number(row.unit_price_distribution ?? 0),
+    btvRate: Number(row.btv_rate ?? 0),
+    vatRate: Number(row.vat_rate ?? 0),
+    tariffType: ((row.tariff_type as TariffType) ?? "single"),
+    contractPowerKw: Number(row.contract_power_kw ?? 0),
+    monthFinalDemandKw: Number(row.month_final_demand_kw ?? 0),
+    powerPrice: Number(row.power_price ?? 0),
+    powerExcessPrice: Number(row.power_excess_price ?? 0),
+    reactivePenaltyCharge,
+    trafoDegeri: Number(row.trafo_degeri ?? 0),
+    totalProductionKwh: Number(row.total_production_kwh ?? 0),
+    onYil: row.on_yil ?? true,
+    perakendeEnerjiBedeli: Number(row.perakende_enerji_bedeli ?? 0),
+    usdKur: Number(row.usd_kur ?? 0),
+    lisansliSatis: row.lisansli_satis ?? false,
+    netPositiveDrawKwh: row.net_positive_draw_kwh != null ? Number(row.net_positive_draw_kwh) : undefined,
+    netExcessFeedKwh: row.net_excess_feed_kwh != null ? Number(row.net_excess_feed_kwh) : undefined,
+  }, overrides);
+}
+
 export function recomputeSnapshotTotalWithMahsup(
-  row: Partial<InvoiceSnapshotRow> & {
-    total_with_mahsup?: number | null;
-    yekdem_mahsup?: number | null;
-    diger_degerler?: number | null;
-  }
+  row: RecomputeRow,
+  overrides?: InvoiceOverrides | null
 ): number {
   try {
-    const breakdown = calculateInvoice({
-      totalConsumptionKwh: Number(row.total_consumption_kwh ?? 0),
-      unitPriceEnergy: Number(row.unit_price_energy ?? 0),
-      unitPriceDistribution: Number(row.unit_price_distribution ?? 0),
-      btvRate: Number(row.btv_rate ?? 0),
-      vatRate: Number(row.vat_rate ?? 0),
-      tariffType: ((row.tariff_type as TariffType) ?? "single"),
-      contractPowerKw: Number(row.contract_power_kw ?? 0),
-      monthFinalDemandKw: Number(row.month_final_demand_kw ?? 0),
-      powerPrice: Number(row.power_price ?? 0),
-      powerExcessPrice: Number(row.power_excess_price ?? 0),
-      reactivePenaltyCharge: Number(row.reactive_penalty_charge ?? 0),
-      trafoDegeri: Number(row.trafo_degeri ?? 0),
-      totalProductionKwh: Number(row.total_production_kwh ?? 0),
-      onYil: row.on_yil ?? true,
-      perakendeEnerjiBedeli: Number(row.perakende_enerji_bedeli ?? 0),
-      usdKur: Number(row.usd_kur ?? 0),
-      lisansliSatis: row.lisansli_satis ?? false,
-    });
+    const breakdown = buildSnapshotBreakdown(row, overrides);
     const yekdem = Number(row.yekdem_mahsup ?? 0);
     const diger = Number(row.diger_degerler ?? 0);
     return breakdown.totalInvoice + yekdem + diger;
@@ -56,7 +90,7 @@ export function recomputeSnapshotTotalWithMahsup(
 /** Tek noktadan import edilen "snapshot select" listesi — recompute yapacak
  * çağıran tarafların kullanması beklenir. */
 export const INVOICE_SNAPSHOT_RECOMPUTE_FIELDS =
-  "total_consumption_kwh, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, yekdem_mahsup, diger_degerler, total_with_mahsup";
+  "total_consumption_kwh, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, total_with_mahsup";
 
 export type InvoiceType = "billed" | "backdated";
 
@@ -123,6 +157,14 @@ export type InvoiceSnapshotRow = {
   // tarife değişse bile sabit kalması için saklanır. null = eski snapshot →
   // gösterim tarafında canlı tarife fallback'i yapılır.
   ges_satis_dagitim_bedeli: number | null;
+
+  // Saatlik net mahsup (net üretici tesisler). null = eski snapshot → aylık fallback.
+  net_positive_draw_kwh: number | null; // Σ max(0, cn − gn) — yeni dağıtım bedeli bazı
+  net_excess_feed_kwh: number | null;   // Σ max(0, gn − cn) — yeni GES üretim satışı kWh
+
+  // Talep Birleştirme audit'i: bu faturaya waterfall ile tahsis edilen GES kWh.
+  // Hesaba GİRMEZ (recompute mevcut alanlardan çalışır); null = tahsis yok/eski snapshot.
+  allocated_ges_kwh: number | null;
 };
 
 export async function upsertInvoiceSnapshot(params: {
@@ -172,6 +214,12 @@ export async function upsertInvoiceSnapshot(params: {
   usdKur?: number;
   /** GES Üretim Satışı: fatura kesilirken donmuş dağıtım kesinti oranı (TL/kWh). */
   gesSatisDagitimBedeli?: number | null;
+  /** Saatlik net pozitif çekiş Σ max(0, cn−gn). Net üretici recompute'unda dağıtım bazı. */
+  netPositiveDrawKwh?: number | null;
+  /** Saatlik net fazla veriş Σ max(0, gn−cn). Net üretici recompute'unda GES satış kWh'ı. */
+  netExcessFeedKwh?: number | null;
+  /** Talep Birleştirme audit'i: bu faturaya tahsis edilen GES kWh. Hesaba girmez. */
+  allocatedGesKwh?: number | null;
 }) {
   const invoiceType = params.invoiceType ?? "billed";
 
@@ -230,6 +278,9 @@ export async function upsertInvoiceSnapshot(params: {
     perakende_enerji_bedeli: params.perakendeEnerjiBedeli ?? null,
     usd_kur: params.usdKur ?? null,
     ges_satis_dagitim_bedeli: params.gesSatisDagitimBedeli ?? null,
+    net_positive_draw_kwh: params.netPositiveDrawKwh ?? null,
+    net_excess_feed_kwh: params.netExcessFeedKwh ?? null,
+    allocated_ges_kwh: params.allocatedGesKwh ?? null,
   };
 
   const { error } = await supabase
@@ -251,7 +302,7 @@ export async function listInvoiceSnapshots(params: {
   const q = supabase
     .from("invoice_snapshots")
     .select(
-      "user_id, subscription_serno, period_year, period_month, invoice_type, month_label, total_with_mahsup, total_invoice, total_consumption_kwh, updated_at, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, yekdem_mahsup, diger_degerler"
+      "user_id, subscription_serno, period_year, period_month, invoice_type, month_label, total_with_mahsup, total_invoice, total_consumption_kwh, updated_at, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler"
     )
     .eq("user_id", params.userId)
     .eq("invoice_type", params.invoiceType ?? "billed")

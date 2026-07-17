@@ -10,9 +10,14 @@ import { upsertInvoiceSnapshot } from "@/components/utils/invoiceSnapshots";
 import AlternateTariffInvoiceSection from "@/components/dashboard/invoiceDetail/AlternateTariffInvoiceSection";
 import { resolveSelectedSub } from "@/lib/subscriptionVisibility";
 import { fetchAllConsumption } from "@/lib/paginatedFetch";
+import {
+  getFacilityAllocation,
+  applyAllocationToHourlyRows,
+} from "@/components/utils/gesAllocation";
 import { calculateGesOlmasaydi, type GesOlmasaydiResult } from "@/components/utils/calculateGesOlmasaydi";
 import GesOlmasaydiPanel from "@/components/dashboard/GesOlmasaydiPanel";
 import GesUretimSatisiCard from "@/components/dashboard/shared/GesUretimSatisiCard";
+import KayseriEkBedellerCard from "@/components/dashboard/shared/KayseriEkBedellerCard";
 import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
 
 import {
@@ -23,6 +28,11 @@ import type {
   InvoiceBreakdown,
   TariffType,
 } from "@/components/utils/calculateInvoice";
+import {
+  fetchInvoiceOverrides,
+  applyReactiveValueOverrides,
+  resolveUnitPriceOverride,
+} from "@/components/utils/invoiceOverrides";
 
 
 // ---- formatters
@@ -96,6 +106,12 @@ interface InvoiceViewData {
   reactiveRiPercent: number;
   reactiveRcPercent: number;
 
+  // Override'sız (doğal) değerler — AlternateTariffInvoiceSection simülasyonları
+  // override'lardan etkilenmesin diye ayrıca taşınır (override yoksa efektiflerle aynı).
+  naturalUnitPriceEnergy: number;
+  naturalReactiveRiPercent: number;
+  naturalReactiveRcPercent: number;
+
    trafoDegeri: number; // ✅ ekle
 
    digerDegerler: number;
@@ -107,6 +123,19 @@ interface InvoiceViewData {
    // GES Üretim Satışı kartı: dağıtım kesinti oranı (TL/kWh) — lisansli_satis'e göre
    // distribution_tariff_official.dagitim_uretici_1/2'den seçilen değer.
    dagitimUreticiBedeli: number;
+   // Kayseri OSB (owner_subscriptions.provider = 'vhs_kayseri'): Dağıtım Bedeli
+   // kalemi kaldırılır; katsayı kaydı varsa "Ek Bedeller" kartı gösterilir.
+   isKayseriOsb: boolean;
+   kayseriEkBedeller: { iletim: number; osbDagitim: number; lisanssizCekis: number } | null;
+   // Saatlik net mahsup (net üretici): alternatif tarife karşılaştırması da bu bazı kullansın.
+   netPositiveDrawKwh: number; // Σ max(0, cn − gn)
+   netExcessFeedKwh: number;   // Σ max(0, gn − cn)
+   // Talep Birleştirme: bu tesisin tahsis rolü (yoksa null → mevcut davranış).
+   // isSource: tesis aynı zamanda GES üretim sayacı (kendi tüketimini de mahsup ediyor).
+   gesAlloc:
+     | { role: "assigned"; priority: number; allocatedKwh: number; isSource: boolean }
+     | { role: "source" }
+     | null;
 }
 
 function mapTermToTariffType(term: string | null | undefined): TariffType {
@@ -380,6 +409,17 @@ export default function InvoiceDetail() {
         const periodMonth = prev.month() + 1;
         const monthLabel = prev.format("MMMM YYYY");
 
+        // 0.5) Fatura kalem override'ları (admin müdahaleleri). Hata PROPAGATE
+        // eder (fail-closed): doğal değerlerle hesaplayıp override'lı snapshot'ın
+        // üzerine yazmayı önler.
+        const invoiceLineOverrides = await fetchInvoiceOverrides({
+          userId: uid,
+          subscriptionSerno: selectedSub,
+          periodYear,
+          periodMonth,
+        });
+        if (cancel) return;
+
         // 1) tüketim (paginated)
         const hourly = await fetchAllConsumption({
           supabase,
@@ -396,12 +436,37 @@ export default function InvoiceDetail() {
         let totalRi = 0;
         let totalRc = 0;
         let totalGn = 0;
+        let netPositiveDrawKwh = 0; // Σ max(0, cn − gn)
+        let netExcessFeedKwh = 0;   // Σ max(0, gn − cn)
 
         for (const row of (hourly.data ?? []) as any[]) {
-          totalConsumptionKwh += Number(row.cn) || 0;
+          const cnH = Number(row.cn) || 0;
+          const gnH = Number(row.gn) || 0;
+          totalConsumptionKwh += cnH;
           totalRi += Number(row.ri) || 0;
           totalRc += Number(row.rc) || 0;
-          totalGn += Number(row.gn) || 0;
+          totalGn += gnH;
+          netPositiveDrawKwh += Math.max(0, cnH - gnH);
+          netExcessFeedKwh += Math.max(0, gnH - cnH);
+        }
+
+        // Talep Birleştirme: bu tesise GES tahsisi/kaynak rolü varsa saatlik
+        // seriden efektif değerleri üret (view=null → yukarıdaki toplamlar
+        // birebir aynı kalır).
+        const allocView = await getFacilityAllocation({
+          supabase,
+          userId: uid,
+          subscriptionSerno: selectedSub,
+          startIso: monthStart.toDate().toISOString(),
+          endIso: monthEndExclusive.toDate().toISOString(),
+        });
+        let allocatedGesKwh: number | null = null;
+        if (allocView) {
+          const eff = applyAllocationToHourlyRows(hourly.data ?? [], allocView);
+          totalGn = eff.totalGn;
+          netPositiveDrawKwh = eff.netPositiveDrawKwh;
+          netExcessFeedKwh = eff.netExcessFeedKwh;
+          if (allocView.role === "assigned") allocatedGesKwh = eff.allocatedKwh;
         }
 
         // 2) PTF – TL/kWh
@@ -456,7 +521,7 @@ export default function InvoiceDetail() {
         // 4) tesis ayarları (KBK + tarife + güç limit) -> SADECE subscription_settings
         const settingsRes = await supabase
           .from("subscription_settings")
-          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis, unit_price_adjustment")
+          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -485,6 +550,10 @@ export default function InvoiceDetail() {
 
         const onYil = settingsRes.data.on_yil ?? false;
         const lisansliSatis = settingsRes.data.lisansli_satis ?? false;
+        // GES Olmasaydı: null/true = behind-the-meter (mevcut davranış),
+        // false = anlık üretim kullanımı yok (arazi GES → ham tüketim = çekiş).
+        const anlikUretimKullanimi =
+          (settingsRes.data as any).anlik_uretim_kullanimi ?? null;
 
         const missing: string[] = [];
         if (!terim) missing.push("terim");
@@ -502,19 +571,22 @@ export default function InvoiceDetail() {
 
         const tariffType = mapTermToTariffType(terim);
 
-        // 5) multiplier + btv_enabled (owner_subscriptions)
+        // 5) multiplier + btv_enabled + provider (owner_subscriptions)
         let multiplier = 1;
         let btvEnabled = true;
+        let provider: string | null = null;
 
         // 5a) owner_subscriptions (user_id ile dene)
         const subRes1 = await supabase
           .from("owner_subscriptions")
-          .select("multiplier, btv_enabled")
+          .select("multiplier, btv_enabled, provider")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
 
         if (subRes1.error) throw subRes1.error;
+
+        provider = subRes1.data?.provider ?? null;
 
         if (
           subRes1.data?.multiplier != null &&
@@ -526,7 +598,7 @@ export default function InvoiceDetail() {
           // 5b) owner_subscriptions (user_id'siz dene — bazı yapılarda row bu şekilde bulunuyor)
           const subRes2 = await supabase
             .from("owner_subscriptions")
-            .select("multiplier, btv_enabled")
+            .select("multiplier, btv_enabled, provider")
             .eq("subscription_serno", selectedSub)
             .maybeSingle();
 
@@ -539,6 +611,32 @@ export default function InvoiceDetail() {
             multiplier = Number(subRes2.data.multiplier);
           }
           btvEnabled = subRes2.data?.btv_enabled ?? true;
+          if (provider == null) provider = subRes2.data?.provider ?? null;
+        }
+
+        // Kayseri OSB tespiti: dağıtım bedeli kaldırılır, Ek Bedeller kartı gösterilir.
+        const isKayseriOsb = provider === "vhs_kayseri";
+
+        // 5c) Kayseri OSB ek bedel katsayıları — kaydı olmayan tesiste kart gösterilmez.
+        // Okuma hatası faturayı kırmasın (kart opsiyonel).
+        let kayseriEkBedeller: { iletim: number; osbDagitim: number; lisanssizCekis: number } | null = null;
+        if (isKayseriOsb) {
+          const kayseriRes = await supabase
+            .from("kayseri_ek_bedeller")
+            .select("iletim_bedeli_aktif_tuketim, osb_dagitim_kullanim_bedeli, lisanssiz_uretim_cekis_bedeli")
+            .eq("user_id", uid)
+            .eq("subscription_serno", selectedSub)
+            .maybeSingle();
+
+          if (kayseriRes.error) {
+            console.error("kayseri_ek_bedeller okunamadı:", kayseriRes.error);
+          } else if (kayseriRes.data) {
+            kayseriEkBedeller = {
+              iletim: Number(kayseriRes.data.iletim_bedeli_aktif_tuketim ?? 0),
+              osbDagitim: Number(kayseriRes.data.osb_dagitim_kullanim_bedeli ?? 0),
+              lisanssizCekis: Number(kayseriRes.data.lisanssiz_uretim_cekis_bedeli ?? 0),
+            };
+          }
         }
 
         // 6) resmi dağıtım/güç tarifesi
@@ -556,8 +654,24 @@ export default function InvoiceDetail() {
 
         const unitPriceEnergy = (monthlyPTF + monthlyYekdem) * kbk + unitPriceAdjustment;
 
-        const unitPriceDistribution =
-          tariffRow.dagitim_bedeli != null ? Number(tariffRow.dagitim_bedeli) : 0;
+        // Kayseri OSB: dağıtım bedeli tedarikçi faturasında yok (OSB ayrı tahsil eder).
+        // Kaynakta 0'lanır ki snapshot kaydı/recompute ve GES Olmasaydı da tutarlı
+        // biçimde dağıtımsız hesaplansın.
+        const unitPriceDistribution = isKayseriOsb
+          ? 0
+          : tariffRow.dagitim_bedeli != null
+            ? Number(tariffRow.dagitim_bedeli)
+            : 0;
+        // Efektif (override'lı) birim fiyatlar — gösterim ve snapshot yazımı için.
+        // calculateInvoice'a DOĞAL fiyatlar geçilir; override içeride uygulanır.
+        const effectiveUnitPriceEnergy = resolveUnitPriceOverride(
+          unitPriceEnergy,
+          invoiceLineOverrides?.enerji
+        );
+        const effectiveUnitPriceDistribution = resolveUnitPriceOverride(
+          unitPriceDistribution,
+          invoiceLineOverrides?.dagitim
+        );
         const perakendeEnerjiBedeli =
           tariffRow.perakende_enerji_bedeli != null ? Number(tariffRow.perakende_enerji_bedeli) : 0;
         // GES Üretim Satışı dağıtım kesinti oranı (lisansli_satis'e göre seçilir).
@@ -577,16 +691,29 @@ export default function InvoiceDetail() {
         const vatRate = tariffRow.kdv != null ? Number(tariffRow.kdv) / 100 : 0;
 
         // 7) reaktif ceza
-        const riPercent =
+        // Doğal yüzdeler AlternateTariff simülasyonu için saklanır; gösterim ve
+        // ceza hesabı payload override'ı (varsa) uygulanmış efektif toplamlardan.
+        const naturalRiPercent =
           totalConsumptionKwh > 0 ? (totalRi / totalConsumptionKwh) * 100 : 0;
-        const rcPercent =
+        const naturalRcPercent =
           totalConsumptionKwh > 0 ? (totalRc / totalConsumptionKwh) * 100 : 0;
+
+        const { riSum: effRi, rcSum: effRc } = applyReactiveValueOverrides(
+          totalRi,
+          totalRc,
+          invoiceLineOverrides
+        );
+
+        const riPercent =
+          totalConsumptionKwh > 0 ? (effRi / totalConsumptionKwh) * 100 : 0;
+        const rcPercent =
+          totalConsumptionKwh > 0 ? (effRc / totalConsumptionKwh) * 100 : 0;
 
         const reactiveUnitPrice =
           tariffRow.reaktif_bedel != null ? Number(tariffRow.reaktif_bedel) : 0;
 
-        const riPenaltyEnergy = riPercent > REACTIVE_LIMIT_RI ? totalRi : 0;
-        const rcPenaltyEnergy = rcPercent > REACTIVE_LIMIT_RC ? totalRc : 0;
+        const riPenaltyEnergy = riPercent > REACTIVE_LIMIT_RI ? effRi : 0;
+        const rcPenaltyEnergy = rcPercent > REACTIVE_LIMIT_RC ? effRc : 0;
 
         const penaltyEnergy = riPenaltyEnergy + rcPenaltyEnergy; // kVArh
         const reactivePenaltyCharge = penaltyEnergy * reactiveUnitPrice; // TL (KDV öncesi)
@@ -648,7 +775,10 @@ export default function InvoiceDetail() {
             perakendeEnerjiBedeli,
             usdKur: monthlyUsdKur, // 10 yıl üstü için veriş fazlası USD bazlı (0 ise perakende fallback)
             lisansliSatis,
-          });
+            excludeDistributionCharge: isKayseriOsb,
+            netPositiveDrawKwh,
+            netExcessFeedKwh,
+          }, invoiceLineOverrides);
 
        //ara taşak madde ekliyom  buraya
 
@@ -800,9 +930,10 @@ try {
     monthLabel,
 
     totalConsumptionKwh,
-    unitPriceEnergy,
+    // Efektif (override'lı) birim fiyatlar yazılır → recompute idempotent kalır.
+    unitPriceEnergy: effectiveUnitPriceEnergy,
     unitPriceAdjustment,
-    unitPriceDistribution,
+    unitPriceDistribution: effectiveUnitPriceDistribution,
     btvRate,
     vatRate,
     tariffType,
@@ -816,7 +947,8 @@ try {
 
     reactiveRiPercent: riPercent,
     reactiveRcPercent: rcPercent,
-    reactivePenaltyCharge,
+    // Payload VE kalem override'ı sonrası ceza — saklı TL, saklı breakdown ile aynı.
+    reactivePenaltyCharge: breakdown.reactivePenaltyCharge,
 
     breakdown,
 
@@ -833,6 +965,11 @@ try {
     usdKur: monthlyUsdKur,
     // GES Üretim Satışı: fatura kesilirken donmuş dağıtım kesinti oranı (TL/kWh).
     gesSatisDagitimBedeli: dagitimUreticiBedeli,
+    // Saatlik net mahsup (net üretici recompute'unda dağıtım/satış bazı).
+    netPositiveDrawKwh,
+    netExcessFeedKwh,
+    // Talep Birleştirme audit'i (hesaba girmez).
+    allocatedGesKwh,
   });
 } catch (e) {
   console.error("upsertInvoiceSnapshot error:", e);
@@ -842,9 +979,13 @@ try {
         if (!cancel) {
           setData({
             breakdown,
+            isKayseriOsb,
+            kayseriEkBedeller,
             totalConsumptionKwh,
-            unitPriceEnergy,
-            unitPriceDistribution,
+            // Gösterim efektif değerlerden (kart + satır açıklamaları breakdown
+            // ile tutarlı); naturaller AlternateTariff simülasyonu için ayrıca.
+            unitPriceEnergy: effectiveUnitPriceEnergy,
+            unitPriceDistribution: effectiveUnitPriceDistribution,
             btvRate,
             vatRate,
             tariffType,
@@ -858,9 +999,12 @@ try {
             hasYekdemMahsup,
             yekdemMissing,
             totalWithMahsup,
-            reactivePenaltyCharge,
+            reactivePenaltyCharge: breakdown.reactivePenaltyCharge,
             reactiveRiPercent: riPercent,
-            reactiveRcPercent: rcPercent,          
+            reactiveRcPercent: rcPercent,
+            naturalUnitPriceEnergy: unitPriceEnergy,
+            naturalReactiveRiPercent: naturalRiPercent,
+            naturalReactiveRcPercent: naturalRcPercent,
             trafoDegeri, // ✅ ekle
             digerDegerler,
             totalProductionKwh: totalGn,
@@ -869,26 +1013,69 @@ try {
             perakendeEnerjiBedeli,
             usdKur: monthlyUsdKur,
             dagitimUreticiBedeli,
+            netPositiveDrawKwh,
+            netExcessFeedKwh,
+            gesAlloc: allocView
+              ? allocView.role === "assigned"
+                ? {
+                    role: "assigned" as const,
+                    priority: allocView.priority,
+                    allocatedKwh: allocatedGesKwh ?? 0,
+                    isSource: allocView.isSource,
+                  }
+                : { role: "source" as const }
+              : null,
           });
 
-          // GES olmasaydı — parametreleri sakla + GES kontrolü
-          // "GES Olmasaydı" karlılık paneli, GES'in gerçek ekonomik getirisini
-          // göstermek için satış GELİRİNİ de "GES'li" tarafa katmalı (ana fatura
-          // ekranı satışsız kalmaya DEVAM eder; burası ayrı amaca hizmet eder).
-          // Son fatura değişikliğinde verisFazlaBedeli ara toplamdan çıkarılmıştı;
-          // burada birebir geri ekleyerek değişiklik öncesi "GES'li" tutarı
-          // (satış dahil) yeniden kuruyoruz: × (1+KDV) çünkü fazla bedeli ara
-          // toplam (KDV öncesi) seviyesinde düşülüyordu.
-          const mevcutFaturaSatisDahil =
-            totalWithMahsup - breakdown.verisFazlaBedeli * (1 + vatRate);
+          // GES olmasaydı — GES kontrolü + parametreleri sakla
+          // GES plant kontrolü — sadece SEÇİLİ ABONELİĞE bağlı plant'lar
+          // (linked_serno = selectedSub). Kendi plant'ı olmayan ama Talep
+          // Birleştirme ile mahsup ALAN tesisler için modül "receiver"
+          // modunda çalışır (buton gate'i de gesAlloc'a bakar).
+          const { data: gesPlants } = await supabase
+            .from("ges_plants")
+            .select("id")
+            .eq("user_id", uid)
+            .eq("is_active", true)
+            .eq("linked_serno", selectedSub);
+          const hasOwnPlants = (gesPlants?.length ?? 0) > 0;
+          setHasGes(hasOwnPlants);
+
+          const gesOlmasaydiMode =
+            !hasOwnPlants && allocView?.role === "assigned" ? "receiver" : "producer";
+
+          // Kart 2 (Satılan Enerji): fatura sayfasındaki "GES Üretim Satışı"
+          // kartıyla birebir aynı girdiler → aynı Net Gelir.
+          const gesSatis =
+            breakdown.verisFazlaKwh > 0
+              ? calculateGesUretimSatisi({
+                  satisKwh: breakdown.verisFazlaKwh,
+                  onYil,
+                  usdKur: monthlyUsdKur,
+                  perakendeEnerjiBedeli,
+                  dagitimBedeli: dagitimUreticiBedeli,
+                })
+              : null;
 
           gesOlmasaydiParamsRef.current = {
             selectedSub,
             periodYear,
             periodMonth,
-            mevcutFatura: mevcutFaturaSatisDahil,
-            mevcutBirimFiyat: unitPriceEnergy,
+            mode: gesOlmasaydiMode,
+            anlikUretimKullanimi,
+            // Kart 1 = fatura sayfasındaki "Genel Toplam (YEKDEM Mahsubu Dahil)"
+            // ile birebir aynı tutar. Birim fiyat da efektif (snapshot yolu
+            // snap.unit_price_energy'yi okur; o artık efektif değer).
+            mevcutFatura: totalWithMahsup,
+            mevcutBirimFiyat: effectiveUnitPriceEnergy,
             mevcutTuketimKwh: totalConsumptionKwh,
+            verisMahsupKwh: breakdown.verisMahsupKwh,
+            satisKwh: breakdown.verisFazlaKwh,
+            satisNetGelir: gesSatis?.satisNetGelir ?? 0,
+            // Kart 3 simetrisi: karşı-olgusal faturaya da eklenir.
+            yekdemMahsup: yekdemMahsupValue,
+            digerDegerler,
+            allocatedKwh: allocatedGesKwh,
             monthlyYekdem,
             kbk: kbk,
             unitPriceAdjustment,
@@ -909,17 +1096,6 @@ try {
           };
           gesOlmasaydiCalced.current = false;
           setGesOlmasaydiResult(null);
-
-          // GES plant kontrolü — sadece SEÇİLİ ABONELİĞE bağlı plant'lar
-          // (linked_serno = selectedSub). Böylece "GES Olmasaydı" kartı yalnızca
-          // bu tüketim tesisine eşleşen GES varsa görünür.
-          const { data: gesPlants } = await supabase
-            .from("ges_plants")
-            .select("id")
-            .eq("user_id", uid)
-            .eq("is_active", true)
-            .eq("linked_serno", selectedSub);
-          setHasGes((gesPlants?.length ?? 0) > 0);
         }
       } catch (e: any) {
         if (!cancel) {
@@ -952,9 +1128,17 @@ try {
         subscriptionSerno: p.selectedSub,
         periodYear: p.periodYear,
         periodMonth: p.periodMonth,
+        mode: p.mode,
+        anlikUretimKullanimi: p.anlikUretimKullanimi,
         mevcutFatura: p.mevcutFatura,
         mevcutBirimFiyat: p.mevcutBirimFiyat,
         mevcutTuketimKwh: p.mevcutTuketimKwh,
+        verisMahsupKwh: p.verisMahsupKwh,
+        satisKwh: p.satisKwh,
+        satisNetGelir: p.satisNetGelir,
+        yekdemMahsup: p.yekdemMahsup,
+        digerDegerler: p.digerDegerler,
+        allocatedKwh: p.allocatedKwh,
         monthlyYekdem: p.monthlyYekdem,
         kbk: p.kbk,
         unitPriceAdjustment: p.unitPriceAdjustment,
@@ -981,12 +1165,6 @@ try {
     }
   }, [uid]);
 
-  const selectedSubLabel = (() => {
-    const s = subs.find((s) => s.subscriptionSerNo === selectedSub);
-    if (!s) return selectedSub != null ? `Tesis ${selectedSub}` : "Tesis seçilmedi";
-    return s.nickname ?? s.title ?? `Tesis ${s.subscriptionSerNo}`;
-  })();
-
   const demandInfo = useMemo(() => {
     if (!data) return null;
 
@@ -1000,6 +1178,11 @@ try {
 
 const isDualTerm = data?.tariffType === "dual";
 
+// Admin tarafından faturadan çıkarılan kalemler — satırları hiç render edilmez.
+const excludedItems = new Set<string>(
+  data?.breakdown.appliedOverrides?.excludedItems ?? []
+);
+
 
   return (
     <DashboardShell>
@@ -1010,13 +1193,6 @@ const isDualTerm = data?.tariffType === "dual";
           <p className="text-sm text-neutral-500">
             {data ? `${data.monthLabel} dönemine ait fatura hesabı` : "Geçen aya ait fatura detayları"}
           </p>
-
-          {selectedSub && (
-            <p className="mt-1 text-xs text-neutral-500">
-              Seçili tesis:{" "}
-              <span className="font-medium text-neutral-800">{selectedSubLabel}</span>
-            </p>
-          )}
         </div>
 
         <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center sm:justify-end md:w-auto">
@@ -1215,11 +1391,11 @@ const isDualTerm = data?.tariffType === "dual";
             subscriptionSerno={selectedSub!}
             tariffType={data.tariffType}
             totalConsumptionKwh={data.totalConsumptionKwh}
-            unitPriceEnergy={data.unitPriceEnergy}
+            unitPriceEnergy={data.naturalUnitPriceEnergy}
             monthFinalDemandKw={data.monthFinalDemandKw}
             hasDemandData={data.hasDemandData}
-            reactiveRiPercent={data.reactiveRiPercent}
-            reactiveRcPercent={data.reactiveRcPercent}
+            reactiveRiPercent={data.naturalReactiveRiPercent}
+            reactiveRcPercent={data.naturalReactiveRcPercent}
             trafoDegeri={data.trafoDegeri}
             digerDegerler={data.digerDegerler}
             currentTotalWithMahsup={data.totalWithMahsup}
@@ -1230,6 +1406,8 @@ const isDualTerm = data?.tariffType === "dual";
             lisansliSatis={data.lisansliSatis}
             perakendeEnerjiBedeli={data.perakendeEnerjiBedeli}
             usdKur={data.usdKur}
+            netPositiveDrawKwh={data.netPositiveDrawKwh}
+            netExcessFeedKwh={data.netExcessFeedKwh}
           />
 
 
@@ -1252,19 +1430,21 @@ const isDualTerm = data?.tariffType === "dual";
                 </thead>
 
                 <tbody>
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">Enerji Bedeli</td>
-                    <td className="py-2 pr-4 text-neutral-600">
-                      {fmtUnit(data.unitPriceEnergy)} TL/kWh ×{" "}
-                      {fmtKwh(data.totalConsumptionKwh)} kWh
-                    </td>
-                    <td className="py-2 pr-4 text-right">
-                      {fmtMoney2(data.breakdown.energyCharge)}
-                    </td>
-                  </tr>
+                  {!excludedItems.has("enerji") && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">Enerji Bedeli</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        {fmtUnit(data.unitPriceEnergy)} TL/kWh ×{" "}
+                        {fmtKwh(data.totalConsumptionKwh)} kWh
+                      </td>
+                      <td className="py-2 pr-4 text-right">
+                        {fmtMoney2(data.breakdown.energyCharge)}
+                      </td>
+                    </tr>
+                  )}
 
 
-                    {data.trafoDegeri > 0 && (
+                    {data.trafoDegeri > 0 && !excludedItems.has("trafo") && (
                           <tr className="border-b border-neutral-100">
                             <td className="py-2 pr-4">Trafo Kaybı</td>
                             <td className="py-2 pr-4 text-neutral-600">
@@ -1277,30 +1457,35 @@ const isDualTerm = data?.tariffType === "dual";
                         )}
 
 
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">Dağıtım Bedeli</td>
-                    <td className="py-2 pr-4 text-neutral-600">
-                      {fmtUnit(data.breakdown.effectiveDistributionUnitPrice)} TL/kWh ×{" "}
-                      {fmtKwh(data.breakdown.distributionChargeKwh)} kWh
-                    </td>
-                    <td className="py-2 pr-4 text-right">
-                      {fmtMoney2(data.breakdown.distributionCharge)}
-                    </td>
-                  </tr>
+                  {/* Kayseri OSB: dağıtım bedeli OSB'ce ayrı tahsil edilir — kalem faturada yok */}
+                  {!data.isKayseriOsb && !excludedItems.has("dagitim") && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">Dağıtım Bedeli</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        {fmtUnit(data.breakdown.effectiveDistributionUnitPrice)} TL/kWh ×{" "}
+                        {fmtKwh(data.breakdown.distributionChargeKwh)} kWh
+                      </td>
+                      <td className="py-2 pr-4 text-right">
+                        {fmtMoney2(data.breakdown.distributionCharge)}
+                      </td>
+                    </tr>
+                  )}
 
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">
-                      BTV (%{(data.btvRate * 100).toFixed(2)})
-                    </td>
-                    <td className="py-2 pr-4 text-neutral-600">
-                      Net enerji bedeli × BTV oranı
-                    </td>
-                    <td className="py-2 pr-4 text-right">
-                      {fmtMoney2(data.breakdown.btvCharge)}
-                    </td>
-                  </tr>
+                  {!excludedItems.has("btv") && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">
+                        BTV (%{(data.btvRate * 100).toFixed(2)})
+                      </td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        Net enerji bedeli × BTV oranı
+                      </td>
+                      <td className="py-2 pr-4 text-right">
+                        {fmtMoney2(data.breakdown.btvCharge)}
+                      </td>
+                    </tr>
+                  )}
 
-                  {isDualTerm && (
+                  {isDualTerm && !excludedItems.has("guc") && (
                     <>
                       <tr className="border-b border-neutral-100">
                         <td className="py-2 pr-4">Güç Bedeli (Limit içi)</td>
@@ -1321,16 +1506,18 @@ const isDualTerm = data?.tariffType === "dual";
                   )}
 
 
-                  <tr className="border-b border-neutral-100">
-                    <td className="py-2 pr-4">Reaktif Ceza Bedeli</td>
-                    <td className="py-2 pr-4 text-neutral-600">
-                      Ri %{data.reactiveRiPercent.toFixed(1)} / Rc %
-                      {data.reactiveRcPercent.toFixed(1)}
-                    </td>
-                    <td className="py-2 pr-4 text-right">
-                      {fmtMoney2(data.reactivePenaltyCharge)}
-                    </td>
-                  </tr>
+                  {!excludedItems.has("reaktif") && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">Reaktif Ceza Bedeli</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        Ri %{data.reactiveRiPercent.toFixed(1)} / Rc %
+                        {data.reactiveRcPercent.toFixed(1)}
+                      </td>
+                      <td className="py-2 pr-4 text-right">
+                        {fmtMoney2(data.reactivePenaltyCharge)}
+                      </td>
+                    </tr>
+                  )}
 
                   {/* Veriş Mahsup — çekişi geçmeyen kısım (birim fiyatla) */}
                   {data.breakdown.verisMahsupKwh > 0 && (
@@ -1440,6 +1627,41 @@ const isDualTerm = data?.tariffType === "dual";
             </div>
           </div>
 
+          {/* Talep Birleştirme bilgi notu — üç durum */}
+          {data.gesAlloc?.role === "assigned" && data.gesAlloc.isSource && (
+            <div className="rounded-2xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800">
+              Talep Birleştirme: bu tesis üretim kaynağıdır. Üretim önce kendi tüketiminden
+              mahsup edildi; bu faturaya {fmtKwh(data.gesAlloc.allocatedKwh)} kWh mahsup tahsis
+              edildi (öncelik {data.gesAlloc.priority}).
+              {data.gesAlloc.priority === 1 &&
+                " Tüm tesislerden artan fazla üretimin satışı bu tesisin faturasında gösterilir."}
+            </div>
+          )}
+          {data.gesAlloc?.role === "assigned" && !data.gesAlloc.isSource && (
+            <div className="rounded-2xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800">
+              Talep Birleştirme: bu faturaya {fmtKwh(data.gesAlloc.allocatedKwh)} kWh GES mahsubu
+              tahsis edildi (öncelik {data.gesAlloc.priority}).
+              {data.gesAlloc.priority === 1 &&
+                " Fazla üretim satışı bu tesisin faturasında gösterilir."}
+            </div>
+          )}
+          {data.gesAlloc?.role === "source" && (
+            <div className="rounded-2xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800">
+              Bu sayacın üretimi Talep Birleştirme ile diğer tesislere mahsup edilmektedir;
+              veriş bu faturada 0 kabul edilir.
+            </div>
+          )}
+
+          {/* Ek Bedeller — Kayseri OSB'nin ayrıca tahsil ettiği bedeller, faturaya dahil DEĞİL */}
+          {data.isKayseriOsb && data.kayseriEkBedeller && (
+            <KayseriEkBedellerCard
+              rates={data.kayseriEkBedeller}
+              totalConsumptionKwh={data.totalConsumptionKwh}
+              verisMahsupKwh={data.breakdown.verisMahsupKwh}
+              verisFazlaKwh={data.breakdown.verisFazlaKwh}
+            />
+          )}
+
           {/* GES Üretim Satışı — fazla üretim satışı, faturaya dahil DEĞİL */}
           {data.breakdown.verisFazlaKwh > 0 && (
             <GesUretimSatisiCard
@@ -1455,8 +1677,9 @@ const isDualTerm = data?.tariffType === "dual";
           )}
         </>
       )}
-      {/* GES Olmasaydı tetik butonu */}
-      {hasGes && data && (
+      {/* GES Olmasaydı tetik butonu — kendi GES'i olan VEYA Talep Birleştirme
+          ile mahsup alan (assigned) tesislerde görünür */}
+      {data && (hasGes || data.gesAlloc?.role === "assigned") && (
         <button
           onClick={handleGesOlmasaydiOpen}
           className="fixed bottom-6 right-6 z-30 flex items-center gap-2 rounded-full bg-amber-500 px-5 py-3 text-sm font-medium text-white shadow-lg hover:bg-amber-600 transition-colors"

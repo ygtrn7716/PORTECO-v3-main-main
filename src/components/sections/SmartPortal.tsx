@@ -1,4 +1,3 @@
-import { Link } from "react-router-dom";
 import Container from "@/components/layout/Container";
 import { Monitor, Smartphone, BarChart3 } from "lucide-react";
 import { motion } from "framer-motion";
@@ -49,12 +48,12 @@ export default function SmartPortal() {
             </div>
 
             <div className="mt-8">
-              <Link
-                to="/#features"
+              <a
+                href="https://ecoenerji.net.tr/blog/porteco-nedir"
                 className="inline-flex items-center rounded-md bg-[#0A66FF] px-5 py-3 text-sm font-medium text-white hover:bg-[#0a59e0] transition shadow-sm shadow-[#0A66FF]/20"
               >
                 Nasıl Çalışır?
-              </Link>
+              </a>
             </div>
           </motion.div>
 

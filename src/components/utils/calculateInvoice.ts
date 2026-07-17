@@ -1,5 +1,11 @@
 // src/utils/calculateInvoice.ts
 
+import type {
+  AppliedInvoiceOverrides,
+  InvoiceOverrideItemKey,
+  InvoiceOverrides,
+} from "./invoiceOverrides";
+
 export type TariffType = "single" | "dual";
 
 export interface InvoiceInput {
@@ -48,6 +54,18 @@ export interface InvoiceInput {
   // (ikisi de true olabilir — on_yil bu durumda sadece satış birim fiyatını
   // belirler, mahsup davranışında lisansliSatis baskındır).
   lisansliSatis?: boolean;
+
+  // Kayseri OSB (vhs_kayseri): dağıtım bedeli OSB tarafından ayrı faturalandırılır.
+  // true ise Dağıtım Bedeli kalemi tamamen kaldırılır (charge/adjustment/kWh/birim = 0);
+  // diğer tüm kalemler (Enerji, BTV, Güç, Reaktif, Veriş Mahsup, KDV) aynen hesaplanır.
+  excludeDistributionCharge?: boolean;
+
+  // Saatlik net mahsup (YALNIZCA net üretici, lisanslı olmayan tesislerde kullanılır).
+  // Sağlandığında: dağıtım bedeli bazı net pozitif çekişe, GES üretim satışı kWh'ı
+  // net fazla verişe döner. Verilmezse (eski snapshot / non-GES) aylık davranışa
+  // fallback yapılır. Birim fiyat (D/2) ve enerji tarafı her durumda aynı kalır.
+  netPositiveDrawKwh?: number; // Σ max(0, cn_saat − gn_saat)
+  netExcessFeedKwh?: number;   // Σ max(0, gn_saat − cn_saat)
 }
 
 // 10 yıl üstü tesislerin veriş fazlası satışında kullanılan sabit USD birim fiyatı.
@@ -86,13 +104,19 @@ export interface InvoiceBreakdown {
 
     trafoCharge: number;
 
+  // Uygulanan override özeti — yalnızca overrides parametresi kalem içerdiğinde
+  // set edilir (UI satır gizleme + "düzenlendi" işaretleme için).
+  appliedOverrides?: AppliedInvoiceOverrides;
 }
 
-export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
+export function calculateInvoice(
+  input: InvoiceInput,
+  overrides?: InvoiceOverrides | null
+): InvoiceBreakdown {
   const {
     totalConsumptionKwh,
-    unitPriceEnergy,
-    unitPriceDistribution,
+    unitPriceEnergy: unitPriceEnergyInput,
+    unitPriceDistribution: unitPriceDistributionInput,
     btvRate,
     vatRate,
     tariffType,
@@ -104,12 +128,31 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
 
     trafoDegeri, // ✅
     totalProductionKwh,
+    netPositiveDrawKwh,
+    netExcessFeedKwh,
   } = input;
 
   const lisansliSatis = input.lisansliSatis ?? false;
+  const excludeDistributionCharge = input.excludeDistributionCharge ?? false;
+
+  // Fatura kalem override'ları — GİRDİ SEVİYESİ (Aşama 1).
+  // Birim fiyat override'ı mutlak değerle YERİNE geçer; shadow edilen isimler
+  // sayesinde aşağıdaki formül zinciri (enerji, trafo, dağıtım, BTV, veriş
+  // mahsup bedeli) efektif fiyattan doğal olarak akar.
+  const ov = overrides ?? null;
+  const enerjiUnitOv = ov?.enerji?.unitPriceOverride;
+  const dagitimUnitOv = ov?.dagitim?.unitPriceOverride;
+  const unitPriceEnergy =
+    enerjiUnitOv != null && Number.isFinite(enerjiUnitOv)
+      ? enerjiUnitOv
+      : unitPriceEnergyInput;
+  const unitPriceDistribution =
+    dagitimUnitOv != null && Number.isFinite(dagitimUnitOv)
+      ? dagitimUnitOv
+      : unitPriceDistributionInput;
 
   // 1) Enerji + dağıtım
-  const energyCharge = unitPriceEnergy * totalConsumptionKwh;
+  let energyCharge = unitPriceEnergy * totalConsumptionKwh;
 
   // ✅ Trafo bedeli (null/0 ise 0)
   const trafoKwh =
@@ -117,7 +160,7 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
       ? trafoDegeri
       : 0;
 
-  const trafoCharge = unitPriceEnergy * trafoKwh;
+  let trafoCharge = unitPriceEnergy * trafoKwh;
 
   // Çekiş tabanı:
   // - Normal tesisler: trafo kaybı şebekeden çekilen enerjinin bir parçasıdır
@@ -136,55 +179,94 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
   const cekisCharge = unitPriceDistribution * distributionBaseKwh;
   const netKwh = totalConsumptionKwh - verisKwh;
 
-  // Dağıtım bedeli:
-  //  - Satış var (veriş > çekiş) → dağıtım = (D/2) × çekiş
-  //      Net üretici olan tesisler için tarife biriminin yarısı uygulanır.
-  //      Veriş çekişe eşit olduğunda satış 0'dır, bu kural devreye girmez.
-  //  - Üretim = çekiş (satış yok, rare edge) → dağıtım = D × çekiş
-  //      Mahsup uygulanmaz; tam tarife (negatife düşmez).
-  //  - Normal (veriş < çekiş) → mahsuplu eski formül: çekiş×D - veriş×(D/2)
+  // Saatlik net mahsup, ÜRETİMİ OLAN (veriş > 0) tüm lisanssız tesislerde devreye
+  // girer — hem net üretici hem net tüketici. (Net tüketici de saat bazında fazla
+  // üretip satabilir.) İki saatlik-net toplamı da geçilmiş olmalı. Aksi halde
+  // (üretimsiz / lisanslı / değerler yok) aylık davranış korunur.
+  const useHourlyNet =
+    !lisansliSatis &&
+    verisKwh > 0 &&
+    netPositiveDrawKwh != null && Number.isFinite(netPositiveDrawKwh) &&
+    netExcessFeedKwh != null && Number.isFinite(netExcessFeedKwh);
+
+  // Dağıtım bedeli — kullanıcı bazlı iki-durumlu formül (sadeleştirme YOK):
+  //  • Lisanslı Satış → mahsup yok, dağıtım = D × çekiş.
+  //  • Aksi halde (mahsuplu tesisler): birim fiyat ÖNCE hesaplanır, sonra
+  //    "mahsup edilmiş tüketim" (BAZ = net pozitif çekiş) ile çarpılarak tutar
+  //    bulunur. Tutar AYLIK çekiş/veriş + /2 ile hesaplanır (dağıtım aylık, GES
+  //    satışı saatlik — hibrit kasıtlı). D = unitPriceDistribution.
+  //      CASE 1 — toplam veriş > toplam çekiş (net üretici):
+  //        birim = (çekiş × D / 2) / BAZ ;            tutar = birim × BAZ
+  //      CASE 2 — toplam veriş ≤ toplam çekiş (net tüketici; sınır da Case 2):
+  //        birim = (çekiş × D − veriş × D / 2) / BAZ ; tutar = birim × BAZ
+  //    "çekiş" trafoyu içerir (distributionBaseKwh = tüketim + trafo). Durum
+  //    ayrımı ise toplam veriş ile toplam tüketim (Σcn, trafosuz) karşılaştırılarak
+  //    yapılır. BAZ = net_positive_draw_kwh (saatlik öz-tüketim sonrası net çekiş,
+  //    trafosuz); böylece üretimsiz/trafolu tesiste tutar bugünkü D×(çekiş) ile
+  //    birebir aynı kalır, gösterilen birim trafo etkisini bugünküyle aynı yansıtır.
   let distributionAdjustment: number;
   let distributionCharge: number;
   let distributionChargeKwh: number;
   let effectiveDistributionUnitPrice: number;
 
-  if (lisansliSatis) {
+  if (excludeDistributionCharge) {
+    // Kayseri OSB: dağıtım bedeli faturada yok (OSB ayrı tahsil eder).
+    distributionAdjustment = 0;
+    distributionCharge = 0;
+    distributionChargeKwh = 0;
+    effectiveDistributionUnitPrice = 0;
+  } else if (lisansliSatis) {
     // Lisanslı Satış: mahsup yok, dağıtım tam tarifeyle çekiş üzerinden alınır
     distributionAdjustment = 0;
     distributionCharge = cekisCharge;
     distributionChargeKwh = distributionBaseKwh;
     effectiveDistributionUnitPrice = unitPriceDistribution;
-  } else if (verisKwh > totalConsumptionKwh) {
-    // Satış var → (D/2) × çekiş
-    distributionCharge = (unitPriceDistribution / 2) * distributionBaseKwh;
-    distributionAdjustment = cekisCharge - distributionCharge; // = cekisCharge / 2
-    distributionChargeKwh = distributionBaseKwh;
-    effectiveDistributionUnitPrice = unitPriceDistribution / 2;
-  } else if (netKwh <= 0) {
-    // Üretim = tüketim (satış yok)
-    distributionAdjustment = 0;
-    distributionCharge = cekisCharge;
-    distributionChargeKwh = distributionBaseKwh;
-    effectiveDistributionUnitPrice = unitPriceDistribution;
   } else {
-    // Normal: çekiş>veriş, mahsuplu eski formül
-    distributionAdjustment = (unitPriceDistribution / 2) * verisKwh;
-    distributionCharge = cekisCharge - distributionAdjustment;
-    distributionChargeKwh = netKwh;
-    effectiveDistributionUnitPrice = netKwh !== 0
-      ? distributionCharge / netKwh
-      : unitPriceDistribution;
-  }
+    // Mahsup edilmiş tüketim (BAZ) = net pozitif çekiş. Saatlik net yoksa
+    // (eski snapshot / non-GES) aylık fallback: max(0, toplam çekiş − toplam veriş).
+    const mahsupBaz =
+      netPositiveDrawKwh != null && Number.isFinite(netPositiveDrawKwh)
+        ? netPositiveDrawKwh
+        : Math.max(0, totalConsumptionKwh - verisKwh);
 
-  console.log('[DAGITIM]', { verisKwh, cekisCharge, distributionAdjustment, distributionCharge, distributionChargeKwh, effectiveDistributionUnitPrice, netKwh });
+    // Durum ayrımı: toplam veriş vs toplam çekiş (Σcn). Sınır (veriş = çekiş) → Case 2.
+    const netProducer = verisKwh > totalConsumptionKwh;
+
+    // Sadeleştirilmiş eşdeğer tutar — yalnızca sıfıra bölme guard'ında doğrudan
+    // kullanılır; baz > 0 iken tutar birim × baz ile (aynı değere) yeniden üretilir.
+    const verisCharge = unitPriceDistribution * verisKwh;
+    const simplifiedCharge = netProducer
+      ? cekisCharge / 2
+      : cekisCharge - verisCharge / 2;
+
+    if (mahsupBaz > 0) {
+      // Birim fiyatı ÖNCE hesapla, sonra bazla çarp (müşteri o ayki birim fiyatı görür).
+      effectiveDistributionUnitPrice = simplifiedCharge / mahsupBaz;
+      distributionCharge = effectiveDistributionUnitPrice * mahsupBaz;
+      distributionChargeKwh = mahsupBaz;
+    } else {
+      // Sıfıra bölme guard'ı: birim 0 (gösterimde "—"), tutar sadeleştirilmiş eşdeğer.
+      // NaN/Infinity faturaya asla yansımaz.
+      effectiveDistributionUnitPrice = 0;
+      distributionCharge = simplifiedCharge;
+      distributionChargeKwh = 0;
+    }
+    distributionAdjustment = cekisCharge - distributionCharge;
+  }
 
   // 2) BTV (net enerji bedeli üzerinden — veriş mahsuplu)
   // netKwh = totalConsumptionKwh - verisKwh (dağıtımda da aynı)
   // Lisanslı Satış: veriş düşülmez, BTV tüketim üzerinden hesaplanır.
   // Trafo bedeli ayrı bir gider; BTV hesabına dahil edilmez.
-  const netEnergyKwh = lisansliSatis ? totalConsumptionKwh : Math.abs(netKwh);
+  // Saatlik net devredeyse net enerji = net pozitif çekiş (şebekeden gerçekte
+  // çekilen); aksi halde aylık |net|.
+  const netEnergyKwh = lisansliSatis
+    ? totalConsumptionKwh
+    : useHourlyNet
+      ? netPositiveDrawKwh!
+      : Math.abs(netKwh);
   const netEnergyCharge = unitPriceEnergy * netEnergyKwh;
-  const btvCharge = lisansliSatis
+  let btvCharge = lisansliSatis
     ? netEnergyCharge * btvRate
     : (netEnergyCharge + trafoCharge) * btvRate;
 
@@ -201,10 +283,10 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
     }
   }
 
-  const powerTotalCharge = powerBaseCharge + powerExcessCharge;
+  let powerTotalCharge = powerBaseCharge + powerExcessCharge;
 
   // 4) Reaktif ceza
-  const reactivePenaltyCharge =
+  let reactivePenaltyCharge =
     reactivePenaltyInput != null && Number.isFinite(reactivePenaltyInput)
       ? reactivePenaltyInput
       : 0;
@@ -224,17 +306,29 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
   const perakendeEnerjiBedeli = input.perakendeEnerjiBedeli ?? 0;
   const usdKur = input.usdKur ?? 0;
 
-  // Lisanslı Satış: mahsup yok; tüm üretim "fazla" (satış) olarak işlenir.
+  // Enerji mahsubu (faturadan düşülen kısım):
+  //  • Lisanslı Satış: mahsup yok; tüm üretim "fazla" (satış).
+  //  • Saatlik net devrede: SAAT-İÇİ örtüşme Σ min(cn,gn) = tüketim − net pozitif
+  //    çekiş. Satılan enerji (net fazla veriş) burada mahsup EDİLMEZ — yoksa aynı
+  //    kWh hem satışta hem mahsupta sayılır (çift sayım). Böylece net enerji =
+  //    net pozitif çekiş × birim olur.
+  //  • Aksi halde (aylık): min(veriş, tüketim).
   const verisMahsupKwh = lisansliSatis
     ? 0
-    : verisKwh > 0
-      ? Math.min(verisKwh, totalConsumptionKwh)
-      : 0;
+    : useHourlyNet
+      ? Math.max(0, totalConsumptionKwh - netPositiveDrawKwh!)
+      : verisKwh > 0
+        ? Math.min(verisKwh, totalConsumptionKwh)
+        : 0;
+  // Satılan (fazla) veriş kWh'ı. Saatlik net devredeyse net fazla veriş
+  // (Σ max(0, gn−cn)); aksi halde aylık fazla (Σgn − Σtüketim).
   const verisFazlaKwh = lisansliSatis
     ? verisKwh
-    : verisKwh > 0
-      ? Math.max(0, verisKwh - totalConsumptionKwh)
-      : 0;
+    : useHourlyNet
+      ? netExcessFeedKwh!
+      : verisKwh > 0
+        ? Math.max(0, verisKwh - totalConsumptionKwh)
+        : 0;
 
   // Fazla kısmı için birim fiyat seçimi (USD veya TL fallback)
   const verisFazlaUseUsd = onYil && usdKur > 0;
@@ -247,6 +341,59 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
   const verisSatisBedeli  = verisKwh > 0
     ? (verisMahsupBedeli + verisFazlaBedeli)
     : 0;
+
+  // 4.6) Fatura kalem override'ları — KALEM SEVİYESİ (toplamlardan önce).
+  // Öncelik: isExcluded > amountOverride. Kalemler arası bağımlılık zinciri
+  // KURULMAZ (BTV bu noktadan önce doğal charge'lardan hesaplanmıştır; enerji
+  // exclude edilse bile BTV doğal kalır — admin isterse BTV'yi ayrıca override
+  // eder). Tek doğal zincir yukarıdaki birim fiyat override'ıdır.
+  let appliedOverrides: AppliedInvoiceOverrides | undefined;
+  if (ov && Object.keys(ov).length > 0) {
+    const excludedItems: InvoiceOverrideItemKey[] = [];
+    const amountOverriddenItems: InvoiceOverrideItemKey[] = [];
+    const applyItem = (key: InvoiceOverrideItemKey, current: number): number => {
+      const item = ov[key];
+      if (!item) return current;
+      if (item.isExcluded) {
+        excludedItems.push(key);
+        return 0;
+      }
+      if (item.amountOverride != null && Number.isFinite(item.amountOverride)) {
+        amountOverriddenItems.push(key);
+        return item.amountOverride;
+      }
+      return current;
+    };
+
+    energyCharge = applyItem("enerji", energyCharge);
+    trafoCharge = applyItem("trafo", trafoCharge);
+    distributionCharge = applyItem("dagitim", distributionCharge);
+    btvCharge = applyItem("btv", btvCharge);
+    reactivePenaltyCharge = applyItem("reaktif", reactivePenaltyCharge);
+
+    // Güç: base + aşım TEK kalem olarak override edilir; base+aşım=total
+    // değişmezi korunur (base = efektif toplam, aşım = 0).
+    const gucItem = ov.guc;
+    if (
+      gucItem &&
+      (gucItem.isExcluded ||
+        (gucItem.amountOverride != null &&
+          Number.isFinite(gucItem.amountOverride)))
+    ) {
+      powerTotalCharge = applyItem("guc", powerTotalCharge);
+      powerBaseCharge = powerTotalCharge;
+      powerExcessCharge = 0;
+    }
+
+    appliedOverrides = {
+      excludedItems,
+      amountOverriddenItems,
+      unitPriceEnergyOverridden:
+        enerjiUnitOv != null && Number.isFinite(enerjiUnitOv),
+      unitPriceDistributionOverridden:
+        dagitimUnitOv != null && Number.isFinite(dagitimUnitOv),
+    };
+  }
 
   // 5) Ara toplam + KDV
   //
@@ -290,6 +437,8 @@ export function calculateInvoice(input: InvoiceInput): InvoiceBreakdown {
     subtotalBeforeVat,
     vatCharge,
     totalInvoice,
+    // Override yokken anahtar hiç eklenmez → override'sız çıktı bit-identik.
+    ...(appliedOverrides ? { appliedOverrides } : {}),
   };
 }
 

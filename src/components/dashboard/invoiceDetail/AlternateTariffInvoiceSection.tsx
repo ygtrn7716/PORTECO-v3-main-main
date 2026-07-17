@@ -66,6 +66,9 @@ export default function AlternateTariffInvoiceSection(props: {
   lisansliSatis?: boolean;
   perakendeEnerjiBedeli?: number;
   usdKur?: number;
+  // Saatlik net mahsup (net üretici): alternatif tarife de aynı bazı kullanır.
+  netPositiveDrawKwh?: number;
+  netExcessFeedKwh?: number;
 }) {
   const {
     uid,
@@ -87,6 +90,8 @@ export default function AlternateTariffInvoiceSection(props: {
     lisansliSatis,
     perakendeEnerjiBedeli,
     usdKur,
+    netPositiveDrawKwh,
+    netExcessFeedKwh,
   } = props;
 
   const [loading, setLoading] = useState(false);
@@ -244,6 +249,8 @@ export default function AlternateTariffInvoiceSection(props: {
           lisansliSatis,
           perakendeEnerjiBedeli,
           usdKur,
+          netPositiveDrawKwh,
+          netExcessFeedKwh,
         });
 
         if (cancel) return;

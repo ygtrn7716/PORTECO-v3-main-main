@@ -34,6 +34,7 @@ Bu doküman üst seviye haritadır. Kapsamlı detay için `porteco-*` ve `sync-*
         │   • Edge Functions:         │
         │     - reactive-alerts       │
         │     - contact-notify        │
+        │     - intake-notify         │
         └──────────┬───────────────────┘
                    ▲
                    │ service-role key (sadece sunucu)
@@ -56,9 +57,10 @@ PortEco web reposunda da bir cron varsayımı vardır (`scripts/reactive-alerts.
 ## 3. Veri Akışı (Üst Seviye)
 
 1. **Sync servisleri** (`aril-sync`) harici API'lerden saatlik tüketim, aylık demand, EPİAŞ PTF ve GES üretim verisini çeker. Hepsi Supabase tablolarına UPSERT ile yazılır.
-2. **PortEco Web** kullanıcı login olduktan sonra Supabase'e doğrudan SELECT atar. Tüm hesaplamalar (fatura kalemleri, mahsup, reaktif yüzdeleri) frontend tarafında yapılır; backend yalnızca veri saklama ve agregasyon RPC'leri sunar.
-3. **Reaktif uyarı motoru** (`scripts/reactive-alerts.ts` veya `supabase/functions/reactive-alerts/index.ts`) periyodik olarak `reactive_mtd_totals` RPC'sini çağırır, eşik aşan tesisler için SMS ve e-posta gönderir, durumu `reactive_alert_state` tablosuna upsert eder.
+2. **PortEco Web** kullanıcı login olduktan sonra Supabase'e doğrudan SELECT atar. Tüm hesaplamalar (fatura kalemleri, mahsup, reaktif yüzdeleri, talep birleştirme tahsisi) frontend tarafında yapılır; backend veri saklama ve agregasyon RPC'leri sunar. İstisna: **manuel veri yükleme** — `data_source = manuel` tesislerde kullanıcı tüketim Excel'ini yükler, frontend `consumption_hourly`'ye batch upsert yapar ve `manual_data_logs`'a log yazar (bkz. porteco-07 §6).
+3. **Reaktif uyarı motoru** (`scripts/reactive-alerts.ts` veya `supabase/functions/reactive-alerts/index.ts`) periyodik olarak `reactive_mtd_totals` RPC'sini çağırır, eşik aşan tesisler için SMS ve e-posta gönderir (limit geçişlerinde kullanıcı başına konsolide "anlık aşım" HTML e-postası dahil), durumu `reactive_alert_state` tablosuna upsert eder.
 4. **İletişim formu** (`/iletisim`) `contact_messages` tablosuna insert yapar. Bu insert Supabase webhook'u ile `contact-notify` Edge Function'ını tetikler; sabit numaraya bilgilendirme SMS'i atar.
+5. **Başvuru formu** (`/basvuru`) `intake_forms` tablosuna insert yapar (GES sağlayıcı bilgileri dahil). Insert webhook'u `intake-notify` Edge Function'ını tetikler; ekibe Resend ile başvuru e-postası gönderilir ve `email_logs`'a `message_type='intake_form_notify'` ile log düşülür.
 
 ## 4. Yetkilendirme Seviyeleri
 
@@ -79,26 +81,26 @@ Aşağıdaki tablolar PortEco ekosisteminde kullanılır. Detaylı kullanım `po
 | `auth.users` | Supabase Auth | Supabase Auth |
 | `user_integrations` | Supabase | Admin (manuel) |
 | `owner_subscriptions` | aril-sync (sync_aril, sync_meram) | sync upsert + admin |
-| `subscription_settings` | Frontend (profil) + Admin | Profil sayfası, AdminUsersPage, IntakeFormsAdmin |
-| `subscription_yekdem` | Admin | SubscriptionYekdemAdmin (manuel veri girişi) |
+| `subscription_settings` | Frontend (profil) + Admin | Profil sayfası, AdminUsersPage (yeni: `satis_hakki`, `lisansli_satis`, `unit_price_adjustment`, `anlik_uretim_kullanimi`), IntakeFormsAdmin |
+| `subscription_yekdem` | Admin | SubscriptionYekdemAdmin + AdminUsersPage YEKDEM sekmesi (yeni: `usd_kur`) |
 | `yekdem_official` | Manuel | Admin (Supabase Studio) |
 | `distribution_tariff_official` | Admin | DistributionTariffAdmin |
 | `epias_ptf_hourly` | sync_epias_ptf | Sync upsert |
-| `consumption_hourly` | sync_aril, sync_meram | Sync upsert (500'lük batch) |
+| `consumption_hourly` | sync_aril, sync_meram + Frontend (manuel yükleme) | Sync upsert (500'lük batch); `ManualUploadPanel` batch upsert/silme |
 | `consumption_daily` | (Postgres view veya sync rollup) | (genelde aril-sync dolaylı) |
 | `demand_monthly` | sync_aril, sync_meram | Sync upsert |
-| `invoice_snapshots` | Frontend (Dashboard, InvoiceDetail) + Admin | `upsertInvoiceSnapshot()` |
+| `invoice_snapshots` | Frontend (Dashboard, InvoiceDetail) + Admin | `upsertInvoiceSnapshot()` — yeni kolonlar: `usd_kur`, `lisansli_satis`, `unit_price_adjustment`, `ges_satis_dagitim_bedeli`, `net_positive_draw_kwh`, `net_excess_feed_kwh`, `allocated_ges_kwh` |
 | `invoice_history` | Frontend | Legacy arşiv |
 | `monthly_overview` | Postgres view | (otomatik) |
 | `contact_messages` | Public form | `ContactUs.tsx`, `LeadForm.tsx` |
-| `intake_forms` | Public form | `IntakeFormPage.tsx` |
+| `intake_forms` | Public form | `IntakeFormPage.tsx` — yeni GES kolonları: `has_ges`, `ges_saglayici_sayisi`, `ges_tesis_sayisi`, `ges_saglayicilar` |
 | `posts` | Admin | PostsAdmin |
 | `notification_channels` | Legacy admin | NotificationChannelsAdmin |
 | `notification_events` | Admin | NotificationEventsAdmin |
 | `user_phone_numbers` | Frontend (PhoneNumberManager) | INSERT/UPDATE/DELETE |
 | `user_emails` | Frontend (EmailManager) | INSERT/UPDATE/DELETE |
 | `sms_logs` | Cron + Edge Function | INSERT (sent/failed) |
-| `email_logs` | Cron | INSERT (sent/failed) |
+| `email_logs` | Cron + intake-notify | INSERT (sent/failed); yeni: `message_type`, `user_id` nullable |
 | `reactive_alert_state` | Cron + Edge Function | UPSERT |
 | `ges_providers` | Admin | GesProvidersAdmin |
 | `ges_credentials` | Profil + Admin | INSERT/DELETE/UPDATE |
@@ -107,9 +109,12 @@ Aşağıdaki tablolar PortEco ekosisteminde kullanılır. Detaylı kullanım `po
 | `ges_production_daily` | sync_growatt, sync_hopewind | Sync upsert (500'lük batch) |
 | `ges_production_hourly` | sync_growatt, manuel upload | Sync upsert + admin |
 | `ges_sync_log` | sync_growatt, sync_hopewind | INSERT |
-| `ges_satis_hakki` | Admin | GesSatisHakkiAdmin |
+| `ges_satis_hakki` | Admin (legacy) | GesSatisHakkiAdmin — aktif limit artık `subscription_settings.satis_hakki` |
+| `ges_mahsup_assignments` | Admin | TalepBirlestirmeAdmin (DEFERRABLE UNIQUE öncelik listesi + `set_ges_mahsup_priorities` / `remove_ges_mahsup_assignment` RPC'leri) |
+| `data_health_providers` | Admin | DataHealthAdmin (eşik editörü); `get_consumption_health()` RPC bununla join olur |
+| `manual_data_logs` | Frontend (manuel yükleme) | `ManualUploadPanel` / `DateRangeDeleteModal` INSERT — **repo migration'ı yok** (canlı DB'de tanımlı) |
 
-Tabloların kolon detayları için ilgili migration dosyalarına ve `porteco-07-supabase-queries.md` "Tablo Kullanım Özeti" bölümüne bakılır.
+Tabloların kolon detayları için ilgili migration dosyalarına ve `porteco-07-supabase-queries.md` "Tablo Kullanım Özeti" bölümüne bakılır. Kod tarafından kullanılan ancak repoda migration'ı olmayan diğer nesneler: `ges_plants.source_serno`, `owner_subscriptions.data_source` (bkz. porteco-01 §13 notu).
 
 ## 6. Edge Functions
 
@@ -117,6 +122,7 @@ Tabloların kolon detayları için ilgili migration dosyalarına ve `porteco-07-
 | --- | --- | --- | --- |
 | `reactive-alerts` | Cron / `npm run cron:alerts` (header `x-cron-token`) | Reaktif RI/RC eşik kontrolü, SMS + e-posta gönderim | [porteco-04-reaktif-islemler.md](./porteco-04-reaktif-islemler.md) |
 | `contact-notify` | `contact_messages` AFTER INSERT webhook | Sabit numaraya bilgilendirme SMS'i (`905550125527`) | [porteco-04-reaktif-islemler.md](./porteco-04-reaktif-islemler.md) |
+| `intake-notify` | `intake_forms` AFTER INSERT webhook | Ekibe Resend ile başvuru e-postası (tüketim + GES sağlayıcı özeti); `email_logs`'a `message_type='intake_form_notify'`, `user_id=null` log | [porteco-01-genel-mimari.md](./porteco-01-genel-mimari.md) §14 |
 
 ## 7. Cron / Scheduled Jobs
 
@@ -153,7 +159,7 @@ Tabloların kolon detayları için ilgili migration dosyalarına ve `porteco-07-
 | [porteco-03-yekdem-mahsup-sayfasi.md](./porteco-03-yekdem-mahsup-sayfasi.md) | YEKDEM mahsup formülü, veri akışı, hata noktaları |
 | [porteco-04-reaktif-islemler.md](./porteco-04-reaktif-islemler.md) | Reaktif uyarı motoru, Edge Function, cron, SMS / e-posta |
 | [porteco-05-fatura-sayfasi.md](./porteco-05-fatura-sayfasi.md) | calculateInvoice, computeMonthInvoiceToDate, snapshot sistemi |
-| [porteco-06-admin-paneli.md](./porteco-06-admin-paneli.md) | TableManager, 28 admin sayfası, RLS bypass, bilinen bug'lar |
+| [porteco-06-admin-paneli.md](./porteco-06-admin-paneli.md) | TableManager, 31 admin sayfası (talep birleştirme, veri sağlığı dahil), RLS bypass, bilinen bug'lar |
 | [porteco-07-supabase-queries.md](./porteco-07-supabase-queries.md) | Tüm `.from(...)` çağrıları, RPC'ler, realtime aboneliği |
 | [PORTECO_SECURITY_REPORT.md](./PORTECO_SECURITY_REPORT.md) | RLS durumu, env exposure, kontrol listesi |
 | [BLOG_CONTENT_GUIDE.md](./BLOG_CONTENT_GUIDE.md) | Blog yazısı ekleme akışı |
@@ -169,13 +175,18 @@ Tabloların kolon detayları için ilgili migration dosyalarına ve `porteco-07-
 - **GES alt sistemi** 2026-02-21'de aktif olarak eklenmiştir; aril-sync tarafında `sync_growatt.js` (üretimde), `sync_hopewind.js` (taslak/eksik workflow), web tarafında `GesDetail.tsx`, `GesPlantsAdmin`, `ges_*` tablolar.
 - **`on_yil` ve `perakende_enerji_bedeli`** alanları 2026-04-10 itibarıyla `subscription_settings` ve `distribution_tariff_official` tablolarına eklenmiş; eski snapshot'lar `recomputeSnapshotTotalWithMahsup()` ile geriye dönük doğru hesaplanır.
 - **MEDAŞ desteği** (`sync_meram.js`) 2026 son güncellemelerinde eklenmiş; henüz GitHub Actions workflow tanımı yoktur, manuel çalıştırılır.
+- **`ges_satis_hakki` tablosu legacy'ye düştü** (2026-05-03): yıllık satış hakkı limiti `subscription_settings.satis_hakki`'ya taşındı.
+- **"Frontend yalnızca SELECT atar" varsayımı esnedi**: manuel veri yükleme (2026-06/07) ile `data_source = manuel` tesislerde frontend `consumption_hourly` ve `manual_data_logs` tablolarına yazar.
+- **Edge Function sayısı 2 → 3**: `intake-notify` eklendi (2026-05-31).
+- **Fatura formülü büyük revizyon geçirdi** (2026-05..07): lisanslı satış, USD kurlu veriş fazlası satışı, iki-durumlu dağıtım bedeli, saatlik netleştirme (`net_positive_draw_kwh`/`net_excess_feed_kwh`), birim fiyat manipülasyonu ve talep birleştirme tahsisi — detay [porteco-05-fatura-sayfasi.md](./porteco-05-fatura-sayfasi.md).
+- **aril-sync dokümantasyonu bu turda yenilenmemiştir**; §2/§7'deki aril-sync bilgileri 2026-05-03 durumunu yansıtır.
 
 ---
 
 ## Son Güncelleme
 
-- **Tarih:** 2026-05-03
+- **Tarih:** 2026-07-12
 - **Branch:** main
-- **Son commit (PortEco Web):** `03aa828` — valla bişeler yaptık da hatırlamıyom amk
-- **Son commit (aril-sync):** `c3c29d5` — Meram
-- **Kapsanan dosyalar:** Yapı düzeyinde her iki repo; detay alt dokümanlara yönlendirilmiştir.
+- **Son commit (PortEco Web):** `500506c` — commit (çalışma ağacındaki commit edilmemiş değişiklikler dahil belgelendi)
+- **Son commit (aril-sync):** `c3c29d5` — Meram (bu turda yenilenmedi; 2026-05-03 durumu)
+- **Kapsanan dosyalar:** Yapı düzeyinde PortEco Web reposu (aril-sync bilgileri önceki turdan taşındı); detay alt dokümanlara yönlendirilmiştir.

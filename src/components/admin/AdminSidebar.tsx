@@ -25,6 +25,9 @@ import {
   Sun,
   ClipboardList,
   Upload,
+  Activity,
+  GitMerge,
+  Wallet,
 } from "lucide-react";
 
 type NavItem = {
@@ -78,9 +81,17 @@ const NAV_CATEGORIES: NavCategory[] = [
     ],
   },
   {
+    title: "İzleme",
+    icon: <Activity size={18} />,
+    items: [
+      { label: "Veri Sağlığı", to: "/dashboard/admin/veri-sagligi", icon: <Activity size={16} /> },
+    ],
+  },
+  {
     title: "Fatura & Hesaplama",
     icon: <Receipt size={18} />,
     items: [
+      { label: "Fatura Düzenleme", to: "/dashboard/admin/faturalar", icon: <FileText size={16} /> },
       { label: "Invoice Snapshots", to: "/dashboard/admin/invoice-snapshots", icon: <Receipt size={16} /> },
       { label: "Reactive Alerts", to: "/dashboard/admin/reactive-alerts", icon: <AlertTriangle size={16} /> },
       { label: "Aylık Özet", to: "/dashboard/admin/monthly-overview", icon: <Calculator size={16} /> },
@@ -97,6 +108,7 @@ const NAV_CATEGORIES: NavCategory[] = [
       { label: "GES Üretim Yükleme", to: "/dashboard/admin/ges-production-upload", icon: <Upload size={16} /> },
       { label: "GES Sync Logları", to: "/dashboard/admin/ges-sync-logs", icon: <Clock size={16} /> },
       { label: "GES Satış Hakkı", to: "/dashboard/admin/ges-satis-hakki", icon: <TrendingUp size={16} /> },
+      { label: "Talep Birleştirme", to: "/dashboard/admin/talep-birlestirme", icon: <GitMerge size={16} /> },
     ],
   },
   {
@@ -113,6 +125,13 @@ const NAV_CATEGORIES: NavCategory[] = [
     icon: <Bell size={18} />,
     items: [
       { label: "Notification Events", to: "/dashboard/admin/notification-events", icon: <Bell size={16} /> },
+    ],
+  },
+  {
+    title: "Finans",
+    icon: <Wallet size={18} />,
+    items: [
+      { label: "Finans Takip", to: "/dashboard/admin/finans", icon: <Wallet size={16} /> },
     ],
   },
 ];

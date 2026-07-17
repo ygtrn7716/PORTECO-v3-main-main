@@ -5,6 +5,9 @@ import { useSession } from "@/hooks/useSession";
 import { supabase } from "@/lib/supabase";
 import { resolveSelectedSub } from "@/lib/subscriptionVisibility";
 import { ReportsSection } from "@/components/dashboard/reports/ReportsSection";
+import { detectVerisPresence, logVerisPresenceErrors } from "@/lib/ges/detectVerisPresence";
+import { fetchAllConsumption } from "@/lib/paginatedFetch";
+import { dayjsTR } from "@/lib/dayjs";
 
 import {
   ResponsiveContainer,
@@ -85,6 +88,12 @@ const fmt1 = (n: number | null | undefined) =>
 
          const RED = "#ef4444";
         const BLUE = "#3b82f6";
+
+// GES grafikleri: üretim = yeşil (GesDetail #22c55e ile tutarlı), veriş = marka mavisi
+const GES_GREEN = "#22c55e";
+const GES_GREEN_PREV = "#86efac";
+const VERIS_BLUE = "#00AEEF";
+const VERIS_BLUE_PREV = "#B7C4CE";
 
 
 function nOrNull(x: any): number | null {
@@ -190,6 +199,42 @@ function Chart({
       </ResponsiveContainer>
     </div>
   );
+}
+
+// ges_production_daily'den paginated çekim: 2 yıl × 365 gün × 3+ tesis
+// PostgREST max_rows (1000) limitini aşabildiği için .range() zorunlu.
+async function fetchAllProductionDaily(params: {
+  plantIds: string[];
+  startDate: string; // YYYY-MM-DD (dahil)
+  endDate: string; // YYYY-MM-DD (dahil)
+}): Promise<{ date: string; energy_kwh: number }[]> {
+  const PAGE = 1000;
+  const all: { date: string; energy_kwh: number }[] = [];
+  let from = 0;
+
+  while (true) {
+    const { data, error } = await supabase
+      .from("ges_production_daily")
+      .select("date, energy_kwh")
+      .in("ges_plant_id", params.plantIds)
+      .gte("date", params.startDate)
+      .lte("date", params.endDate)
+      // date tek başına unique değil (tesis başına aynı gün) — sayfalar arası
+      // kayma olmasın diye ikincil sıralama şart
+      .order("date", { ascending: true })
+      .order("ges_plant_id", { ascending: true })
+      .range(from, from + PAGE - 1);
+
+    if (error) throw error;
+
+    const batch = (data ?? []) as any[];
+    all.push(...batch);
+
+    if (batch.length < PAGE) break;
+    from += PAGE;
+  }
+
+  return all;
 }
 
 export default function ChartsPage() {
@@ -358,6 +403,135 @@ export default function ChartsPage() {
     };
   }, [uid, sessionLoading, selectedSub, year]);
 
+  // --- GES grafikleri (Toplam Üretim / Toplam Veriş) ---
+  // Yalnızca GES varlığı olan kullanıcıda render edilir (detectVerisPresence).
+  const [showGes, setShowGes] = useState(false);
+  const [prodByMonth, setProdByMonth] = useState<{
+    curr: (number | null)[];
+    prev: (number | null)[];
+  }>({ curr: Array(12).fill(null), prev: Array(12).fill(null) });
+  const [verisByMonth, setVerisByMonth] = useState<{
+    curr: (number | null)[];
+    prev: (number | null)[];
+  }>({ curr: Array(12).fill(null), prev: Array(12).fill(null) });
+
+  // 1b) GES görünürlük tespiti — Dashboard Effect 7 ile aynı helper
+  useEffect(() => {
+    if (sessionLoading || !uid) return;
+    let cancel = false;
+
+    (async () => {
+      const presence = await detectVerisPresence(supabase, uid);
+      if (cancel) return;
+      logVerisPresenceErrors("ChartsPage", presence);
+      setShowGes(presence.hasGesApi || presence.hasVeris);
+    })();
+
+    return () => {
+      cancel = true;
+    };
+  }, [uid, sessionLoading]);
+
+  // 1c) Toplam Üretim — kullanıcının TÜM aktif tesisleri (ges_plants ile
+  // subscription_serno arasında ilişki yok → tesis seçiciden BAĞIMSIZ).
+  useEffect(() => {
+    if (sessionLoading || !uid || !showGes) return;
+    let cancel = false;
+
+    setProdByMonth({ curr: Array(12).fill(null), prev: Array(12).fill(null) });
+
+    (async () => {
+      try {
+        const { data: plants, error: plantsErr } = await supabase
+          .from("ges_plants")
+          .select("id")
+          .eq("user_id", uid)
+          .eq("is_active", true);
+
+        if (cancel) return;
+        if (plantsErr) throw plantsErr;
+
+        const plantIds = (plants ?? []).map((p: any) => String(p.id));
+        if (plantIds.length === 0) return;
+
+        const rows = await fetchAllProductionDaily({
+          plantIds,
+          startDate: `${year - 1}-01-01`,
+          endDate: `${year}-12-31`,
+        });
+        if (cancel) return;
+
+        const curr: (number | null)[] = Array(12).fill(null);
+        const prev: (number | null)[] = Array(12).fill(null);
+        for (const r of rows) {
+          const d = String(r.date); // YYYY-MM-DD
+          const y = Number(d.slice(0, 4));
+          const m = Number(d.slice(5, 7)) - 1;
+          if (m < 0 || m > 11) continue;
+          const v = Number(r.energy_kwh) || 0;
+          if (y === year) curr[m] = (curr[m] ?? 0) + v;
+          else if (y === year - 1) prev[m] = (prev[m] ?? 0) + v;
+        }
+        setProdByMonth({ curr, prev });
+      } catch (e) {
+        if (!cancel) console.warn("[ChartsPage] GES üretim verisi alınamadı:", e);
+      }
+    })();
+
+    return () => {
+      cancel = true;
+    };
+  }, [uid, sessionLoading, showGes, year]);
+
+  // 1d) Toplam Veriş — consumption_daily tablosu DB'de yok (şema doğrulandı),
+  // bu yüzden consumption_hourly.gn paginated çekilip ay bazında toplanır.
+  // Seçili tesise BAĞLI (mevcut grafiklerle aynı davranış).
+  useEffect(() => {
+    if (sessionLoading || !uid || !selectedSub || !showGes) return;
+    let cancel = false;
+
+    setVerisByMonth({ curr: Array(12).fill(null), prev: Array(12).fill(null) });
+
+    (async () => {
+      try {
+        const base = dayjsTR();
+        const startIso = base.year(year - 1).startOf("year").toDate().toISOString();
+        const endIso = base.year(year + 1).startOf("year").toDate().toISOString();
+
+        const { data, error } = await fetchAllConsumption({
+          supabase,
+          userId: uid,
+          subscriptionSerno: selectedSub,
+          columns: "ts, gn",
+          startIso,
+          endIso,
+          endInclusive: false,
+        });
+        if (cancel) return;
+        if (error) throw error;
+
+        const curr: (number | null)[] = Array(12).fill(null);
+        const prev: (number | null)[] = Array(12).fill(null);
+        for (const r of data ?? []) {
+          if (r.gn == null) continue; // gn'siz satır ayı "veri var" saymasın
+          const d = dayjsTR(r.ts);
+          const y = d.year();
+          const m = d.month(); // 0-11
+          const v = Number(r.gn) || 0;
+          if (y === year) curr[m] = (curr[m] ?? 0) + v;
+          else if (y === year - 1) prev[m] = (prev[m] ?? 0) + v;
+        }
+        setVerisByMonth({ curr, prev });
+      } catch (e) {
+        if (!cancel) console.warn("[ChartsPage] Veriş verisi alınamadı:", e);
+      }
+    })();
+
+    return () => {
+      cancel = true;
+    };
+  }, [uid, sessionLoading, selectedSub, showGes, year]);
+
   // 2) Chart data: 12 ay birleştir (current + prev year)
   const chartData = useMemo(() => {
     const kbk = selectedSubObj?.kbk ?? null;
@@ -432,6 +606,21 @@ export default function ChartsPage() {
 
     return out;
   }, [rowsCurr, rowsPrev, selectedSubObj?.kbk, selectedSubObj?.unitPriceAdjustment]);
+
+  // 2b) GES chart data — mevcut chartData akışından bağımsız ayrı seri
+  const gesChartData = useMemo(() => {
+    const out = [];
+    for (let m = 0; m < 12; m++) {
+      out.push({
+        m: monthNamesShort[m],
+        prod_curr: prodByMonth.curr[m],
+        prod_prev: prodByMonth.prev[m],
+        veris_curr: verisByMonth.curr[m],
+        veris_prev: verisByMonth.prev[m],
+      });
+    }
+    return out;
+  }, [prodByMonth, verisByMonth]);
 
   return (
     <DashboardShell>
@@ -689,6 +878,42 @@ export default function ChartsPage() {
                 }
             />
             </Section>
+
+        {showGes && (
+          <>
+            <Section title="Toplam Üretim (kWh)" subtitle="Tüm GES tesisleriniz">
+              <Chart
+                mode={chartType}
+                data={gesChartData}
+                yFmt={(v) => (v == null ? "" : Number(v).toLocaleString("tr-TR"))}
+                series={
+                  chartType === "bar"
+                    ? [{ dataKey: "prod_curr", name: `${year}`, color: GES_GREEN }]
+                    : [
+                        { dataKey: "prod_curr", name: `${year}`, color: GES_GREEN },
+                        { dataKey: "prod_prev", name: `${year - 1}`, color: GES_GREEN_PREV },
+                      ]
+                }
+              />
+            </Section>
+
+            <Section title="Toplam Veriş (kWh)" subtitle="Aylık Toplam Veriş Değeri">
+              <Chart
+                mode={chartType}
+                data={gesChartData}
+                yFmt={(v) => (v == null ? "" : Number(v).toLocaleString("tr-TR"))}
+                series={
+                  chartType === "bar"
+                    ? [{ dataKey: "veris_curr", name: `${year}`, color: VERIS_BLUE }]
+                    : [
+                        { dataKey: "veris_curr", name: `${year}`, color: VERIS_BLUE },
+                        { dataKey: "veris_prev", name: `${year - 1}`, color: VERIS_BLUE_PREV },
+                      ]
+                }
+              />
+            </Section>
+          </>
+        )}
 
       </div>
     </DashboardShell>

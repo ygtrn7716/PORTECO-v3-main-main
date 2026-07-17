@@ -9,8 +9,9 @@ Kaynak dosyalar:
 - `src/components/dashboard/PhoneNumberManager.tsx`, `EmailManager.tsx`
 - `supabase/functions/reactive-alerts/index.ts` — Deno tabanlı Edge Function
 - `scripts/reactive-alerts.ts` — VPS/Cron için tsx çalıştırılabilir script (`npm run cron:alerts`)
+- `scripts/lib/reactive-email-template.ts` — anlık reaktif aşım e-postası HTML+text şablonu
 - `scripts/test-sms.ts`, `scripts/test-email.ts`
-- Migration dosyaları: `20260205_002_create_reactive_alert_state.sql`, `20260205_003_create_reactive_mtd_totals.sql`, `20260326_001_alter_reactive_mtd_totals.sql`, `20260326_002_alter_reactive_alert_state_kind.sql`, `20260203_001_create_user_phone_numbers.sql`, `20260211_001_create_user_emails.sql`, `20260203_002_create_sms_logs.sql`, `20260211_002_create_email_logs.sql`
+- Migration dosyaları: `20260205_002_create_reactive_alert_state.sql`, `20260205_003_create_reactive_mtd_totals.sql`, `20260326_001_alter_reactive_mtd_totals.sql`, `20260326_002_alter_reactive_alert_state_kind.sql`, `20260203_001_create_user_phone_numbers.sql`, `20260211_001_create_user_emails.sql`, `20260203_002_create_sms_logs.sql`, `20260211_002_create_email_logs.sql`, `20260503_002_add_message_type_to_email_logs.sql`, `20260531_002_email_logs_user_id_nullable.sql`
 
 ## 1. Reaktif Enerji Nedir
 
@@ -115,9 +116,10 @@ Yalnızca `x-cron-token` header'ında doğru sırrın geldiği isteklere yanıt 
 VPS / GitHub Actions üzerinde `npm run cron:alerts` ile çalıştırılır. Edge Function ile aynı temel mantığı paylaşır, ancak ek özellikleri vardır:
 
 - `user_emails` tablosundan aktif e-posta adresleri okunur ve **her e-posta için ayrı** Resend isteği atılır.
-- `email_logs` tablosuna her e-posta için INSERT yapılır.
+- `email_logs` tablosuna her e-posta için INSERT yapılır; SMS ve e-posta loglarına `message_type` yazılır (`scripts/reactive-alerts.ts:179,203`).
 - `gn_kwh, rio_kvarh, rco_kvarh` `reactive_mtd_totals` RPC'sinden ek olarak okunur (Edge Function'da bu kolonlar henüz okunmuyor).
 - `gn > 0` ise Veriş reaktif (RIO ve RCO) kontrolü yapılır; eşikler RI/RC ile aynıdır.
+- **Anlık aşım e-postası:** limit geçişleri kullanıcı bazında iki buffer'da toplanır (çekiş `gridLimit`, veriş `prodLimit`, `scripts/reactive-alerts.ts:517-526`). En az bir limit geçişi varsa `buildReactiveAlertEmail(...)` (`scripts/lib/reactive-email-template.ts:124`) ile tesis adları (`subscription_settings.nickname/title` çözümlemesi) dahil tek bir konsolide HTML+text e-posta üretilir ve kullanıcının tüm aktif adreslerine gönderilir (`scripts/reactive-alerts.ts:574-617`). Her gönderim `email_logs`'a `message_type = "reactive_instant_notification"` ile loglanır; Resend rate limit'i için gönderimler arası 600 ms beklenir.
 - Konsol log'ları zaman damgalı (`[YYYY-MM-DD HH:MM:SS]`) basılır.
 
 Cron script env değişkenleri:
@@ -181,8 +183,8 @@ Yazılı durum mesajı:
 Bu sayfa üç parçaya ayrılır:
 
 1. **Reaktif uyarı durum tablosu** — `reactive_alert_state` tablosundan kullanıcı için tüm satırlar (period_ym + kind + status). Status'a göre renklendirilir.
-2. **SMS log tablosu** — `sms_logs`'tan (sent / failed kayıtları, mesaj gövdesi, telefon, tarih).
-3. **E-posta log tablosu** — `email_logs`'tan (sent / failed, e-posta adresi, konu, tarih).
+2. **SMS log tablosu** — `sms_logs`'tan (sent / failed kayıtları, `message_type`, mesaj gövdesi, telefon, tarih).
+3. **E-posta log tablosu** — `email_logs`'tan (sent / failed, e-posta adresi, konu, `message_type`, tarih). Her iki log tablosunda da "Tür" kolonu vardır: `formatMessageType()` (`AlertsPage.tsx:118`) ham tipi Türkçe etikete çevirir (örn. `reactive_instant_notification` → "Reaktif Aşım Bildirimi") ve tipe göre renk rozeti uygulanır — instant bildirim ayrı renk, `limit` içerenler kırmızı, `warn` içerenler sarı (`AlertsPage.tsx:584-593`).
 
 Sayfa ayrıca `PhoneNumberManager` ve `EmailManager` bileşenlerini render eder.
 
@@ -260,9 +262,12 @@ status (sent/failed), provider_response (jsonb), error_message, created_at
 ### `email_logs`
 
 ```
-id, user_id, subscription_serno (text), email_address, subject, message_body,
+id, user_id (nullable ← 2026-05-31), subscription_serno (text), email_address, subject,
+message_type (default 'unknown' ← 2026-05-03), message_body,
 status (sent/failed), provider_response (jsonb), error_message, created_at
 ```
+
+`20260503_002_add_message_type_to_email_logs.sql` `message_type` kolonunu (index'iyle) ekledi — `sms_logs` ile şema simetrisi sağlar; `reactive_instant_notification`, `intake_form_notify` gibi tipler ayırt edilir. `20260531_002_email_logs_user_id_nullable.sql` `user_id`'yi nullable yaptı (public başvuru formu anonim log yazabilsin diye); RLS gereği `user_id` null olan loglar son kullanıcıya görünmez, adminler her satırı görür.
 
 ### `user_phone_numbers`
 
@@ -321,9 +326,11 @@ E-posta konusu:
 - Veriş warn: `<prefix> - Reaktif uyari (veris): sinira yaklasiyor`
 - Veriş limit: `<prefix> - Reaktif uyari (veris): limit asildi`
 
+**Anlık aşım e-postası şablonu** (`scripts/lib/reactive-email-template.ts`): `buildReactiveAlertEmail({ todayIso, timeText, gridBreaches, prodBreaches, subMap })` → `{ subject, html, text }`. Tek e-postada çekiş ve veriş tarafındaki tüm limit geçişleri tesis bazında listelenir (tesis adı, indüktif/kapasitif yüzdeleri, hangi kanalın aştığı); HTML gövde + düz metin alternatifi birlikte üretilir.
+
 ## 12. Fatura Cezası
 
-`Dashboard.tsx:911-925` (Effect 5) ve `Dashboard.tsx:1257-1263` (Effect 6) reaktif cezayı şu mantıkla hesaplar:
+`Dashboard.tsx:972-986` (Effect 5) ve `Dashboard.tsx:1374-1376` (Effect 6) reaktif cezayı şu mantıkla hesaplar:
 
 ```typescript
 const REACTIVE_LIMIT_RI = 20;
@@ -350,12 +357,15 @@ Bu ceza tutarı `calculateInvoice({ ..., reactivePenaltyCharge })` parametresine
 - **Edge Function vs Cron Script**: Şu an iki paralel implementasyon vardır. Edge Function yalnızca RI/RC kontrolü ve SMS log'u yapar. Cron script ek olarak veriş kontrolü ve e-posta log'u yapar. Üretimde ikisi birden çalışırsa bildirim çakışmaları yaşanabilir; biri devre dışı bırakılmalıdır.
 - **Frontend hard limit** ile **cron warn/limit** ayrımı: kullanıcı UI'da yeşil görmesine rağmen cron uyarı SMS'i atabilir. Bu davranış bilinçli ve mevcut sürümde "feature" olarak kabul edilmiştir; istenirse `ReactiveSection` warn için de kademeli renk gösterimi eklenebilir.
 - **Test scripti** `test-sms.ts` daha önceleri sabit numaraya gönderiyordu; bu turda repo'da bulunan sürüm aynı yaklaşımı koruyor (numara değişikliği için scripti elle düzenlemek gerekir).
+- **E-posta logları `message_type` içermiyordu** (yalnızca sms_logs'ta vardı): `20260503_002` ile `email_logs.message_type` eklendi; AlertsPage her iki log tablosunda "Tür" kolonu gösterir.
+- **Cron script yalnızca kısa metin e-postası atıyordu**: 2026-05 sonrası limit geçişlerinde kullanıcı başına konsolide, markalı HTML "anlık aşım" e-postası (`buildReactiveAlertEmail`) devreye girdi; kayıtları `message_type = "reactive_instant_notification"` ile ayrışır.
+- **`email_logs.user_id` NOT NULL idi**: `20260531_002` ile nullable yapıldı (intake-notify gibi anonim/ekip-hedefli gönderimler için).
 
 ---
 
 ## Son Güncelleme
 
-- **Tarih:** 2026-05-03
+- **Tarih:** 2026-07-12
 - **Branch:** main
-- **Son commit:** `03aa828` — valla bişeler yaptık da hatırlamıyom amk
-- **Kapsanan dosyalar:** `src/components/dashboard/ReactiveSection.tsx`, `src/pages/AlertsPage.tsx`, `src/components/dashboard/PhoneNumberManager.tsx`, `src/components/dashboard/EmailManager.tsx`, `supabase/functions/reactive-alerts/index.ts`, `scripts/reactive-alerts.ts`, `scripts/test-sms.ts`, `scripts/test-email.ts`, `supabase/migrations/20260203_001_*.sql`, `20260203_002_*.sql`, `20260205_002_*.sql`, `20260205_003_*.sql`, `20260211_001_*.sql`, `20260211_002_*.sql`, `20260326_001_*.sql`, `20260326_002_*.sql`
+- **Son commit:** `500506c` — commit (çalışma ağacındaki commit edilmemiş değişiklikler dahil belgelendi)
+- **Kapsanan dosyalar:** `src/components/dashboard/ReactiveSection.tsx`, `src/pages/AlertsPage.tsx`, `src/components/dashboard/PhoneNumberManager.tsx`, `src/components/dashboard/EmailManager.tsx`, `supabase/functions/reactive-alerts/index.ts`, `scripts/reactive-alerts.ts`, `scripts/lib/reactive-email-template.ts`, `scripts/test-sms.ts`, `scripts/test-email.ts`, `supabase/migrations/20260203_001_*.sql`, `20260203_002_*.sql`, `20260205_002_*.sql`, `20260205_003_*.sql`, `20260211_001_*.sql`, `20260211_002_*.sql`, `20260326_001_*.sql`, `20260326_002_*.sql`, `20260503_002_*.sql`, `20260531_002_*.sql`

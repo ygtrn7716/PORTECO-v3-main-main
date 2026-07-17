@@ -166,13 +166,6 @@ export default function YekdemDetail() {
   const selectedSubObj = subs.find((s) => s.subscriptionSerNo === selectedSub);
   const selectedMeterSerial = selectedSubObj?.meterSerial ?? null;
 
-  const selectedSubLabel = (() => {
-    if (!selectedSubObj) return selectedSub != null ? String(selectedSub) : "Tesis seçilmedi";
-    const nick = selectedSubObj.nickname;
-    const serial = selectedSubObj.meterSerial ?? String(selectedSubObj.subscriptionSerNo);
-    return nick ? `${serial} - ${nick}` : serial;
-  })();
-
   // ─────────────────────────────
   // Bu yılın YEKDEM değerlerini çek (period_year/period_month)
   // ─────────────────────────────
@@ -300,17 +293,9 @@ export default function YekdemDetail() {
           </h1>
           <p className="text-sm text-neutral-500">
             {selectedSub
-              ? `${year} yılı • seçili tesis (${selectedSubLabel}) YEKDEM değerleri (TL/kWh)`
+              ? `${year} yılı YEKDEM değerleri (TL/kWh)`
               : `${year} yılı için YEKDEM değerlerini görmek için tesis seçin`}
           </p>
-          {selectedSub && (
-            <p className="mt-1 text-xs text-neutral-500">
-              Seçili tesis:{" "}
-              <span className="font-medium text-neutral-800">
-                {selectedSubLabel}
-              </span>
-            </p>
-          )}
         </div>
 
         <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center sm:justify-end md:w-auto">

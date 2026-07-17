@@ -7,7 +7,14 @@
       "mcp__claude_ai_Supabase__execute_sql",
       "mcp__claude_ai_Supabase__apply_migration",
       "mcp__claude_ai_Supabase__deploy_edge_function",
-      "Bash(grep -ivE \"\\\\.md$\")"
+      "Bash(grep -ivE \"\\\\.md$\")",
+      "mcp__claude_ai_Supabase__list_projects",
+      "PowerShell(npm run typecheck)",
+      "PowerShell(npm run lint)",
+      "Bash(npm run *)",
+      "Bash(grep -oE '`20[0-9]{6}[^`]+\\\\.sql`')",
+      "Read(//tmp/**)",
+      "mcp__claude_ai_Supabase__get_advisors"
     ]
   }
 }

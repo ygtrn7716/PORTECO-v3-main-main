@@ -18,8 +18,21 @@ import {
   calculateYekdemMahsup,
   type TariffType,
 } from "@/components/utils/calculateInvoice";
+import {
+  fetchInvoiceOverrides,
+  fetchAllInvoiceOverridesForUser,
+  applyReactiveValueOverrides,
+  resolveUnitPriceOverride,
+  overrideKey,
+  type InvoiceOverrides,
+} from "@/components/utils/invoiceOverrides";
 import { fetchHiddenSernos, resolveSelectedSub } from "@/lib/subscriptionVisibility";
 import { fetchAllConsumption } from "@/lib/paginatedFetch";
+import {
+  fetchGesMahsupContext,
+  getFacilityAllocation,
+  applyAllocationToHourlyRows,
+} from "@/components/utils/gesAllocation";
 import { detectVerisPresence, logVerisPresenceErrors } from "@/lib/ges/detectVerisPresence";
 import { resolveManualPlantIds } from "@/lib/ges/manualPlants";
 
@@ -359,6 +372,9 @@ export default function Dashboard() {
   const [prevMonthRi, setPrevMonthRi] = useState<number | null>(null);
   const [prevMonthRc, setPrevMonthRc] = useState<number | null>(null);
   const [prevMonthGn, setPrevMonthGn] = useState<number | null>(null);
+  // Saatlik net mahsup (net üretici): Σ max(0,cn−gn) ve Σ max(0,gn−cn).
+  const [prevMonthNetPos, setPrevMonthNetPos] = useState<number | null>(null);
+  const [prevMonthNetExcess, setPrevMonthNetExcess] = useState<number | null>(null);
 
   // 2) Geçen ay ortalama PTF (TL/kWh)
   const [monthlyPTF, setMonthlyPTF] = useState<number | null>(null);
@@ -387,6 +403,16 @@ export default function Dashboard() {
   const [invoiceTotal, setInvoiceTotal] = useState<number | null>(null);
   const [invoiceLoading, setInvoiceLoading] = useState(false);
   const [invoiceErr, setInvoiceErr] = useState<string | null>(null);
+
+  // 4.5) Fatura kalem override'ları (M-1, seçili tesis). Etiketli state: Effect 5
+  // ile valley (birim fiyat) kartı aynı fetch'i tutarlı görür; tesis değişiminde
+  // bayat veri sub etiketi üzerinden senkron tespit edilir.
+  const [subOverrides, setSubOverrides] = useState<{
+    sub: number;
+    year: number;
+    month: number;
+    overrides: InvoiceOverrides | null;
+  } | null>(null);
 
   // ✅ YEKDEM mahsup (dashboard kartı için)
   const [yekdemMahsup, setYekdemMahsup] = useState<number | null>(null);
@@ -556,18 +582,43 @@ export default function Dashboard() {
         let sumRi = 0;
         let sumRc = 0;
         let sumGn = 0;
+        let sumNetPos = 0;
+        let sumNetExcess = 0;
 
         for (const r of (hourly.data ?? []) as any[]) {
-          sumCn += Number(r.cn) || 0;
+          const cnH = Number(r.cn) || 0;
+          const gnH = Number(r.gn) || 0;
+          sumCn += cnH;
           sumRi += Number(r.ri) || 0;
           sumRc += Number(r.rc) || 0;
-          sumGn += Number(r.gn) || 0;
+          sumGn += gnH;
+          sumNetPos += Math.max(0, cnH - gnH);
+          sumNetExcess += Math.max(0, gnH - cnH);
+        }
+
+        // Talep Birleştirme: tesise GES tahsisi/kaynak rolü varsa efektif
+        // gn/net değerleri kullan (view=null → yukarıdaki toplamlar aynen kalır).
+        const allocView = await getFacilityAllocation({
+          supabase,
+          userId: uid,
+          subscriptionSerno: selectedSub,
+          startIso: start.toDate().toISOString(),
+          endIso: end.toDate().toISOString(),
+        });
+        if (cancel) return;
+        if (allocView) {
+          const eff = applyAllocationToHourlyRows(hourly.data ?? [], allocView);
+          sumGn = eff.totalGn;
+          sumNetPos = eff.netPositiveDrawKwh;
+          sumNetExcess = eff.netExcessFeedKwh;
         }
 
         setPrevMonthKwh(sumCn);
         setPrevMonthRi(sumRi);
         setPrevMonthRc(sumRc);
         setPrevMonthGn(sumGn);
+        setPrevMonthNetPos(sumNetPos);
+        setPrevMonthNetExcess(sumNetExcess);
       } catch (e: any) {
         if (!cancel) {
           console.error("prev month kWh error:", e);
@@ -576,6 +627,8 @@ export default function Dashboard() {
           setPrevMonthRi(null);
           setPrevMonthRc(null);
           setPrevMonthGn(null);
+          setPrevMonthNetPos(null);
+          setPrevMonthNetExcess(null);
         }
       } finally {
         if (!cancel) setPrevLoading(false);
@@ -761,6 +814,42 @@ export default function Dashboard() {
   }, [uid, sessionLoading, selectedSub]);
 
   // ---------------------------
+  // 4.5) Fatura kalem override'ları (M-1, seçili tesis)
+  // ---------------------------
+  useEffect(() => {
+    if (sessionLoading) return;
+    if (!uid || !selectedSub) {
+      setSubOverrides(null);
+      return;
+    }
+
+    let cancel = false;
+
+    (async () => {
+      const prev = dayjsTR().subtract(1, "month");
+      const year = prev.year();
+      const month = prev.month() + 1;
+      try {
+        const overrides = await fetchInvoiceOverrides({
+          userId: uid,
+          subscriptionSerno: selectedSub,
+          periodYear: year,
+          periodMonth: month,
+        });
+        if (!cancel) setSubOverrides({ sub: selectedSub, year, month, overrides });
+      } catch (e) {
+        console.error("invoice overrides load error:", e);
+        // Fail-open: Dashboard yalnız okur (snapshot yazmaz) — doğal değerlerle devam.
+        if (!cancel) setSubOverrides({ sub: selectedSub, year, month, overrides: null });
+      }
+    })();
+
+    return () => {
+      cancel = true;
+    };
+  }, [uid, sessionLoading, selectedSub]);
+
+  // ---------------------------
   // 5) Fatura toplamı (mahsup dahil) + mahsup hesapla
   // ---------------------------
   useEffect(() => {
@@ -778,6 +867,11 @@ export default function Dashboard() {
       setHasYekdemMahsup(false);
       return;
     }
+
+    // Override fetch'i (Effect 4.5) tamamlanıp seçili tesisle eşleşene dek bekle
+    // (bayat override'la yanlış hesap yapılmasın).
+    if (subOverrides == null || subOverrides.sub !== selectedSub) return;
+    const lineOverrides = subOverrides.overrides ?? undefined;
 
     let cancel = false;
 
@@ -805,7 +899,7 @@ export default function Dashboard() {
         if (cancel) return;
 
         if (!snap.error && snap.data?.total_with_mahsup != null) {
-          setInvoiceTotal(recomputeSnapshotTotalWithMahsup(snap.data as any));
+          setInvoiceTotal(recomputeSnapshotTotalWithMahsup(snap.data as any, lineOverrides));
           setHasYekdemMahsup(!!(snap.data as any).has_yekdem_mahsup);
           setYekdemMahsup(
             (snap.data as any).yekdem_mahsup != null ? Number((snap.data as any).yekdem_mahsup) : null
@@ -934,9 +1028,12 @@ export default function Dashboard() {
         const contractPowerKw = gucLimit;
         const tariffType = mapTermToTariffType(terim);
 
-        // ✅ reaktif ceza
-        const totalRi = prevMonthRi ?? 0;
-        const totalRc = prevMonthRc ?? 0;
+        // ✅ reaktif ceza (payload override'ı varsa Ri/Rc toplamları mutlak değiştirilir)
+        const { riSum: totalRi, rcSum: totalRc } = applyReactiveValueOverrides(
+          prevMonthRi ?? 0,
+          prevMonthRc ?? 0,
+          lineOverrides
+        );
 
         const riPercent = prevMonthKwh > 0 ? (totalRi / prevMonthKwh) * 100 : 0;
         const rcPercent = prevMonthKwh > 0 ? (totalRc / prevMonthKwh) * 100 : 0;
@@ -968,7 +1065,9 @@ export default function Dashboard() {
           lisansliSatis,
           perakendeEnerjiBedeli,
           usdKur: monthlyUsdKur ?? 0,
-        });
+          netPositiveDrawKwh: prevMonthNetPos ?? undefined,
+          netExcessFeedKwh: prevMonthNetExcess ?? undefined,
+        }, lineOverrides);
 
         // ✅ YEKDEM mahsup (M-1)
         // Lisanslı Satış tesisleri için YEKDEM mahsup uygulanmaz.
@@ -1095,11 +1194,14 @@ export default function Dashboard() {
     prevMonthRi,
     prevMonthRc,
     prevMonthGn,
+    prevMonthNetPos,
+    prevMonthNetExcess,
     monthlyPTF,
     monthlyYekdem,
     monthlyKbk,
     monthlyUnitPriceAdj,
     monthlyUsdKur,
+    subOverrides,
   ]);
 
   // ---------------------------
@@ -1131,6 +1233,23 @@ export default function Dashboard() {
 
         const allSernos = subs.map((s) => s.subscriptionSerNo);
 
+        // Talep Birleştirme bağlamı — döngü öncesi bir kez; atama yoksa
+        // (hasAny=false) hiçbir yeni kod yolu çalışmaz.
+        const gesCtx = await fetchGesMahsupContext(supabase, uid);
+        if (cancel) return;
+
+        // Fatura kalem override'ları — tüm tesisler için TEK sorgu (M-1 dönemi).
+        // Fail-open: Dashboard yalnız okur, hata durumunda doğal değerlerle devam.
+        const ovMap = await fetchAllInvoiceOverridesForUser({
+          userId: uid,
+          periodYear: pYear,
+          periodMonth: pMonth,
+        }).catch((e) => {
+          console.error("invoice overrides batch load error:", e);
+          return new Map<string, InvoiceOverrides>();
+        });
+        if (cancel) return;
+
         let grandTotalKwh = 0;
         let grandTotalInvoice = 0;
         let grandTotalMahsup = 0;
@@ -1145,27 +1264,59 @@ export default function Dashboard() {
             supabase,
             userId: uid,
             subscriptionSerno: serno,
-            columns: "cn, ri, rc, gn",
+            columns: "ts, cn, ri, rc, gn",
             startIso: start.toDate().toISOString(),
             endIso: end.toDate().toISOString(),
           });
+          // Hata yutulursa boş satırlar + cache'ten gelen tahsis, toplam karta
+          // hayali satış kalemi ekleyebilir — Effect 1 ile aynı şekilde fırlat.
+          if (hourlyRes.error) throw hourlyRes.error;
 
           let subKwh = 0;
           let subRi = 0;
           let subRc = 0;
           let subGn = 0;
+          let subNetPos = 0;
+          let subNetExcess = 0;
           for (const r of (hourlyRes.data ?? []) as any[]) {
-            subKwh += Number(r.cn) || 0;
+            const cnH = Number(r.cn) || 0;
+            const gnH = Number(r.gn) || 0;
+            subKwh += cnH;
             subRi += Number(r.ri) || 0;
             subRc += Number(r.rc) || 0;
-            subGn += Number(r.gn) || 0;
+            subGn += gnH;
+            subNetPos += Math.max(0, cnH - gnH);
+            subNetExcess += Math.max(0, gnH - cnH);
           }
           grandTotalKwh += subKwh;
+
+          // Talep Birleştirme: tahsis/kaynak rolü varsa efektif gn/net değerleri.
+          // Kaynak sayaç (efektif gn=0) aşağıdaki subKwh===0 && subGn===0
+          // kontrolüyle pseudo-fatura üretmeden toplam dışında kalır.
+          if (gesCtx.hasAny) {
+            const allocView = await getFacilityAllocation({
+              supabase,
+              userId: uid,
+              subscriptionSerno: serno,
+              startIso: start.toDate().toISOString(),
+              endIso: end.toDate().toISOString(),
+              ctx: gesCtx,
+            });
+            if (cancel) return;
+            if (allocView) {
+              const eff = applyAllocationToHourlyRows(hourlyRes.data ?? [], allocView);
+              subGn = eff.totalGn;
+              subNetPos = eff.netPositiveDrawKwh;
+              subNetExcess = eff.netExcessFeedKwh;
+            }
+          }
 
           if (cancel) return;
           // Tüketim ve üretim ikisi de yoksa fatura kalemi olmaz; sadece
           // tüketim 0 ise lisansli_satis tesisinde satış olabilir, devam et.
           if (subKwh === 0 && subGn === 0) continue;
+
+          const subLineOverrides = ovMap.get(overrideKey(serno, pYear, pMonth));
 
           // 6.2) Önce snapshot kontrol — varsa direkt kullan (canlı recompute ile)
           const { data: snapData } = await supabase
@@ -1181,7 +1332,7 @@ export default function Dashboard() {
           if (cancel) return;
 
           if (snapData?.total_with_mahsup != null) {
-            grandTotalInvoice += recomputeSnapshotTotalWithMahsup(snapData as any) || 0;
+            grandTotalInvoice += recomputeSnapshotTotalWithMahsup(snapData as any, subLineOverrides) || 0;
             grandTotalMahsup += Number((snapData as any).yekdem_mahsup) || 0;
             hasAnyInvoice = true;
             if ((snapData as any).yekdem_mahsup != null) hasAnyMahsup = true;
@@ -1294,11 +1445,17 @@ export default function Dashboard() {
           const contractPowerKw = gucLimit;
           const tariffType = mapTermToTariffType(terim);
 
-          const riPercent = subKwh > 0 ? (subRi / subKwh) * 100 : 0;
-          const rcPercent = subKwh > 0 ? (subRc / subKwh) * 100 : 0;
+          // Payload override'ı varsa Ri/Rc toplamları mutlak değiştirilir.
+          const { riSum: effSubRi, rcSum: effSubRc } = applyReactiveValueOverrides(
+            subRi,
+            subRc,
+            subLineOverrides
+          );
+          const riPercent = subKwh > 0 ? (effSubRi / subKwh) * 100 : 0;
+          const rcPercent = subKwh > 0 ? (effSubRc / subKwh) * 100 : 0;
           const reactiveUnitPrice = tariffRow.reaktif_bedel != null ? Number(tariffRow.reaktif_bedel) : 0;
-          const riPenaltyEnergy = riPercent > REACTIVE_LIMIT_RI ? subRi : 0;
-          const rcPenaltyEnergy = rcPercent > REACTIVE_LIMIT_RC ? subRc : 0;
+          const riPenaltyEnergy = riPercent > REACTIVE_LIMIT_RI ? effSubRi : 0;
+          const rcPenaltyEnergy = rcPercent > REACTIVE_LIMIT_RC ? effSubRc : 0;
           const reactivePenaltyCharge = (riPenaltyEnergy + rcPenaltyEnergy) * reactiveUnitPrice;
 
           const subPerakende = tariffRow.perakende_enerji_bedeli != null ? Number(tariffRow.perakende_enerji_bedeli) : 0;
@@ -1324,7 +1481,9 @@ export default function Dashboard() {
             lisansliSatis: subLisansliSatis,
             perakendeEnerjiBedeli: subPerakende,
             usdKur: subUsdKur,
-          });
+            netPositiveDrawKwh: subNetPos,
+            netExcessFeedKwh: subNetExcess,
+          }, subLineOverrides);
 
           // YEKDEM Mahsup (M-1) — Lisanslı Satış tesisleri için atlanır.
           let yekdemMahsupVal = 0;
@@ -1527,7 +1686,13 @@ export default function Dashboard() {
         ? (monthlyPTF + monthlyYekdem) * monthlyKbk + (monthlyUnitPriceAdj ?? 0)
         : null;
 
-    const unitPriceText = fmtPTF6(unitPrice);
+    // Enerji birim fiyatı override'lıysa kartta EFEKTİF değer gösterilir.
+    const effUnitPrice =
+      unitPrice != null && subOverrides != null && subOverrides.sub === selectedSub
+        ? resolveUnitPriceOverride(unitPrice, subOverrides.overrides?.enerji)
+        : unitPrice;
+
+    const unitPriceText = fmtPTF6(effUnitPrice);
     const invoiceText = fmtMoney2(invoiceTotal);
 
     const mahsupText =
@@ -1562,6 +1727,8 @@ export default function Dashboard() {
     invoiceTotal,
     hasYekdemMahsup,
     yekdemMahsup,
+    subOverrides,
+    selectedSub,
   ]);
 
   // ✅ Tüm tesislerin toplam değerleri (subs > 1 ise)
@@ -1640,12 +1807,6 @@ export default function Dashboard() {
       ? "TL/kWh (tesis özel YEKDEM)"
       : "TL/kWh (EPİAŞ resmi YEKDEM)";
 
-  const selectedSubLabel = (() => {
-    const found = subs.find((s) => s.subscriptionSerNo === selectedSub);
-    if (found) return subLabel(found);
-    return selectedSub != null ? `Tesis ${selectedSub}` : "Tesis seçilmedi";
-  })();
-
   return (
     <DashboardShell>
       {/* Header + Tesis seçimi */}
@@ -1656,24 +1817,6 @@ export default function Dashboard() {
             PortEco Gösterge Paneli
           </h1>
           <p className="text-sm text-neutral-500">Kişiye ve tesise özel istatistiklerin</p>
-
-{selectedSub && (
-  <p className="mt-1 text-xs text-neutral-500 flex items-center gap-2">
-    Seçili tesis:{" "}
-    
-
-    <button
-      type="button"
-      onClick={() => navigate("/dashboard/profile")}
-      className="inline-flex items-center justify-center rounded-md border border-neutral-200 bg-white px-2 py-0.5 text-[11px] text-neutral-600 hover:bg-neutral-50"
-      title="Tesis adını (nickname) düzenle"
-      aria-label="Tesis adını (nickname) düzenle"
-    >
-      <span className="font-medium text-neutral-800">{selectedSubLabel}</span>
-    </button>
-  </p>
-)}
-
         </div>
 
         <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center sm:justify-end md:w-auto">

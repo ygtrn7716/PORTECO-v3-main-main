@@ -7,6 +7,11 @@ import {
   recomputeSnapshotTotalWithMahsup,
   type InvoiceSnapshotRow,
 } from "@/components/utils/invoiceSnapshots";
+import {
+  fetchAllInvoiceOverridesForUser,
+  overrideKey,
+  type InvoiceOverrides,
+} from "@/components/utils/invoiceOverrides";
 
 const fmtMoney2 = (n: number | null | undefined) =>
   n == null || !Number.isFinite(Number(n))
@@ -28,6 +33,9 @@ export default function InvoiceHistory() {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [rows, setRows] = useState<InvoiceSnapshotRow[]>([]);
+  // Fatura kalem override'ları — tüm tesisler/aylar için TEK sorgu; render
+  // map'inde senkron lookup ile recompute'a geçirilir.
+  const [ovMap, setOvMap] = useState<Map<string, InvoiceOverrides>>(new Map());
 
   useEffect(() => {
     if (sessionLoading) return;
@@ -40,10 +48,18 @@ export default function InvoiceHistory() {
         setLoading(true);
         setErr(null);
 
-        const data = await listInvoiceSnapshots({ userId: uid, invoiceType: "billed" });
+        const [data, overrides] = await Promise.all([
+          listInvoiceSnapshots({ userId: uid, invoiceType: "billed" }),
+          // Fail-open: liste yalnız okur; hata durumunda doğal toplamlar gösterilir.
+          fetchAllInvoiceOverridesForUser({ userId: uid }).catch((e) => {
+            console.error("invoice overrides load error (history):", e);
+            return new Map<string, InvoiceOverrides>();
+          }),
+        ]);
         if (cancel) return;
 
         setRows(data);
+        setOvMap(overrides);
       } catch (e: any) {
         if (!cancel) setErr(e?.message ?? "Geçmiş faturalar yüklenemedi.");
       } finally {
@@ -118,7 +134,7 @@ export default function InvoiceHistory() {
 
                       <div className="text-right">
                         <div className="text-xs text-neutral-500">Ödenecek</div>
-                        <div className="text-sm font-semibold text-neutral-900">{fmtMoney2(recomputeSnapshotTotalWithMahsup(r))} TL</div>
+                        <div className="text-sm font-semibold text-neutral-900">{fmtMoney2(recomputeSnapshotTotalWithMahsup(r, ovMap.get(overrideKey(r.subscription_serno, r.period_year, r.period_month)))) } TL</div>
                       </div>
                     </div>
 
