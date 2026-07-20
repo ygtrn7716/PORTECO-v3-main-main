@@ -1,14 +1,18 @@
 // src/components/utils/calculateInvoiceToDate.ts
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { dayjsTR, TR_TZ } from "@/lib/dayjs";
-import {
-  calculateInvoice,
-  calculateYekdemMahsup,
-} from "@/components/utils/calculateInvoice";
 import type { InvoiceBreakdown, TariffType } from "@/components/utils/calculateInvoice";
+import {
+  calculateInvoiceForMethod,
+  methodForProvider,
+  resolveInvoiceMethods,
+} from "@/lib/invoiceMethods";
+import { assembleMethodInputs } from "@/components/utils/hourlyNetAggregates";
+import type { InvoiceMethodInputs } from "@/components/utils/calculateInvoiceNetMethods";
 import {
   fetchInvoiceOverrides,
   applyReactiveValueOverrides,
+  computeYekdemMahsupWithOverride,
   resolveUnitPriceOverride,
 } from "@/components/utils/invoiceOverrides";
 import { fetchAllConsumption, fetchAllPtf } from "@/lib/paginatedFetch";
@@ -441,25 +445,27 @@ export async function computeMonthInvoiceToDate(params: {
 
   const tariffType = mapTermToTariffType(terim);
 
-  // multiplier + btv_enabled (owner_subscriptions)
+  // multiplier + btv_enabled + provider (owner_subscriptions)
   let multiplier = 1;
   let btvEnabled = true;
+  let provider: string | null = null;
 
   const subRes1 = await supabase
     .from("owner_subscriptions")
-    .select("multiplier, btv_enabled")
+    .select("multiplier, btv_enabled, provider")
     .eq("user_id", uid)
     .eq("subscription_serno", subscriptionSerNo)
     .maybeSingle();
 
   if (subRes1.error) throw subRes1.error;
+  provider = subRes1.data?.provider ?? null;
   if (subRes1.data?.multiplier != null && Number.isFinite(Number(subRes1.data.multiplier))) {
     multiplier = Number(subRes1.data.multiplier);
     btvEnabled = subRes1.data.btv_enabled ?? true;
   } else {
     const subRes2 = await supabase
       .from("owner_subscriptions")
-      .select("multiplier, btv_enabled")
+      .select("multiplier, btv_enabled, provider")
       .eq("subscription_serno", subscriptionSerNo)
       .maybeSingle();
 
@@ -468,7 +474,13 @@ export async function computeMonthInvoiceToDate(params: {
       multiplier = Number(subRes2.data.multiplier);
     }
     btvEnabled = subRes2.data?.btv_enabled ?? true;
+    if (provider == null) provider = subRes2.data?.provider ?? null;
   }
+
+  // Fatura metodu: kullanıcının entegrasyonlarından provider ile çözülür
+  // (müşteri bağlamı — injected client ile RPC).
+  const methodMap = await resolveInvoiceMethods({ context: "self", userId: uid, supabase });
+  const { methodId: invoiceMethodId } = methodForProvider(methodMap, provider);
 
   // resmi dağıtım/güç tarifesi
   const tariffRes = await supabase
@@ -581,8 +593,38 @@ export async function computeMonthInvoiceToDate(params: {
     ? undefined
     : netExcessFeedKwh * projectionFactor;
 
+  // Metod 2/3 saatlik-net girdileri. Yükleyici tam ayı okur; cari ayda bu fiilen
+  // "bugüne kadar"dır (gelecek satır yok). Projeksiyon m1 girdileriyle aynı f ile
+  // kWh agregalarına uygulanır (wPos fiyattır, ölçeklenmez). excludeGesMahsup →
+  // veriş yok sayılır (pos=cn, mahsup/excess=0) — m1'deki davranışın analoğu.
+  let methodInputs: InvoiceMethodInputs | null = null;
+  if (invoiceMethodId !== 1) {
+    const mi = await assembleMethodInputs({
+      supabase,
+      userId: uid,
+      subscriptionSerno: subscriptionSerNo,
+      periodYear: year,
+      periodMonth: month,
+      kbk,
+      tahminiYekdem: monthlyYekdem,
+    });
+    if (mi) {
+      const f = projectionFactor;
+      methodInputs = excludeGesMahsup
+        ? { ...mi, sumCn: mi.sumCn * f, sumGn: 0, sumPos: mi.sumCn * f, sumMahsup: 0, sumExcess: 0 }
+        : {
+            ...mi,
+            sumCn: mi.sumCn * f,
+            sumGn: mi.sumGn * f,
+            sumPos: mi.sumPos * f,
+            sumMahsup: mi.sumMahsup * f,
+            sumExcess: mi.sumExcess * f,
+          };
+    }
+  }
+
   // base invoice (mahsup hariç)
-  const breakdown = calculateInvoice({
+  const breakdown = calculateInvoiceForMethod(invoiceMethodId, {
     totalConsumptionKwh: projConsumptionKwh,
     unitPriceEnergy,
     unitPriceDistribution,
@@ -602,15 +644,19 @@ export async function computeMonthInvoiceToDate(params: {
     lisansliSatis,
     netPositiveDrawKwh: netPositiveDrawForCalc,
     netExcessFeedKwh: netExcessFeedForCalc,
+    methodInputs: methodInputs ?? undefined,
   }, lineOverrides);
 
   // YEKDEM mahsup: M-1 (tam ay)  — InvoiceDetail ile aynı mantık
   // Lisanslı Satış tesisleri mahsup akışına hiç girmez.
+  // D4: Metod 2/3'te fark KDV matrahındaki kalem (yekFarkiCharge) → toplam
+  // sonrası mahsup 0'a zorlanır.
+  const isNetMethod = invoiceMethodId === 2 || invoiceMethodId === 3;
   let yekdemMahsup = 0;
   let hasYekdemMahsup = false;
   let yekdemMissing: "none" | "value" | "final" | "both" = "both";
 
-  if (lisansliSatis) {
+  if (lisansliSatis || isNetMethod) {
     yekdemMissing = "none";
   } else {
    try {
@@ -651,7 +697,11 @@ export async function computeMonthInvoiceToDate(params: {
       }
     }
 
-    if (prevKwh > 0) {
+    // Aşama 3: override yalnız total_kwh verdiğinde doğal YEKDEM değerleri de
+    // gerektiğinden kapı gevşetildi.
+    const mahsupOv = lineOverrides?.yekdem_mahsup;
+
+    if (prevKwh > 0 || mahsupOv) {
       const yRow = await fetchSubYekdemForMahsup(supabase, {
         uid,
         sub: subscriptionSerNo,
@@ -659,29 +709,21 @@ export async function computeMonthInvoiceToDate(params: {
         month: prevForMahsup.month() + 1,
       });
 
-      if (yRow) {
-        const hasValue = yRow.yekdem_value != null;
-        const hasFinal = yRow.yekdem_final != null;
+      const eff = computeYekdemMahsupWithOverride({
+        naturalTotalKwh: prevKwh,
+        naturalYekdemOld:
+          yRow?.yekdem_value != null ? num(yRow.yekdem_value, 0) : null,
+        naturalYekdemNew:
+          yRow?.yekdem_final != null ? num(yRow.yekdem_final, 0) : null,
+        kbk,
+        btvRate,
+        vatRate,
+        override: mahsupOv,
+      });
 
-        if (hasValue && hasFinal) {
-          yekdemMahsup = calculateYekdemMahsup({
-            totalKwh: prevKwh,
-            kbk,
-            btvRate,
-            vatRate,
-            yekdemOld: num(yRow.yekdem_value, 0),
-            yekdemNew: num(yRow.yekdem_final, 0),
-          });
-          hasYekdemMahsup = true;
-          yekdemMissing = "none";
-        } else if (!hasValue && !hasFinal) {
-          yekdemMissing = "both";
-        } else if (!hasValue) {
-          yekdemMissing = "value";
-        } else {
-          yekdemMissing = "final";
-        }
-      }
+      yekdemMahsup = eff.mahsup;
+      hasYekdemMahsup = eff.has;
+      yekdemMissing = eff.missing;
     }
    } catch {
     yekdemMahsup = 0;

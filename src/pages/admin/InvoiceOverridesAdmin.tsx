@@ -44,14 +44,23 @@ const ITEM_LABELS: Record<InvoiceOverrideItemKey, string> = {
   btv: "BTV",
   guc: "Güç Bedeli",
   reaktif: "Reaktif Ceza Bedeli",
+  yekdem_mahsup: "YEKDEM Mahsubu",
+  mahsuplasma: "Mahsuplaşma Fiyatı (Muhtelif-2)",
 };
 
+/**
+ * Kalem tablosunda gösterilen anahtarlar. 'yekdem_mahsup' BİLİNÇLİ olarak yok:
+ * o bir fatura kalemi değil (calculateInvoice'ın dışında hesaplanır) ve kendi
+ * kartında düzenlenir. ITEM_ORDER üzerinde dönen tüm akışlar (draft dönüşümleri,
+ * görünürlük guard'ı, persist) onu ayrıca ele alır.
+ */
 const ITEM_ORDER: InvoiceOverrideItemKey[] = [
-  "enerji", "trafo", "dagitim", "btv", "guc", "reaktif",
+  "enerji", "trafo", "dagitim", "btv", "guc", "reaktif", "mahsuplasma",
 ];
 
-/** Yalnız enerji/dagitim kaleminde birim fiyat override'ı anlamlı. */
-const UNIT_PRICE_ITEMS = new Set<InvoiceOverrideItemKey>(["enerji", "dagitim"]);
+/** Yalnız enerji/dagitim/mahsuplasma kaleminde birim fiyat override'ı anlamlı.
+ *  (mahsuplasma: metod 3 muhtelif-2 kredisinin fiyatı; motor yalnız unitPrice okur.) */
+const UNIT_PRICE_ITEMS = new Set<InvoiceOverrideItemKey>(["enerji", "dagitim", "mahsuplasma"]);
 
 // ---- formatters (InvoiceDetail ile aynı)
 const fmtMoney2 = (n: number | null | undefined) =>
@@ -93,6 +102,8 @@ type DraftRow = {
   note: string;
   riKwh: string; // yalnız reaktif
   rcKwh: string; // yalnız reaktif
+  totalKwh: string; // yalnız yekdem_mahsup — mahsup dönemi toplam tüketim
+  diffYekdem: string; // yalnız yekdem_mahsup — YEKDEM farkı (TL/kWh)
 };
 
 type Draft = Record<InvoiceOverrideItemKey, DraftRow>;
@@ -104,6 +115,8 @@ const emptyRow = (): DraftRow => ({
   note: "",
   riKwh: "",
   rcKwh: "",
+  totalKwh: "",
+  diffYekdem: "",
 });
 
 const emptyDraft = (): Draft => ({
@@ -113,6 +126,8 @@ const emptyDraft = (): Draft => ({
   btv: emptyRow(),
   guc: emptyRow(),
   reaktif: emptyRow(),
+  yekdem_mahsup: emptyRow(),
+  mahsuplasma: emptyRow(),
 });
 
 /** DB'den gelen override'ları form taslağına çevirir. */
@@ -129,6 +144,20 @@ function draftFromOverrides(ov: InvoiceOverrides | null): Draft {
       note: item.note ?? "",
       riKwh: key === "reaktif" ? d(item.payload?.ri_kwh ?? null) : "",
       rcKwh: key === "reaktif" ? d(item.payload?.rc_kwh ?? null) : "",
+      totalKwh: "",
+      diffYekdem: "",
+    };
+  }
+
+  // YEKDEM mahsubu ITEM_ORDER dışında (kalem değil) — kendi kartı.
+  const mahsup = ov.yekdem_mahsup;
+  if (mahsup) {
+    out.yekdem_mahsup = {
+      ...emptyRow(),
+      isExcluded: mahsup.isExcluded,
+      note: mahsup.note ?? "",
+      totalKwh: d(mahsup.payload?.total_kwh ?? null),
+      diffYekdem: d(mahsup.payload?.diff_yekdem ?? null),
     };
   }
   return out;
@@ -167,6 +196,27 @@ function overridesFromDraft(draft: Draft): InvoiceOverrides {
       note: row.note.trim() || null,
     };
   }
+
+  // YEKDEM mahsubu — kalem değil; yalnız payload + is_excluded taşır.
+  const mRow = draft.yekdem_mahsup;
+  const mTotalKwh = numOrNull(mRow.totalKwh);
+  const mDiff = numOrNull(mRow.diffYekdem);
+  let mPayload: { total_kwh?: number; diff_yekdem?: number } | null = null;
+  if (mTotalKwh != null || mDiff != null) {
+    mPayload = {};
+    if (mTotalKwh != null) mPayload.total_kwh = mTotalKwh;
+    if (mDiff != null) mPayload.diff_yekdem = mDiff;
+  }
+  if (mRow.isExcluded || mPayload) {
+    out.yekdem_mahsup = {
+      isExcluded: mRow.isExcluded,
+      unitPriceOverride: null,
+      amountOverride: null,
+      payload: mPayload,
+      note: mRow.note.trim() || null,
+    };
+  }
+
   return out;
 }
 
@@ -430,9 +480,11 @@ export default function InvoiceOverridesAdmin() {
       if (key === "trafo") return trafo > 0;
       if (key === "dagitim") return selectedFacility.provider !== "vhs_kayseri";
       if (key === "guc") return selectedFacility.terim === "cift_terim";
+      // Muhtelif-2 mahsuplaşma fiyatı yalnız Metod 3 (Tredaş) faturasında var.
+      if (key === "mahsuplasma") return inputs?.invoiceMethodId === 3;
       return true;
     });
-  }, [selectedFacility]);
+  }, [selectedFacility, inputs]);
 
   /**
    * Guard'lı (gizli) bir kaleme daha önce konmuş override — tesis ayarı sonradan
@@ -493,6 +545,30 @@ export default function InvoiceOverridesAdmin() {
         },
       });
     }
+
+    // YEKDEM mahsubu — ITEM_ORDER dışında, ayrı yazılır. Lisanslı satış
+    // tesisinde mahsup hiç uygulanmadığı için form da kilitli → yazma yok.
+    if (
+      !inputs?.lisansliSatis &&
+      JSON.stringify(draft.yekdem_mahsup) !== JSON.stringify(savedDraft.yekdem_mahsup)
+    ) {
+      await upsertInvoiceOverride({
+        userId: selectedUserId,
+        subscriptionSerno: selectedSerno,
+        periodYear,
+        periodMonth,
+        itemKey: "yekdem_mahsup",
+        // Boş taslak → isEmptyOverride DELETE'e düşer (çöp satır kalmaz).
+        value: draftOverrides.yekdem_mahsup ?? {
+          isExcluded: false,
+          unitPriceOverride: null,
+          amountOverride: null,
+          payload: null,
+          note: null,
+        },
+      });
+    }
+
     setSavedDraft(draft);
   };
 
@@ -555,8 +631,11 @@ export default function InvoiceOverridesAdmin() {
 
         breakdown: editedResult.breakdown,
 
-        hasYekdemMahsup: inputs.hasYekdemMahsup,
-        yekdemMahsup: inputs.yekdemMahsup,
+        // Efektif (override'lı) mahsup. recomputeSnapshotTotalWithMahsup saklı
+        // yekdem_mahsup'ı AYNEN okur → override'ın Dashboard/InvoiceHistory/
+        // grafiklerde görünmesinin tek yolu bu yazımdır.
+        hasYekdemMahsup: editedResult.hasYekdemMahsup,
+        yekdemMahsup: editedResult.yekdemMahsup,
         totalWithMahsup: editedResult.totalWithMahsup,
         trafoDegeri: inputs.trafoDegeri,
         trafoCharge: editedResult.breakdown.trafoCharge,
@@ -570,6 +649,11 @@ export default function InvoiceOverridesAdmin() {
         netPositiveDrawKwh: inputs.netPositiveDrawKwh,
         netExcessFeedKwh: inputs.netExcessFeedKwh,
         allocatedGesKwh: inputs.allocatedGesKwh,
+        // Fatura metodu damgası — fetchBilledInvoiceInputs'ta admin yolu ile çözüldü.
+        invoiceMethod: inputs.invoiceMethodId,
+        invoiceFrom: inputs.invoiceFrom,
+        // Metod 2/3 replay alanları (metod 1'de null).
+        methodInputs: inputs.methodInputs,
       });
 
       setHasSnapshot(true);
@@ -637,6 +721,25 @@ export default function InvoiceOverridesAdmin() {
     }[] = [
       { label: "Enerji Bedeli", natural: nb.energyCharge, edited: eb.energyCharge, excluded: excluded.has("enerji") },
     ];
+    // Metod 2/3 kalemleri (metod 1 önizlemesi değişmez).
+    const mId = inputs?.invoiceMethodId;
+    const isNetMethod = mId === 2 || mId === 3;
+    if (isNetMethod) {
+      rows.push({
+        label: mId === 2 ? "YEK Bedeli" : "Tahmini YEKDEM",
+        natural: nb.yekTahminiCharge ?? 0,
+        edited: eb.yekTahminiCharge ?? 0,
+        excluded: false,
+      });
+      if ((nb.yekFarkiCharge ?? 0) !== 0 || (eb.yekFarkiCharge ?? 0) !== 0) {
+        rows.push({
+          label: mId === 2 ? "YEK Farkı" : "Önceki YEKDEM Mahsup",
+          natural: nb.yekFarkiCharge ?? 0,
+          edited: eb.yekFarkiCharge ?? 0,
+          excluded: false,
+        });
+      }
+    }
     if (inputs && inputs.trafoDegeri > 0) {
       rows.push({ label: "Trafo Kaybı", natural: nb.trafoCharge, edited: eb.trafoCharge, excluded: excluded.has("trafo") });
     }
@@ -647,13 +750,28 @@ export default function InvoiceOverridesAdmin() {
     if (inputs && inputs.tariffType === "dual") {
       rows.push({ label: "Güç Bedeli (toplam)", natural: nb.powerTotalCharge, edited: eb.powerTotalCharge, excluded: excluded.has("guc") });
     }
+    if (mId === 3) {
+      rows.push({
+        label: "Muhtelif-2 (dağıtım − mahsuplaşma)",
+        natural: nb.muhtelif2Net ?? 0,
+        edited: eb.muhtelif2Net ?? 0,
+        excluded: false,
+      });
+    }
     rows.push({ label: "Reaktif Ceza", natural: nb.reactivePenaltyCharge, edited: eb.reactivePenaltyCharge, excluded: excluded.has("reaktif") });
-    if (nb.verisMahsupKwh > 0 || eb.verisMahsupKwh > 0) {
+    // Metod 2/3'te veriş mahsubu faturadan DÜŞÜLMEZ (m3'te kredi muhtelif-2'de) → satır gizli.
+    if (!isNetMethod && (nb.verisMahsupKwh > 0 || eb.verisMahsupKwh > 0)) {
       rows.push({ label: "Veriş Mahsup (−)", natural: -nb.verisMahsupBedeli, edited: -eb.verisMahsupBedeli, excluded: false });
     }
     rows.push({ label: "KDV Hariç Toplam", natural: nb.subtotalBeforeVat, edited: eb.subtotalBeforeVat, excluded: false, strong: true });
     rows.push({ label: "KDV", natural: nb.vatCharge, edited: eb.vatCharge, excluded: false });
     rows.push({ label: "Genel Toplam (KDV Dahil)", natural: nb.totalInvoice, edited: eb.totalInvoice, excluded: false, strong: true });
+    rows.push({
+      label: "YEKDEM Mahsubu",
+      natural: naturalResult.yekdemMahsup,
+      edited: editedResult.yekdemMahsup,
+      excluded: draft.yekdem_mahsup.isExcluded,
+    });
     rows.push({
       label: "Ödenecek Toplam (Mahsup Dahil)",
       natural: naturalResult.totalWithMahsup,
@@ -662,7 +780,7 @@ export default function InvoiceOverridesAdmin() {
       strong: true,
     });
     return rows;
-  }, [naturalResult, editedResult, inputs]);
+  }, [naturalResult, editedResult, inputs, draft.yekdem_mahsup.isExcluded]);
 
   const diff =
     naturalResult && editedResult
@@ -1030,6 +1148,107 @@ export default function InvoiceOverridesAdmin() {
                   </div>
                 </div>
               )}
+
+              {/* YEKDEM Mahsubu (Manuel) — kalem DEĞİL, ayrı kart */}
+              <div className="mt-4 rounded-xl border border-neutral-200 bg-neutral-50 p-3">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-xs font-medium text-neutral-700">
+                    YEKDEM Mahsubu (Manuel)
+                  </span>
+                  {inputs && (
+                    <span className="text-[11px] text-neutral-500">
+                      Mahsup Dönemi: {inputs.mahsupPeriodLabel}
+                    </span>
+                  )}
+                </div>
+
+                {inputs?.lisansliSatis ? (
+                  <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                    Lisanslı satış tesisinde YEKDEM mahsubu uygulanmaz.
+                  </div>
+                ) : (
+                  <>
+                    <label className="mt-2 flex items-center gap-2 text-xs text-neutral-700">
+                      <input
+                        type="checkbox"
+                        checked={draft.yekdem_mahsup.isExcluded}
+                        onChange={(e) =>
+                          setRow("yekdem_mahsup", { isExcluded: e.target.checked })
+                        }
+                        className="h-4 w-4 rounded border-neutral-300"
+                      />
+                      Bu ay YEKDEM mahsubunu çıkar
+                    </label>
+
+                    <div className="mt-3 flex flex-wrap gap-3">
+                      <label className="block">
+                        <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                          Mahsup Dönemi Toplam Tüketim (kWh)
+                        </span>
+                        <input
+                          type="number"
+                          step="any"
+                          disabled={draft.yekdem_mahsup.isExcluded}
+                          value={draft.yekdem_mahsup.totalKwh}
+                          onChange={(e) =>
+                            setRow("yekdem_mahsup", { totalKwh: e.target.value })
+                          }
+                          placeholder={
+                            inputs
+                              ? inputs.mahsupNaturalTotalKwh > 0
+                                ? `Doğal: ${fmtKwh(inputs.mahsupNaturalTotalKwh)}`
+                                : "Veri yok"
+                              : "—"
+                          }
+                          className="w-56 rounded-lg border border-neutral-300 px-3 py-2 text-sm disabled:bg-neutral-100 disabled:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                        />
+                      </label>
+                      <label className="block">
+                        <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                          YEKDEM Farkı (Gerçekleşen − Tahmin, TL/kWh)
+                        </span>
+                        <input
+                          type="number"
+                          step="any"
+                          disabled={draft.yekdem_mahsup.isExcluded}
+                          value={draft.yekdem_mahsup.diffYekdem}
+                          onChange={(e) =>
+                            setRow("yekdem_mahsup", { diffYekdem: e.target.value })
+                          }
+                          placeholder={
+                            inputs &&
+                            inputs.mahsupNaturalYekdemValue != null &&
+                            inputs.mahsupNaturalYekdemFinal != null
+                              ? `Doğal: ${fmtUnit(
+                                  inputs.mahsupNaturalYekdemFinal -
+                                    inputs.mahsupNaturalYekdemValue
+                                )}`
+                              : "Veri yok"
+                          }
+                          className="w-56 rounded-lg border border-neutral-300 px-3 py-2 text-sm disabled:bg-neutral-100 disabled:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                        />
+                      </label>
+                    </div>
+
+                    {editedResult && (
+                      <div className="mt-2 text-[11px] text-neutral-600">
+                        Hesaplanan mahsup:{" "}
+                        <span className="font-semibold">
+                          {fmtMoney2(editedResult.yekdemMahsup)} ₺
+                        </span>{" "}
+                        <span className="text-neutral-400">
+                          (doğal: {fmtMoney2(naturalResult?.yekdemMahsup ?? 0)} ₺)
+                        </span>
+                      </div>
+                    )}
+
+                    <div className="mt-1 text-[10px] text-neutral-400">
+                      Bu değerler sadece YEKDEM mahsup satırını etkiler; enerji/dağıtım/diğer
+                      kalemlere ve veriş mahsubuna dokunmaz.
+                    </div>
+                  </>
+                )}
+              </div>
 
               {/* Önizleme */}
               <div className="mt-5">

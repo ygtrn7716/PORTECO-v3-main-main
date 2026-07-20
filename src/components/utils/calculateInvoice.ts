@@ -385,14 +385,28 @@ export function calculateInvoice(
       powerExcessCharge = 0;
     }
 
-    appliedOverrides = {
-      excludedItems,
-      amountOverriddenItems,
-      unitPriceEnergyOverridden:
-        enerjiUnitOv != null && Number.isFinite(enerjiUnitOv),
-      unitPriceDistributionOverridden:
-        dagitimUnitOv != null && Number.isFinite(dagitimUnitOv),
-    };
+    const unitPriceEnergyOverridden =
+      enerjiUnitOv != null && Number.isFinite(enerjiUnitOv);
+    const unitPriceDistributionOverridden =
+      dagitimUnitOv != null && Number.isFinite(dagitimUnitOv);
+
+    // Yalnız GERÇEKTEN bir şey uygulandıysa set et. Bu kalemlerden hiçbirini
+    // etkilemeyen bir override objesi (örn. sadece 'yekdem_mahsup' — mahsup
+    // calculateInvoice'ın dışında hesaplanır) çıktıyı bit seviyesinde
+    // değiştirmemeli, UI'daki "düzenlendi" rozetini de yakmamalı.
+    if (
+      excludedItems.length > 0 ||
+      amountOverriddenItems.length > 0 ||
+      unitPriceEnergyOverridden ||
+      unitPriceDistributionOverridden
+    ) {
+      appliedOverrides = {
+        excludedItems,
+        amountOverriddenItems,
+        unitPriceEnergyOverridden,
+        unitPriceDistributionOverridden,
+      };
+    }
   }
 
   // 5) Ara toplam + KDV

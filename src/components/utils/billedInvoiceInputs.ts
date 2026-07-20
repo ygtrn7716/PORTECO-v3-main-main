@@ -27,13 +27,25 @@ import {
   applyAllocationToHourlyRows,
 } from "@/components/utils/gesAllocation";
 import {
-  calculateInvoice,
-  calculateYekdemMahsup,
-  type InvoiceBreakdown,
   type TariffType,
 } from "@/components/utils/calculateInvoice";
 import {
+  calculateInvoiceForMethod,
+  methodForProvider,
+  resolveInvoiceMethods,
+  type InvoiceMethodId,
+} from "@/lib/invoiceMethods";
+import {
+  assembleMethodInputs,
+  computeHourlyNetAggregates,
+} from "@/components/utils/hourlyNetAggregates";
+import type {
+  InvoiceMethodInputs,
+  MethodInvoiceBreakdown,
+} from "@/components/utils/calculateInvoiceNetMethods";
+import {
   applyReactiveValueOverrides,
+  computeYekdemMahsupWithOverride,
   type InvoiceOverrides,
 } from "@/components/utils/invoiceOverrides";
 
@@ -84,9 +96,20 @@ export type BilledInvoiceInputs = {
   reactiveUnitPrice: number;
 
   // ── toplam ekleri
+  /** DOĞAL mahsup (override'sız). Efektif değer için buildBreakdownFromInputs. */
   yekdemMahsup: number;
   hasYekdemMahsup: boolean;
   digerDegerler: number;
+
+  // ── YEKDEM mahsup ham girdileri (Aşama 3 — admin override formu + önizleme)
+  /** Mahsup dönemi P−1 etiketi, örn. "Mayıs 2026". */
+  mahsupPeriodLabel: string;
+  /** P−1 toplam tüketim (kWh). Veri yoksa 0. */
+  mahsupNaturalTotalKwh: number;
+  /** subscription_yekdem.yekdem_value (tahmini), yoksa null. */
+  mahsupNaturalYekdemValue: number | null;
+  /** subscription_yekdem.yekdem_final (kesin), yoksa null. */
+  mahsupNaturalYekdemFinal: number | null;
 
   // ── gösterim / guard / snapshot yazımı
   monthlyPTF: number;
@@ -97,6 +120,11 @@ export type BilledInvoiceInputs = {
   hasDemandData: boolean;
   isKayseriOsb: boolean;
   provider: string | null;
+  // Tedarik firmasından çözülen fatura metodu + firma anahtarı (snapshot damgası).
+  invoiceMethodId: InvoiceMethodId;
+  invoiceFrom: string | null;
+  /** Metod 2/3 saatlik-net girdileri. Metod 1 tesisinde null. */
+  methodInputs: InvoiceMethodInputs | null;
   terim: string | null;
   dagitimUreticiBedeli: number;
   allocatedGesKwh: number | null;
@@ -288,6 +316,10 @@ export async function fetchBilledInvoiceInputs(params: {
   }
   const monthlyPTF = sumPtfWeighted / ptfCoveredKwh;
 
+  // Metod 2/3 için saatlik-net agregalar (pos-ağırlıklı wPos dahil). Satırlar,
+  // tahsis görünümü ve PTF map zaten scope'ta → ek DB turu yok. Metod 1'de kullanılmaz.
+  const netAgg = computeHourlyNetAggregates({ rows: hourlyRows, view: allocView, ptfMap });
+
   if (ptfMissingKwh > 0) {
     warnings.push(
       `${ptfMissingKwh.toLocaleString("tr-TR", {
@@ -372,6 +404,11 @@ export async function fetchBilledInvoiceInputs(params: {
 
   const isKayseriOsb = provider === "vhs_kayseri";
 
+  // Fatura metodu: admin bağlamında RPC işe yaramaz (auth.uid() admin'i döner,
+  // bkz. dosya başındaki not) → user_integrations doğrudan sorgulanır.
+  const methodMap = await resolveInvoiceMethods({ context: "admin", supabase, userId });
+  const { methodId: invoiceMethodId, invoiceFrom } = methodForProvider(methodMap, provider);
+
   // ── 7) Resmi tarife
   const tariffRes = await supabase
     .from("distribution_tariff_official")
@@ -437,11 +474,19 @@ export async function fetchBilledInvoiceInputs(params: {
   let yekdemMahsup = 0;
   let hasYekdemMahsup = false;
 
+  // Ham girdiler admin override formuna gider — lisanslı satışta da etiket lazım.
+  const mahsupPeriod = dayjsTR()
+    .year(periodYear)
+    .month(periodMonth - 1)
+    .subtract(1, "month");
+  const mahsupPeriodLabel = mahsupPeriod.format("MMMM YYYY");
+  let mahsupNaturalTotalKwh = 0;
+  let mahsupNaturalYekdemValue: number | null = null;
+  let mahsupNaturalYekdemFinal: number | null = null;
+
   if (!lisansliSatis) {
     try {
-      const billingMonth = dayjsTR().year(periodYear).month(periodMonth - 1);
-      const prevForYekdem = billingMonth.subtract(1, "month");
-      const prevStart = prevForYekdem.startOf("month");
+      const prevStart = mahsupPeriod.startOf("month");
       const prevEndExclusive = prevStart.clone().add(1, "month");
 
       const prevHourly = await fetchAllConsumption({
@@ -453,43 +498,65 @@ export async function fetchBilledInvoiceInputs(params: {
         endIso: prevEndExclusive.toDate().toISOString(),
       });
 
-      let prevPeriodKwh = 0;
       if (!prevHourly.error && prevHourly.data?.length) {
-        prevPeriodKwh = prevHourly.data.reduce(
+        mahsupNaturalTotalKwh = prevHourly.data.reduce(
           (sum: number, row: any) => sum + (Number(row.cn) || 0),
           0
         );
       }
 
-      if (prevPeriodKwh > 0) {
-        const yRow = await fetchSubYekdemForMahsup(supabase, {
-          uid: userId,
-          sub: subscriptionSerno,
-          year: prevForYekdem.year(),
-          month: prevForYekdem.month() + 1,
-        });
+      // Aşama 3: kapı KOŞULSUZ — override yalnız total_kwh verdiğinde doğal
+      // YEKDEM değerlerinin yine de okunması ve admin formunda placeholder
+      // olarak gösterilebilmesi için.
+      const yRow = await fetchSubYekdemForMahsup(supabase, {
+        uid: userId,
+        sub: subscriptionSerno,
+        year: mahsupPeriod.year(),
+        month: mahsupPeriod.month() + 1,
+      });
 
-        if (yRow && yRow.yekdem_value != null && yRow.yekdem_final != null) {
-          yekdemMahsup = calculateYekdemMahsup({
-            totalKwh: prevPeriodKwh,
-            kbk,
-            btvRate,
-            vatRate,
-            yekdemOld: Number(yRow.yekdem_value),
-            yekdemNew: Number(yRow.yekdem_final),
-          });
-          hasYekdemMahsup = true;
-        } else {
-          warnings.push(
-            "Önceki dönem YEKDEM verileri eksik; mahsup 0 kabul edildi."
-          );
-        }
+      mahsupNaturalYekdemValue =
+        yRow?.yekdem_value != null ? Number(yRow.yekdem_value) : null;
+      mahsupNaturalYekdemFinal =
+        yRow?.yekdem_final != null ? Number(yRow.yekdem_final) : null;
+
+      // Override YOK → doğal mahsup (bugünkü davranışla birebir aynı).
+      const natural = computeYekdemMahsupWithOverride({
+        naturalTotalKwh: mahsupNaturalTotalKwh,
+        naturalYekdemOld: mahsupNaturalYekdemValue,
+        naturalYekdemNew: mahsupNaturalYekdemFinal,
+        kbk,
+        btvRate,
+        vatRate,
+      });
+      yekdemMahsup = natural.mahsup;
+      hasYekdemMahsup = natural.has;
+
+      if (mahsupNaturalTotalKwh > 0 && natural.missing !== "none") {
+        warnings.push(
+          "Önceki dönem YEKDEM verileri eksik; mahsup 0 kabul edildi."
+        );
       }
     } catch {
       warnings.push("Önceki dönem YEKDEM mahsubu hesaplanamadı; 0 kabul edildi.");
       yekdemMahsup = 0;
       hasYekdemMahsup = false;
     }
+  }
+
+  // Metod 2/3 girdileri (yalnız ilgili metotta; prevSumPos snapshot→saatlik, D3).
+  let methodInputs: InvoiceMethodInputs | null = null;
+  if (invoiceMethodId !== 1) {
+    methodInputs = await assembleMethodInputs({
+      supabase,
+      userId,
+      subscriptionSerno,
+      periodYear,
+      periodMonth,
+      kbk,
+      tahminiYekdem: monthlyYekdem,
+      current: netAgg,
+    });
   }
 
   return {
@@ -527,6 +594,11 @@ export async function fetchBilledInvoiceInputs(params: {
       hasYekdemMahsup,
       digerDegerler,
 
+      mahsupPeriodLabel,
+      mahsupNaturalTotalKwh,
+      mahsupNaturalYekdemValue,
+      mahsupNaturalYekdemFinal,
+
       monthlyPTF,
       monthlyYekdem,
       kbk,
@@ -535,6 +607,9 @@ export async function fetchBilledInvoiceInputs(params: {
       hasDemandData,
       isKayseriOsb,
       provider,
+      invoiceMethodId,
+      invoiceFrom,
+      methodInputs,
       terim,
       dagitimUreticiBedeli,
       allocatedGesKwh,
@@ -547,10 +622,13 @@ export async function fetchBilledInvoiceInputs(params: {
 }
 
 export type BilledInvoiceResult = {
-  breakdown: InvoiceBreakdown;
+  breakdown: MethodInvoiceBreakdown;
   riPercent: number;
   rcPercent: number;
   reactivePenaltyCharge: number;
+  /** Efektif YEKDEM mahsubu (override uygulanmış). */
+  yekdemMahsup: number;
+  hasYekdemMahsup: boolean;
   totalWithMahsup: number;
 };
 
@@ -585,7 +663,8 @@ export function buildBreakdownFromInputs(
     (rcPercent > REACTIVE_LIMIT_RC ? rcSum : 0);
   const reactivePenaltyCharge = penaltyEnergy * inputs.reactiveUnitPrice;
 
-  const breakdown = calculateInvoice(
+  const breakdown = calculateInvoiceForMethod(
+    inputs.invoiceMethodId,
     {
       totalConsumptionKwh: inputs.totalConsumptionKwh,
       unitPriceEnergy: inputs.unitPriceEnergy,
@@ -607,16 +686,42 @@ export function buildBreakdownFromInputs(
       excludeDistributionCharge: inputs.excludeDistributionCharge,
       netPositiveDrawKwh: inputs.netPositiveDrawKwh,
       netExcessFeedKwh: inputs.netExcessFeedKwh,
+      methodInputs: inputs.methodInputs ?? undefined,
     },
     overrides
   );
+
+  // YEKDEM mahsubu: override YOKSA doğal değer AYNEN kullanılır (bit-identiklik).
+  // Lisanslı satış tesisinde mahsup hiç uygulanmaz — override diriltemez.
+  // D4: Metod 2/3'te YEKDEM farkı zaten KDV matrahındaki bir KALEM (yekFarkiCharge)
+  // olarak var → toplam-sonrası mahsup 0'a zorlanır (çift sayım önlenir).
+  const isNetMethod = inputs.invoiceMethodId === 2 || inputs.invoiceMethodId === 3;
+  const mahsupOv = overrides?.yekdem_mahsup;
+  let yekdemMahsup = isNetMethod ? 0 : inputs.yekdemMahsup;
+  let hasYekdemMahsup = isNetMethod ? false : inputs.hasYekdemMahsup;
+
+  if (!isNetMethod && mahsupOv && !inputs.lisansliSatis) {
+    const eff = computeYekdemMahsupWithOverride({
+      naturalTotalKwh: inputs.mahsupNaturalTotalKwh,
+      naturalYekdemOld: inputs.mahsupNaturalYekdemValue,
+      naturalYekdemNew: inputs.mahsupNaturalYekdemFinal,
+      kbk: inputs.kbk,
+      btvRate: inputs.btvRate,
+      vatRate: inputs.vatRate,
+      override: mahsupOv,
+    });
+    yekdemMahsup = eff.mahsup;
+    hasYekdemMahsup = eff.has;
+  }
 
   return {
     breakdown,
     riPercent,
     rcPercent,
     reactivePenaltyCharge: breakdown.reactivePenaltyCharge,
+    yekdemMahsup,
+    hasYekdemMahsup,
     totalWithMahsup:
-      breakdown.totalInvoice + inputs.yekdemMahsup + inputs.digerDegerler,
+      breakdown.totalInvoice + yekdemMahsup + inputs.digerDegerler,
   };
 }

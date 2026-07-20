@@ -20,7 +20,13 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { fetchAllConsumption, fetchAllPtf } from "@/lib/paginatedFetch";
-import { calculateInvoice, type InvoiceBreakdown, type TariffType } from "./calculateInvoice";
+import { type InvoiceBreakdown, type TariffType } from "./calculateInvoice";
+import {
+  calculateInvoiceForMethod,
+  DEFAULT_INVOICE_METHOD,
+  type InvoiceMethodId,
+} from "@/lib/invoiceMethods";
+import type { InvoiceMethodInputs } from "@/components/utils/calculateInvoiceNetMethods";
 
 const PAGE = 1000;
 
@@ -97,6 +103,12 @@ export interface GesOlmasaydiParams {
   // Lisanslı Satış: true ise GES tüketim faturasını etkilemez; tasarruf =
   // satılan enerjinin net geliri olarak ortaya çıkar.
   lisansliSatis?: boolean;
+  /** Tesisin fatura metodu — karşı-olgusal fatura da aynı metod motorunu kullanır. */
+  invoiceMethodId?: InvoiceMethodId;
+  /** MEVCUT (GES'li) faturanın metod 2/3 girdileri. Karşı-olgusalda yalnız önceki
+   *  dönem YEKDEM alanları taşınır (önceki dönem her iki dünyada da aynı gerçek);
+   *  cari agregalar ham seriden yeniden kurulur. */
+  methodInputs?: InvoiceMethodInputs | null;
 }
 
 /** Tasarruf formülü TEK yerde: tüm modlar bu montajdan geçer. */
@@ -268,13 +280,17 @@ export async function calculateGesOlmasaydi(
   params: GesOlmasaydiParams,
 ): Promise<GesOlmasaydiResult | null> {
   const { supabase, userId, subscriptionSerno, periodYear, periodMonth } = params;
+  const methodId = params.invoiceMethodId ?? DEFAULT_INVOICE_METHOD;
 
   // ── Receiver modu: Talep Birleştirme ile mahsup alan üretimsiz tesis ──────
   // Üretim/veriş yok → ham tüketim = çekiş; DB fetch gerekmez. "GES olmasaydı
   // fatura" = tahsis SIFIRLANARAK yeniden çalıştırılan fatura motoru (Veriş
   // Mahsup kalemiyle birlikte dağıtım D/2 avantajı ve BTV etkisi de kalkar).
   if (params.mode === "receiver") {
-    const breakdown = calculateInvoice({
+    // Metod 2/3: karşı-olgusal saatlik ÇIPLAK PTF bu dalda türetilemez (yalnız
+    // füzyonlu mevcutBirimFiyat var) → methodInputs geçilmez, dispatcher bilinçli
+    // olarak Metod 1 tahminine düşer (konsolda uyarır). 2C'de iyileştirilebilir.
+    const breakdown = calculateInvoiceForMethod(methodId, {
       totalConsumptionKwh: params.mevcutTuketimKwh,
       unitPriceEnergy: params.mevcutBirimFiyat,
       unitPriceDistribution: params.unitPriceDistribution,
@@ -322,7 +338,7 @@ export async function calculateGesOlmasaydi(
       );
     }
 
-    const breakdown = calculateInvoice({
+    const breakdown = calculateInvoiceForMethod(methodId, {
       totalConsumptionKwh: params.mevcutTuketimKwh,
       unitPriceEnergy: params.mevcutBirimFiyat,
       unitPriceDistribution: params.unitPriceDistribution,
@@ -377,7 +393,8 @@ export async function calculateGesOlmasaydi(
       periodMonth,
     );
 
-    const breakdown = calculateInvoice({
+    // Metod 2/3: receiver dalıyla aynı sınırlama → methodInputs geçilmez (m1 tahmini).
+    const breakdown = calculateInvoiceForMethod(methodId, {
       totalConsumptionKwh: params.mevcutTuketimKwh,
       unitPriceEnergy: params.mevcutBirimFiyat,
       unitPriceDistribution: params.unitPriceDistribution,
@@ -538,8 +555,29 @@ export async function calculateGesOlmasaydi(
   const hamUnitPriceEnergy =
     (hamWeightedPtf + params.monthlyYekdem) * params.kbk + (params.unitPriceAdjustment ?? 0);
 
+  // 8b) Metod 2/3 karşı-olgusal girdiler: GES yok → gn=0 ⇒ pos=cn=ham,
+  // mahsup/excess=0, wPos = ham-ağırlıklı ÇIPLAK PTF (zaten hesaplandı).
+  // Önceki dönem alanları mevcut dünyadan aynen taşınır (gerçekleşmiş veri).
+  const counterfactualMi: InvoiceMethodInputs | undefined =
+    methodId === 2 || methodId === 3
+      ? {
+          sumCn: totalHamKwh,
+          sumGn: 0,
+          sumPos: totalHamKwh,
+          sumMahsup: 0,
+          sumExcess: 0,
+          wPos: hamWeightedPtf,
+          kbk: params.kbk,
+          tahminiYekdem: params.monthlyYekdem,
+          prevSumPos: params.methodInputs?.prevSumPos ?? null,
+          prevTahminiYekdem: params.methodInputs?.prevTahminiYekdem ?? null,
+          prevGerceklesenYekdem: params.methodInputs?.prevGerceklesenYekdem ?? null,
+          mahsuplasmaUnitPrice: null, // mahsup 0 → muhtelif-2 zaten 0
+        }
+      : undefined;
+
   // 9) GES olmasaydı fatura (veriş = 0, çünkü GES yok)
-  const gesOlmasaydiBreakdown = calculateInvoice({
+  const gesOlmasaydiBreakdown = calculateInvoiceForMethod(methodId, {
     totalConsumptionKwh: totalHamKwh,
     unitPriceEnergy: hamUnitPriceEnergy,
     unitPriceDistribution: params.unitPriceDistribution,
@@ -554,6 +592,7 @@ export async function calculateGesOlmasaydi(
     trafoDegeri: params.trafoDegeri,
     totalProductionKwh: 0, // GES yok → veriş yok
     // on_yil ve perakende irrelevant — veriş 0
+    methodInputs: counterfactualMi,
   });
 
   return assembleResult({

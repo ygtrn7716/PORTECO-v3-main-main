@@ -9,7 +9,7 @@ import {
   buildSnapshotBreakdown,
   type InvoiceSnapshotRow,
 } from "@/components/utils/invoiceSnapshots";
-import { type InvoiceBreakdown } from "@/components/utils/calculateInvoice";
+import type { MethodInvoiceBreakdown } from "@/components/utils/calculateInvoiceNetMethods";
 import {
   fetchInvoiceOverrides,
   applyReactivePayloadToSnapshot,
@@ -126,16 +126,21 @@ const yekdemCell = useMemo(() => {
   // Eski snapshot'larda dağıtım bedeli yanlış kayıtlı olabilir (üretim>tüketim
   // durumunda negatif). Saklı input'lardan canlı hesaplayıp doğru değerleri
   // gösteriyoruz. Yeni snapshot'lar zaten doğru yazılıyor.
-  const liveBreakdown = useMemo<InvoiceBreakdown | null>(() => {
+  const liveBreakdown = useMemo<MethodInvoiceBreakdown | null>(() => {
     if (!row) return null;
     try {
       // buildSnapshotBreakdown: birebir aynı alan eşlemesi + kalem override desteği
-      // (reaktif payload dahil).
+      // (reaktif payload dahil). Metod 2/3 snapshot'ları kendi motoruyla replay edilir.
       return buildSnapshotBreakdown(row, overrides);
     } catch {
       return null;
     }
   }, [row, overrides]);
+
+  // Metod 2/3 replay'i mi? (wPosApplied yalnız net motorlarca set edilir;
+  // w_pos'suz eski 2A damgalı satırlar m1'e düşer → burada da metod 1 görünümü.)
+  const snapIsNetMethod = liveBreakdown?.wPosApplied !== undefined;
+  const snapIsM3 = snapIsNetMethod && liveBreakdown?.muhtelif2Net !== undefined;
 
   // Efektif (override'lı) enerji birim fiyatı — kart + satır açıklamaları.
   const effUnitPriceEnergyDisplay = useMemo(() => {
@@ -301,9 +306,41 @@ const yekdemCell = useMemo(() => {
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Enerji Bedeli</td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {fmtUnit(effUnitPriceEnergyDisplay)} TL/kWh × {fmtKwh(row.total_consumption_kwh)} kWh
+                        {snapIsNetMethod ? (
+                          <>
+                            {fmtUnit(liveBreakdown?.energyUnitPriceApplied ?? 0)} TL/kWh ×{" "}
+                            {fmtKwh(liveBreakdown?.netEnergyKwh ?? 0)} kWh
+                          </>
+                        ) : (
+                          <>
+                            {fmtUnit(effUnitPriceEnergyDisplay)} TL/kWh × {fmtKwh(row.total_consumption_kwh)} kWh
+                          </>
+                        )}
                       </td>
                       <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.energyCharge ?? row.energy_charge)}</td>
+                    </tr>
+                  )}
+
+                  {/* Metod 2: YEK Bedeli (brüt) · Metod 3: Tahmini YEKDEM (net) */}
+                  {snapIsNetMethod && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">{snapIsM3 ? "Tahmini YEKDEM" : "YEK Bedeli"}</td>
+                      <td className="py-2 pr-4 text-neutral-600">Tahmini YEKDEM × KBK</td>
+                      <td className="py-2 pr-4 text-right">
+                        {fmtMoney2(liveBreakdown?.yekTahminiCharge ?? 0)}
+                      </td>
+                    </tr>
+                  )}
+
+                  {snapIsNetMethod && (liveBreakdown?.yekFarkiCharge ?? 0) !== 0 && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">{snapIsM3 ? "Önceki YEKDEM Mahsup" : "YEK Farkı"}</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        Önceki dönem net çekiş × (Gerçekleşen − Tahmini) × KBK
+                      </td>
+                      <td className="py-2 pr-4 text-right">
+                        {fmtMoney2(liveBreakdown?.yekFarkiCharge ?? 0)}
+                      </td>
                     </tr>
                   )}
 
@@ -317,10 +354,36 @@ const yekdemCell = useMemo(() => {
                     </tr>
                   )}
 
+                  {/* Metod 3: Muhtelif-2 (+mahsup×dağıtım − mahsup×mahsuplaşma) */}
+                  {snapIsM3 && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">Muhtelif-2</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        +{fmtMoney2(liveBreakdown?.muhtelif2Dagitim ?? 0)} dağıtım −{" "}
+                        {fmtMoney2(liveBreakdown?.muhtelif2MahsupKredisi ?? 0)} mahsuplaşma
+                      </td>
+                      <td
+                        className={
+                          "py-2 pr-4 text-right " +
+                          ((liveBreakdown?.muhtelif2Net ?? 0) < 0 ? "text-emerald-700" : "")
+                        }
+                      >
+                        {(liveBreakdown?.muhtelif2Net ?? 0) < 0 ? "−" : ""}
+                        {fmtMoney2(Math.abs(liveBreakdown?.muhtelif2Net ?? 0))}
+                      </td>
+                    </tr>
+                  )}
+
                   {!excludedItems.has("btv") && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">BTV (%{((Number(row.btv_rate ?? 0)) * 100).toFixed(2)})</td>
-                      <td className="py-2 pr-4 text-neutral-600">Net enerji bedeli × BTV oranı</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        {snapIsNetMethod
+                          ? snapIsM3
+                            ? "(Enerji − mahsuplaşma kredisi) × BTV oranı"
+                            : "Enerji bedeli × BTV oranı"
+                          : "Net enerji bedeli × BTV oranı"}
+                      </td>
                       <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.btvCharge ?? row.btv_charge)}</td>
                     </tr>
                   )}
@@ -366,8 +429,9 @@ const yekdemCell = useMemo(() => {
                   )}
 
                   {/* Yalnızca veriş MAHSUBU faturadan düşülür. Fazla üretim satışı
-                      aşağıdaki "GES Üretim Satışı" kartında ayrı gösterilir. */}
-                  {Number(liveBreakdown?.verisMahsupBedeli ?? 0) > 0 && (
+                      aşağıdaki "GES Üretim Satışı" kartında ayrı gösterilir.
+                      Metod 2/3'te mahsup faturadan düşülmez → satır yok. */}
+                  {!snapIsNetMethod && Number(liveBreakdown?.verisMahsupBedeli ?? 0) > 0 && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4 text-emerald-700">Veriş Mahsup (Birim Fiyat)</td>
                       <td className="py-2 pr-4 text-neutral-600">
@@ -397,13 +461,16 @@ const yekdemCell = useMemo(() => {
                     <td className="py-2 pr-4 text-right font-semibold">{fmtMoney2(liveBreakdown?.totalInvoice ?? row.total_invoice)} TL</td>
                   </tr>
 
-                  <tr className="border-b border-neutral-200">
-                    <td className="py-2 pr-4 font-semibold">Önceki Dönem YEKDEM Mahsubu</td>
-                    <td className="py-2 pr-4 text-neutral-600">M-1 için (yekdem_final - yekdem_value)</td>
-                    <td className={`py-2 pr-4 text-right font-semibold ${yekdemCell?.cls ?? ""}`}>
-                      {yekdemCell?.text ?? "—"}
-                    </td>
-                  </tr>
+                  {/* Metod 2/3'te fark KDV matrahındaki kalem (yukarıda) — bu satır gizli (D4). */}
+                  {!snapIsNetMethod && (
+                    <tr className="border-b border-neutral-200">
+                      <td className="py-2 pr-4 font-semibold">Önceki Dönem YEKDEM Mahsubu</td>
+                      <td className="py-2 pr-4 text-neutral-600">M-1 için (yekdem_final - yekdem_value)</td>
+                      <td className={`py-2 pr-4 text-right font-semibold ${yekdemCell?.cls ?? ""}`}>
+                        {yekdemCell?.text ?? "—"}
+                      </td>
+                    </tr>
+                  )}
 
 {digerDegerler !== 0 && (
   <tr className="border-b border-neutral-100">

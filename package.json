@@ -9,7 +9,8 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "cron:alerts": "tsx scripts/reactive-alerts.ts",
-    "test:sms": "tsx scripts/test-sms.ts"
+    "test:sms": "tsx scripts/test-sms.ts",
+    "check:invoice-methods": "tsx scripts/check-invoice-methods.ts"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.2.3",

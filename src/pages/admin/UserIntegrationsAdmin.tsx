@@ -18,6 +18,9 @@ export default function UserIntegrationsAdmin() {
           { key: "active", label: "active", type: "bool" },
           { key: "kullanici_sirasi", label: "kullanici_sirasi", type: "number" },
           { key: "altyapi", label: "altyapi", type: "text" },
+          // NOT NULL (20260718_003). Boş bırakılırsa insert DB seviyesinde
+          // reddedilir. Dropdown + validasyon Aşama 2'de.
+          { key: "invoice_from", label: "invoice_from", type: "text" },
           { key: "created_at", label: "created_at", type: "text", readOnly: true, hideInTable: true },
         ],
       }}

@@ -1,10 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import {
-  calculateInvoice,
   type InvoiceBreakdown,
   type TariffType,
 } from "@/components/utils/calculateInvoice";
+import {
+  calculateInvoiceForMethod,
+  DEFAULT_INVOICE_METHOD,
+  type InvoiceMethodId,
+} from "@/lib/invoiceMethods";
+import type { InvoiceMethodInputs } from "@/components/utils/calculateInvoiceNetMethods";
 
 const fmtMoney2 = (n: number | null | undefined) =>
   n == null || !Number.isFinite(Number(n))
@@ -69,6 +74,10 @@ export default function AlternateTariffInvoiceSection(props: {
   // Saatlik net mahsup (net üretici): alternatif tarife de aynı bazı kullanır.
   netPositiveDrawKwh?: number;
   netExcessFeedKwh?: number;
+  // Tesisin fatura metodu — simülasyon da aynı metod motorunu kullansın.
+  invoiceMethodId?: InvoiceMethodId;
+  /** Metod 2/3 saatlik-net girdileri (InvoiceDetail'den). Metod 1'de null. */
+  methodInputs?: InvoiceMethodInputs | null;
 }) {
   const {
     uid,
@@ -92,6 +101,8 @@ export default function AlternateTariffInvoiceSection(props: {
     usdKur,
     netPositiveDrawKwh,
     netExcessFeedKwh,
+    invoiceMethodId = DEFAULT_INVOICE_METHOD,
+    methodInputs = null,
   } = props;
 
   const [loading, setLoading] = useState(false);
@@ -231,7 +242,7 @@ export default function AlternateTariffInvoiceSection(props: {
           powerExcessPriceForCalc = altPowerExcessPrice;
         }
 
-        const breakdown = calculateInvoice({
+        const breakdown = calculateInvoiceForMethod(invoiceMethodId, {
           totalConsumptionKwh,
           unitPriceEnergy,
           unitPriceDistribution: altUnitPriceDistribution,
@@ -251,6 +262,7 @@ export default function AlternateTariffInvoiceSection(props: {
           usdKur,
           netPositiveDrawKwh,
           netExcessFeedKwh,
+          methodInputs: methodInputs ?? undefined,
         });
 
         if (cancel) return;
@@ -289,6 +301,10 @@ export default function AlternateTariffInvoiceSection(props: {
     reactiveRiPercent,
     reactiveRcPercent,
     trafoDegeri,
+    // Aşama 2B: metodlar ayrıştı — metod/girdi değişimi simülasyonu yeniden hesaplatmalı
+    // (2A'da bilinçli ertelenmişti; artık stale-prop riski gerçek).
+    invoiceMethodId,
+    methodInputs,
   ]);
 
   const altTotalWithExtras = useMemo(() => {

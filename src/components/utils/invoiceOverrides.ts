@@ -1,4 +1,6 @@
 import { supabase } from "@/lib/supabase";
+// calculateInvoice.ts bu modülden yalnız `import type` yapar → runtime döngüsü yok.
+import { calculateYekdemMahsup } from "./calculateInvoice";
 
 /**
  * Fatura kalem override altyapısı (Aşama 1).
@@ -15,7 +17,33 @@ export type InvoiceOverrideItemKey =
   | "btv"
   | "reaktif"
   | "guc"
-  | "trafo";
+  | "trafo"
+  /**
+   * Aşama 3 — fatura KALEMİ DEĞİL. YEKDEM mahsubu calculateInvoice'ın dışında
+   * (totalWithMahsup = totalInvoice + yekdemMahsup + digerDegerler) hesaplandığı
+   * için calculateInvoice bu anahtarı görmezden gelir; mahsup çağrı noktaları
+   * computeYekdemMahsupWithOverride ile tüketir.
+   */
+  | "yekdem_mahsup"
+  /**
+   * Aşama 2B — yalnız METOD 3 (Tredaş). Muhtelif-2 kalemindeki mahsuplaşma
+   * kredisinin birim fiyatı (TL/kWh). Girilmezse T-0 enerji fiyatı kullanılır.
+   * Metod 1/2 bu anahtarı görmezden gelir.
+   */
+  | "mahsuplasma";
+
+/**
+ * Kalem payload'ı. Alanlar kaleme göre anlamlıdır:
+ * - reaktif       → ri_kwh / rc_kwh (Ri/Rc kWh toplamlarının MUTLAK yerine geçer)
+ * - yekdem_mahsup → total_kwh (mahsup dönemi toplam tüketim) /
+ *                   diff_yekdem (YEKDEM farkı = yekdem_final − yekdem_value, TL/kWh)
+ */
+export type InvoiceOverridePayload = {
+  ri_kwh?: number;
+  rc_kwh?: number;
+  total_kwh?: number;
+  diff_yekdem?: number;
+};
 
 export type InvoiceLineOverride = {
   isExcluded: boolean;
@@ -23,8 +51,8 @@ export type InvoiceLineOverride = {
   unitPriceOverride: number | null;
   /** Kalem tutarını sabitler (TL, KDV öncesi). */
   amountOverride: number | null;
-  /** Yalnız reaktif için: Ri/Rc kWh toplamlarını MUTLAK değerle değiştirir. */
-  payload: { ri_kwh?: number; rc_kwh?: number } | null;
+  /** Kaleme özel ek girdiler — bkz. InvoiceOverridePayload. */
+  payload: InvoiceOverridePayload | null;
   note: string | null;
 };
 
@@ -38,6 +66,8 @@ export type AppliedInvoiceOverrides = {
   amountOverriddenItems: InvoiceOverrideItemKey[];
   unitPriceEnergyOverridden: boolean;
   unitPriceDistributionOverridden: boolean;
+  /** Aşama 2B / Metod 3: muhtelif-2 mahsuplaşma birim fiyatı override'landı mı? */
+  unitPriceMahsuplasmaOverridden?: boolean;
 };
 
 const ITEM_KEYS: InvoiceOverrideItemKey[] = [
@@ -47,6 +77,8 @@ const ITEM_KEYS: InvoiceOverrideItemKey[] = [
   "reaktif",
   "guc",
   "trafo",
+  "yekdem_mahsup",
+  "mahsuplasma",
 ];
 
 // Caller'lardaki reaktif eşiklerin aynısı (Dashboard/InvoiceDetail/calculateInvoiceToDate).
@@ -99,11 +131,28 @@ const parseReactivePayload = (
   return out.ri_kwh != null || out.rc_kwh != null ? out : null;
 };
 
+/** yekdem_mahsup payload'ı — reaktifin simetriği; boşsa null (çöp satır olmasın). */
+const parseYekdemMahsupPayload = (
+  raw: unknown
+): { total_kwh?: number; diff_yekdem?: number } | null => {
+  if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  const out: { total_kwh?: number; diff_yekdem?: number } = {};
+  const totalKwh = toFiniteOrNull(obj.total_kwh);
+  const diff = toFiniteOrNull(obj.diff_yekdem);
+  if (totalKwh != null) out.total_kwh = totalKwh;
+  if (diff != null) out.diff_yekdem = diff;
+  return out.total_kwh != null || out.diff_yekdem != null ? out : null;
+};
+
 const rowToOverride = (row: InvoiceLineOverrideRow): InvoiceLineOverride => ({
   isExcluded: row.is_excluded === true,
   unitPriceOverride: toFiniteOrNull(row.unit_price_override),
   amountOverride: toFiniteOrNull(row.amount_override),
-  payload: parseReactivePayload(row.payload),
+  payload:
+    row.item_key === "yekdem_mahsup"
+      ? parseYekdemMahsupPayload(row.payload)
+      : parseReactivePayload(row.payload),
   note: row.note ?? null,
 });
 
@@ -221,7 +270,7 @@ export type InvoiceLineOverrideInput = {
   isExcluded?: boolean;
   unitPriceOverride?: number | null;
   amountOverride?: number | null;
-  payload?: { ri_kwh?: number; rc_kwh?: number } | null;
+  payload?: InvoiceOverridePayload | null;
   note?: string | null;
 };
 
@@ -426,4 +475,149 @@ export function applyReactivePayloadToSnapshot(
   // Birim fiyat türetilemiyor (saklı ceza 0) → saklı ceza korunur; kesin TL
   // için admin reaktif amount_override kullanmalı.
   return { riPercent, rcPercent, penalty: stored.penalty };
+}
+
+// ─────────────────────────────────────────────
+// YEKDEM MAHSUP OVERRIDE (Aşama 3)
+// ─────────────────────────────────────────────
+
+export type YekdemMahsupMissing = "none" | "value" | "final" | "both";
+
+export type ResolvedYekdemMahsupInputs = {
+  totalKwh: number;
+  yekdemOld: number;
+  yekdemNew: number;
+  /** Doğal veri eksik/0 olsa bile mahsup HESAPLANIR (erken çıkışlar bypass). */
+  forceCompute: boolean;
+  /** is_excluded → mahsup o dönem için 0'a zorlanır. */
+  forceZero: boolean;
+};
+
+/**
+ * yekdem_mahsup override'ının efektif girdilerini üretir. SAF — Supabase yok.
+ *
+ * Override yoksa null döner; çağıran doğal davranışını birebir korur
+ * (regresyon garantisi).
+ */
+export function resolveYekdemMahsupInputs(args: {
+  naturalTotalKwh: number;
+  naturalYekdemOld: number | null;
+  naturalYekdemNew: number | null;
+  override?: InvoiceLineOverride | null;
+}): ResolvedYekdemMahsupInputs | null {
+  const { naturalTotalKwh, naturalYekdemOld, naturalYekdemNew, override } = args;
+  if (!override) return null;
+
+  const payload = override.payload;
+
+  const payloadKwh = payload?.total_kwh;
+  const effTotalKwh =
+    payloadKwh != null && Number.isFinite(payloadKwh)
+      ? payloadKwh
+      : naturalTotalKwh;
+
+  // diff_yekdem verildiyse net farkı TEK kalemde temsil et: formül
+  // diffYekdem = yekdemNew − yekdemOld olduğu için old=0, new=diff yeterli.
+  const payloadDiff = payload?.diff_yekdem;
+  const useDiff = payloadDiff != null && Number.isFinite(payloadDiff);
+
+  const yekdemOld = useDiff ? 0 : naturalYekdemOld ?? NaN;
+  const yekdemNew = useDiff ? payloadDiff! : naturalYekdemNew ?? NaN;
+
+  const effDiff = yekdemNew - yekdemOld;
+
+  return {
+    totalKwh: effTotalKwh,
+    yekdemOld,
+    yekdemNew,
+    forceCompute: effTotalKwh > 0 && Number.isFinite(effDiff),
+    forceZero: override.isExcluded === true,
+  };
+}
+
+/**
+ * Mahsup çağrı noktalarının ORTAK karar noktası: doğal girdiler + opsiyonel
+ * override → { mahsup, has, missing }.
+ *
+ * Override yokken bugünkü nested-if mantığının birebir aynısını uygular
+ * (kWh > 0 && her iki YEKDEM dolu → hesapla; değilse both/value/final), böylece
+ * override'sız çıktı bit-identiktir.
+ *
+ * lisansli_satis kontrolü ÇAĞIRANDA kalır — override lisanslı tesiste mahsubu
+ * diriltmemelidir.
+ */
+export function computeYekdemMahsupWithOverride(args: {
+  naturalTotalKwh: number;
+  /** subscription_yekdem.yekdem_value (tahmini) */
+  naturalYekdemOld: number | null;
+  /** subscription_yekdem.yekdem_final (kesin) */
+  naturalYekdemNew: number | null;
+  kbk: number;
+  btvRate: number;
+  vatRate: number;
+  override?: InvoiceLineOverride | null;
+}): { mahsup: number; has: boolean; missing: YekdemMahsupMissing } {
+  const {
+    naturalTotalKwh,
+    naturalYekdemOld,
+    naturalYekdemNew,
+    kbk,
+    btvRate,
+    vatRate,
+    override,
+  } = args;
+
+  const resolved = resolveYekdemMahsupInputs({
+    naturalTotalKwh,
+    naturalYekdemOld,
+    naturalYekdemNew,
+    override,
+  });
+
+  if (resolved?.forceZero) {
+    return { mahsup: 0, has: true, missing: "none" };
+  }
+
+  if (resolved?.forceCompute) {
+    return {
+      mahsup: calculateYekdemMahsup({
+        totalKwh: resolved.totalKwh,
+        kbk,
+        btvRate,
+        vatRate,
+        yekdemOld: resolved.yekdemOld,
+        yekdemNew: resolved.yekdemNew,
+      }),
+      has: true,
+      missing: "none",
+    };
+  }
+
+  // Doğal dal — override yok ya da hesap için yeterli değil.
+  const hasValue = naturalYekdemOld != null;
+  const hasFinal = naturalYekdemNew != null;
+
+  if (!(naturalTotalKwh > 0)) {
+    // Tüketim yoksa doğal akış YEKDEM satırına hiç bakmaz → "both".
+    return { mahsup: 0, has: false, missing: "both" };
+  }
+
+  if (hasValue && hasFinal) {
+    return {
+      mahsup: calculateYekdemMahsup({
+        totalKwh: naturalTotalKwh,
+        kbk,
+        btvRate,
+        vatRate,
+        yekdemOld: naturalYekdemOld,
+        yekdemNew: naturalYekdemNew,
+      }),
+      has: true,
+      missing: "none",
+    };
+  }
+
+  if (!hasValue && !hasFinal) return { mahsup: 0, has: false, missing: "both" };
+  if (!hasValue) return { mahsup: 0, has: false, missing: "value" };
+  return { mahsup: 0, has: false, missing: "final" };
 }

@@ -15,9 +15,11 @@ import {
 import {
   getInvoiceSnapshot,
   buildSnapshotBreakdown,
+  methodInputsFromSnapshotRow,
   recomputeSnapshotTotalWithMahsup,
 } from "@/components/utils/invoiceSnapshots";
 import { fetchInvoiceOverrides } from "@/components/utils/invoiceOverrides";
+import { coerceInvoiceMethodId } from "@/lib/invoiceMethods";
 import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
 import { resolveGesSatisDagitimRate } from "@/lib/ges/gesSatisDagitimRate";
 import GesSavingsCard from "@/components/dashboard/shared/GesSavingsCard";
@@ -246,6 +248,10 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
           trafoDegeri: Number(snap.trafo_degeri) || 0,
           onYil: snap.on_yil ?? undefined,
           perakendeEnerjiBedeli: snap.perakende_enerji_bedeli ?? undefined,
+          // Metod snapshot'tan okunur (null = eski kayıt → metod 1).
+          invoiceMethodId: coerceInvoiceMethodId(snap.invoice_method),
+          // Metod 2/3: karşı-olgusalın önceki dönem YEKDEM alanları snapshot'tan.
+          methodInputs: methodInputsFromSnapshotRow(snap) ?? null,
         });
 
         if (cancel) return;

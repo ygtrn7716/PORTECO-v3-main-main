@@ -20,17 +20,25 @@ import GesUretimSatisiCard from "@/components/dashboard/shared/GesUretimSatisiCa
 import KayseriEkBedellerCard from "@/components/dashboard/shared/KayseriEkBedellerCard";
 import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
 
-import {
-  calculateInvoice,
-  calculateYekdemMahsup,
-} from "@/components/utils/calculateInvoice";
 import type {
   InvoiceBreakdown,
   TariffType,
 } from "@/components/utils/calculateInvoice";
 import {
+  calculateInvoiceForMethod,
+  methodForProvider,
+  resolveInvoiceMethods,
+  type InvoiceMethodId,
+} from "@/lib/invoiceMethods";
+import { assembleMethodInputs } from "@/components/utils/hourlyNetAggregates";
+import type {
+  InvoiceMethodInputs,
+  MethodInvoiceBreakdown,
+} from "@/components/utils/calculateInvoiceNetMethods";
+import {
   fetchInvoiceOverrides,
   applyReactiveValueOverrides,
+  computeYekdemMahsupWithOverride,
   resolveUnitPriceOverride,
 } from "@/components/utils/invoiceOverrides";
 
@@ -79,7 +87,7 @@ interface PowerRecommendation {
 
 
 interface InvoiceViewData {
-  breakdown: InvoiceBreakdown;
+  breakdown: MethodInvoiceBreakdown;
   totalConsumptionKwh: number;
   totalProductionKwh: number;
   unitPriceEnergy: number;
@@ -126,6 +134,10 @@ interface InvoiceViewData {
    // Kayseri OSB (owner_subscriptions.provider = 'vhs_kayseri'): Dağıtım Bedeli
    // kalemi kaldırılır; katsayı kaydı varsa "Ek Bedeller" kartı gösterilir.
    isKayseriOsb: boolean;
+   // Tedarik firmasından çözülen fatura metodu.
+   invoiceMethodId: InvoiceMethodId;
+   // Metod 2/3 saatlik-net girdileri (AlternateTariff + GES Olmasaydı da kullanır).
+   methodInputs: InvoiceMethodInputs | null;
    kayseriEkBedeller: { iletim: number; osbDagitim: number; lisanssizCekis: number } | null;
    // Saatlik net mahsup (net üretici): alternatif tarife karşılaştırması da bu bazı kullansın.
    netPositiveDrawKwh: number; // Σ max(0, cn − gn)
@@ -617,6 +629,11 @@ export default function InvoiceDetail() {
         // Kayseri OSB tespiti: dağıtım bedeli kaldırılır, Ek Bedeller kartı gösterilir.
         const isKayseriOsb = provider === "vhs_kayseri";
 
+        // Fatura metodu: kullanıcının entegrasyonlarından provider ile çözülür.
+        const methodMap = await resolveInvoiceMethods({ context: "self", userId: uid });
+        if (cancel) return;
+        const { methodId: invoiceMethodId, invoiceFrom } = methodForProvider(methodMap, provider);
+
         // 5c) Kayseri OSB ek bedel katsayıları — kaydı olmayan tesiste kart gösterilmez.
         // Okuma hatası faturayı kırmasın (kart opsiyonel).
         let kayseriEkBedeller: { iletim: number; osbDagitim: number; lisanssizCekis: number } | null = null;
@@ -755,8 +772,24 @@ export default function InvoiceDetail() {
           }
         }
 
+        // 8) Metod 2/3 saatlik-net girdileri (pos-ağırlıklı wPos + önceki dönem, D3).
+        //    Yalnız metod 2/3'te; metod 1 tesisinde ek DB turu yok.
+        let methodInputs: InvoiceMethodInputs | null = null;
+        if (invoiceMethodId !== 1) {
+          methodInputs = await assembleMethodInputs({
+            supabase,
+            userId: uid,
+            subscriptionSerno: selectedSub,
+            periodYear,
+            periodMonth,
+            kbk,
+            tahminiYekdem: monthlyYekdem,
+          });
+          if (cancel) return;
+        }
+
         // 8) fatura hesabı (mahsup hariç)
-          const breakdown = calculateInvoice({
+          const breakdown = calculateInvoiceForMethod(invoiceMethodId, {
             totalConsumptionKwh,
             unitPriceEnergy,
             unitPriceDistribution,
@@ -778,6 +811,7 @@ export default function InvoiceDetail() {
             excludeDistributionCharge: isKayseriOsb,
             netPositiveDrawKwh,
             netExcessFeedKwh,
+            methodInputs: methodInputs ?? undefined,
           }, invoiceLineOverrides);
 
        //ara taşak madde ekliyom  buraya
@@ -791,11 +825,15 @@ export default function InvoiceDetail() {
 
         // 9) YEKDEM mahsup (M-1 için)
         // Lisanslı Satış tesisleri için YEKDEM mahsup uygulanmaz.
+        // D4: Metod 2/3'te YEKDEM farkı zaten KDV matrahındaki bir KALEM
+        // (yekFarkiCharge) → toplam-sonrası mahsup 0'a zorlanır (çift sayım önlenir).
+        const isNetMethod = invoiceMethodId === 2 || invoiceMethodId === 3;
         let yekdemMahsupValue = 0;
         let hasYekdemMahsup = false;
-        let yekdemMissing: "none" | "value" | "final" | "both" = lisansliSatis ? "none" : "both";
+        let yekdemMissing: "none" | "value" | "final" | "both" =
+          lisansliSatis || isNetMethod ? "none" : "both";
 
-        if (!lisansliSatis) try {
+        if (!lisansliSatis && !isNetMethod) try {
           const billingMonth = dayjsTR().year(periodYear).month(periodMonth - 1); // M
           const prevForYekdem = billingMonth.subtract(1, "month"); // M-1
 
@@ -835,7 +873,11 @@ export default function InvoiceDetail() {
             }
           }
 
-          if (prevPeriodKwh > 0) {
+          // Aşama 3: override yalnız total_kwh verdiğinde doğal YEKDEM
+          // değerleri de gerektiğinden kapı gevşetildi.
+          const mahsupOv = invoiceLineOverrides?.yekdem_mahsup;
+
+          if (prevPeriodKwh > 0 || mahsupOv) {
             const yRow = await fetchSubYekdemForMahsup({
               uid,
               sub: selectedSub,
@@ -843,29 +885,21 @@ export default function InvoiceDetail() {
               month: prevForYekdem.month() + 1,
             });
 
-            if (yRow) {
-              const hasValue = yRow.yekdem_value != null;
-              const hasFinal = yRow.yekdem_final != null;
+            const eff = computeYekdemMahsupWithOverride({
+              naturalTotalKwh: prevPeriodKwh,
+              naturalYekdemOld:
+                yRow?.yekdem_value != null ? Number(yRow.yekdem_value) : null,
+              naturalYekdemNew:
+                yRow?.yekdem_final != null ? Number(yRow.yekdem_final) : null,
+              kbk,
+              btvRate,
+              vatRate,
+              override: mahsupOv,
+            });
 
-              if (hasValue && hasFinal) {
-                yekdemMahsupValue = calculateYekdemMahsup({
-                  totalKwh: prevPeriodKwh,
-                  kbk,
-                  btvRate,
-                  vatRate,
-                  yekdemOld: Number(yRow.yekdem_value),
-                  yekdemNew: Number(yRow.yekdem_final),
-                });
-                hasYekdemMahsup = true;
-                yekdemMissing = "none";
-              } else if (!hasValue && !hasFinal) {
-                yekdemMissing = "both";
-              } else if (!hasValue) {
-                yekdemMissing = "value";
-              } else {
-                yekdemMissing = "final";
-              }
-            }
+            yekdemMahsupValue = eff.mahsup;
+            hasYekdemMahsup = eff.has;
+            yekdemMissing = eff.missing;
           }
         } catch (e) {
           console.error("YEKDEM mahsup hesap hatası:", e);
@@ -970,6 +1004,11 @@ try {
     netExcessFeedKwh,
     // Talep Birleştirme audit'i (hesaba girmez).
     allocatedGesKwh,
+    // Fatura metodu damgası: kesim anında çözülen metod + tedarik firması anahtarı.
+    invoiceMethod: invoiceMethodId,
+    invoiceFrom,
+    // Metod 2/3 replay alanları (metod 1'de null → kolonlar boş kalır).
+    methodInputs,
   });
 } catch (e) {
   console.error("upsertInvoiceSnapshot error:", e);
@@ -980,6 +1019,8 @@ try {
           setData({
             breakdown,
             isKayseriOsb,
+            invoiceMethodId,
+            methodInputs,
             kayseriEkBedeller,
             totalConsumptionKwh,
             // Gösterim efektif değerlerden (kart + satır açıklamaları breakdown
@@ -1093,6 +1134,8 @@ try {
             lisansliSatis,
             perakendeEnerjiBedeli,
             usdKur: monthlyUsdKur,
+            invoiceMethodId,
+            methodInputs,
           };
           gesOlmasaydiCalced.current = false;
           setGesOlmasaydiResult(null);
@@ -1155,6 +1198,8 @@ try {
         onYil: p.onYil,
         lisansliSatis: p.lisansliSatis,
         perakendeEnerjiBedeli: p.perakendeEnerjiBedeli,
+        invoiceMethodId: p.invoiceMethodId,
+        methodInputs: p.methodInputs ?? null,
       });
       setGesOlmasaydiResult(result);
       gesOlmasaydiCalced.current = true;
@@ -1408,6 +1453,8 @@ const excludedItems = new Set<string>(
             usdKur={data.usdKur}
             netPositiveDrawKwh={data.netPositiveDrawKwh}
             netExcessFeedKwh={data.netExcessFeedKwh}
+            invoiceMethodId={data.invoiceMethodId}
+            methodInputs={data.methodInputs}
           />
 
 
@@ -1434,14 +1481,61 @@ const excludedItems = new Set<string>(
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Enerji Bedeli</td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {fmtUnit(data.unitPriceEnergy)} TL/kWh ×{" "}
-                        {fmtKwh(data.totalConsumptionKwh)} kWh
+                        {data.invoiceMethodId === 2 || data.invoiceMethodId === 3 ? (
+                          // Metod 2/3: taban NET pozitif çekiş, fiyat = wPos × KBK (T-0).
+                          <>
+                            {fmtUnit(data.breakdown.energyUnitPriceApplied ?? 0)} TL/kWh ×{" "}
+                            {fmtKwh(data.breakdown.netEnergyKwh)} kWh
+                          </>
+                        ) : (
+                          <>
+                            {fmtUnit(data.unitPriceEnergy)} TL/kWh ×{" "}
+                            {fmtKwh(data.totalConsumptionKwh)} kWh
+                          </>
+                        )}
                       </td>
                       <td className="py-2 pr-4 text-right">
                         {fmtMoney2(data.breakdown.energyCharge)}
                       </td>
                     </tr>
                   )}
+
+                  {/* Metod 2: YEK Bedeli (brüt taban) · Metod 3: Tahmini YEKDEM (net taban) */}
+                  {(data.invoiceMethodId === 2 || data.invoiceMethodId === 3) && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">
+                        {data.invoiceMethodId === 2 ? "YEK Bedeli" : "Tahmini YEKDEM"}
+                      </td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        Tahmini YEKDEM × KBK ×{" "}
+                        {fmtKwh(
+                          data.invoiceMethodId === 2
+                            ? data.totalConsumptionKwh
+                            : data.breakdown.netEnergyKwh
+                        )}{" "}
+                        kWh
+                      </td>
+                      <td className="py-2 pr-4 text-right">
+                        {fmtMoney2(data.breakdown.yekTahminiCharge ?? 0)}
+                      </td>
+                    </tr>
+                  )}
+
+                  {/* Önceki dönem YEKDEM farkı — veri yoksa 0 ve satır gizli */}
+                  {(data.invoiceMethodId === 2 || data.invoiceMethodId === 3) &&
+                    (data.breakdown.yekFarkiCharge ?? 0) !== 0 && (
+                      <tr className="border-b border-neutral-100">
+                        <td className="py-2 pr-4">
+                          {data.invoiceMethodId === 2 ? "YEK Farkı" : "Önceki YEKDEM Mahsup"}
+                        </td>
+                        <td className="py-2 pr-4 text-neutral-600">
+                          Önceki dönem net çekiş × (Gerçekleşen − Tahmini) × KBK
+                        </td>
+                        <td className="py-2 pr-4 text-right">
+                          {fmtMoney2(data.breakdown.yekFarkiCharge ?? 0)}
+                        </td>
+                      </tr>
+                    )}
 
 
                     {data.trafoDegeri > 0 && !excludedItems.has("trafo") && (
@@ -1471,13 +1565,46 @@ const excludedItems = new Set<string>(
                     </tr>
                   )}
 
+                  {/* Metod 3: Muhtelif-2 — +mahsup×dağıtım, −mahsup×mahsuplaşmaFiyatı (tek kalem) */}
+                  {data.invoiceMethodId === 3 && (
+                    <tr className="border-b border-neutral-100">
+                      <td
+                        className={
+                          "py-2 pr-4 " +
+                          ((data.breakdown.muhtelif2Net ?? 0) < 0 ? "text-emerald-700" : "")
+                        }
+                      >
+                        Muhtelif-2
+                      </td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        +{fmtMoney2(data.breakdown.muhtelif2Dagitim ?? 0)} dağıtım −{" "}
+                        {fmtMoney2(data.breakdown.muhtelif2MahsupKredisi ?? 0)} mahsuplaşma (
+                        {fmtUnit(data.breakdown.mahsuplasmaUnitPriceApplied ?? 0)} TL/kWh ×{" "}
+                        {fmtKwh(data.breakdown.verisMahsupKwh)} kWh)
+                      </td>
+                      <td
+                        className={
+                          "py-2 pr-4 text-right " +
+                          ((data.breakdown.muhtelif2Net ?? 0) < 0 ? "text-emerald-700" : "")
+                        }
+                      >
+                        {(data.breakdown.muhtelif2Net ?? 0) < 0 ? "−" : ""}
+                        {fmtMoney2(Math.abs(data.breakdown.muhtelif2Net ?? 0))}
+                      </td>
+                    </tr>
+                  )}
+
                   {!excludedItems.has("btv") && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">
                         BTV (%{(data.btvRate * 100).toFixed(2)})
                       </td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        Net enerji bedeli × BTV oranı
+                        {data.invoiceMethodId === 2
+                          ? "Enerji bedeli × BTV oranı"
+                          : data.invoiceMethodId === 3
+                          ? "(Enerji − mahsuplaşma kredisi) × BTV oranı"
+                          : "Net enerji bedeli × BTV oranı"}
                       </td>
                       <td className="py-2 pr-4 text-right">
                         {fmtMoney2(data.breakdown.btvCharge)}
@@ -1519,8 +1646,11 @@ const excludedItems = new Set<string>(
                     </tr>
                   )}
 
-                  {/* Veriş Mahsup — çekişi geçmeyen kısım (birim fiyatla) */}
-                  {data.breakdown.verisMahsupKwh > 0 && (
+                  {/* Veriş Mahsup — çekişi geçmeyen kısım (birim fiyatla).
+                      Metod 2/3'te faturadan DÜŞÜLMEZ (m3: kredi Muhtelif-2'de) → satır yok. */}
+                  {data.invoiceMethodId !== 2 &&
+                    data.invoiceMethodId !== 3 &&
+                    data.breakdown.verisMahsupKwh > 0 && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4 text-emerald-700">Veriş Mahsup (Birim Fiyat)</td>
                       <td className="py-2 pr-4 text-neutral-600">
@@ -1569,6 +1699,8 @@ const excludedItems = new Set<string>(
                     </td>
                   </tr>
 
+                  {/* Metod 2/3'te fark KDV matrahındaki kalem (yukarıda) — bu satır gizli (D4). */}
+                  {data.invoiceMethodId !== 2 && data.invoiceMethodId !== 3 && (
                   <tr className="border-b border-neutral-200">
                     <td className="py-2 pr-4 font-semibold">
                       Önceki Dönem YEKDEM Mahsubu
@@ -1594,9 +1726,10 @@ const excludedItems = new Set<string>(
                           : "Önceki dönem YEKDEM verileri girilmemiş."
                         : `${data.yekdemMahsup > 0 ? "+" : "-"}${fmtMoney2(Math.abs(data.yekdemMahsup))} TL`}
 
- 
+
                     </td>
                   </tr>
+                  )}
 
                   {data.digerDegerler !== 0 && (
                     <tr className="border-b border-neutral-100">
@@ -1615,7 +1748,9 @@ const excludedItems = new Set<string>(
                   
                   <tr>
                     <td className="py-3 pr-4 font-semibold text-neutral-900">
-                      Genel Toplam (YEKDEM Mahsubu Dahil)
+                      {data.invoiceMethodId === 2 || data.invoiceMethodId === 3
+                        ? "Genel Toplam (Ödenecek)"
+                        : "Genel Toplam (YEKDEM Mahsubu Dahil)"}
                     </td>
                     <td className="py-3 pr-4 text-neutral-600">Ödenecek toplam</td>
                     <td className="py-3 pr-4 text-right text-lg font-semibold text-neutral-900">

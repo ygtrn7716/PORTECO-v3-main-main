@@ -14,14 +14,21 @@ import {
 } from "@/components/utils/invoiceSnapshots";
 
 import {
-  calculateInvoice,
   calculateYekdemMahsup,
   type TariffType,
 } from "@/components/utils/calculateInvoice";
 import {
+  calculateInvoiceForMethod,
+  methodForProvider,
+  resolveInvoiceMethods,
+} from "@/lib/invoiceMethods";
+import { assembleMethodInputs } from "@/components/utils/hourlyNetAggregates";
+import type { InvoiceMethodInputs } from "@/components/utils/calculateInvoiceNetMethods";
+import {
   fetchInvoiceOverrides,
   fetchAllInvoiceOverridesForUser,
   applyReactiveValueOverrides,
+  computeYekdemMahsupWithOverride,
   resolveUnitPriceOverride,
   overrideKey,
   type InvoiceOverrides,
@@ -714,14 +721,11 @@ export default function Dashboard() {
         // usd_kur her durumda set ediliyor (custom YEKDEM kaydı varsa o satırdan)
         setMonthlyUsdKur(subYek?.usd_kur ?? null);
 
-        if (
-          subYek &&
-          (subYek.yekdem_value != null || subYek.yekdem_final != null)
-        ) {
-          // final-first: kesin (final) değer öncelikli; yoksa tahmini (value).
-          // ChartsPage birim-fiyat mantığı (yekdem_final ?? yekdem_value) ile hizalı.
-          const valRaw = subYek.yekdem_final ?? subYek.yekdem_value ?? null;
-          const val = valRaw != null ? Number(valRaw) : null;
+        if (subYek && subYek.yekdem_value != null) {
+          // Fatura sayfası ile hizalı: birim fiyatta SADECE yekdem_value kullanılır.
+          // yekdem_final yalnızca faturadaki YEKDEM mahsup satırında kullanılır;
+          // birim fiyat kartı da faturadaki birim fiyat ile aynı değeri göstermeli.
+          const val = Number(subYek.yekdem_value);
 
           setMonthlyYekdem(Number.isFinite(val as any) ? val : null);
           setYekdemMode("custom");
@@ -966,10 +970,10 @@ export default function Dashboard() {
           return;
         }
 
-        // 5.3) multiplier + btv_enabled
+        // 5.3) multiplier + btv_enabled + provider
         const { data: subRow, error: subErr } = await supabase
           .from("owner_subscriptions")
-          .select("multiplier, btv_enabled")
+          .select("multiplier, btv_enabled, provider")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -980,6 +984,14 @@ export default function Dashboard() {
         const multiplier =
           subRow && subRow.multiplier != null ? Number(subRow.multiplier) : 1;
         const btvEnabled = subRow?.btv_enabled ?? true;
+
+        // Fatura metodu: kullanıcının entegrasyonlarından provider ile çözülür.
+        const methodMap = await resolveInvoiceMethods({ context: "self", userId: uid });
+        if (cancel) return;
+        const { methodId: invoiceMethodId } = methodForProvider(
+          methodMap,
+          subRow?.provider ?? null
+        );
 
         // 5.4) demand (geçen ay)
         const { data: demandRow, error: demandErr } = await supabase
@@ -1047,7 +1059,22 @@ export default function Dashboard() {
         const penaltyEnergy = riPenaltyEnergy + rcPenaltyEnergy;
         const reactivePenaltyCharge = penaltyEnergy * reactiveUnitPrice;
 
-        const breakdown = calculateInvoice({
+        // Metod 2/3 saatlik-net girdileri (yalnız ilgili metotta; metod 1'de ek sorgu yok).
+        let methodInputs: InvoiceMethodInputs | null = null;
+        if (invoiceMethodId !== 1) {
+          methodInputs = await assembleMethodInputs({
+            supabase,
+            userId: uid,
+            subscriptionSerno: selectedSub,
+            periodYear,
+            periodMonth,
+            kbk: monthlyKbk,
+            tahminiYekdem: monthlyYekdem,
+          });
+          if (cancel) return;
+        }
+
+        const breakdown = calculateInvoiceForMethod(invoiceMethodId, {
           totalConsumptionKwh: prevMonthKwh,
           unitPriceEnergy,
           unitPriceDistribution,
@@ -1067,15 +1094,20 @@ export default function Dashboard() {
           usdKur: monthlyUsdKur ?? 0,
           netPositiveDrawKwh: prevMonthNetPos ?? undefined,
           netExcessFeedKwh: prevMonthNetExcess ?? undefined,
+          methodInputs: methodInputs ?? undefined,
         }, lineOverrides);
 
         // ✅ YEKDEM mahsup (M-1)
         // Lisanslı Satış tesisleri için YEKDEM mahsup uygulanmaz.
+        // D4: Metod 2/3'te fark KDV matrahındaki kalem (yekFarkiCharge) → toplam
+        // sonrası mahsup 0'a zorlanır (çift sayım önlenir).
+        const isNetMethod = invoiceMethodId === 2 || invoiceMethodId === 3;
         let yekdemMahsupValue = 0;
         let has = false;
-        let missing: "none" | "value" | "final" | "both" = lisansliSatis ? "none" : "both";
+        let missing: "none" | "value" | "final" | "both" =
+          lisansliSatis || isNetMethod ? "none" : "both";
 
-        if (!lisansliSatis) try {
+        if (!lisansliSatis && !isNetMethod) try {
           const billingMonth = dayjsTR().year(periodYear).month(periodMonth - 1); // M
           const prevForYekdem = billingMonth.subtract(1, "month"); // M-1
           setYekdemMahsupLabel(prevForYekdem.format("MMMM YYYY"));
@@ -1117,7 +1149,11 @@ export default function Dashboard() {
             }
           }
 
-          if (prevPeriodKwh > 0) {
+          // Aşama 3: override yalnız total_kwh verdiğinde doğal YEKDEM
+          // değerleri de gerektiğinden kapı gevşetildi.
+          const mahsupOv = lineOverrides?.yekdem_mahsup;
+
+          if (prevPeriodKwh > 0 || mahsupOv) {
             const yRow = await fetchSubscriptionYekdem({
               uid,
               sub: selectedSub,
@@ -1125,29 +1161,21 @@ export default function Dashboard() {
               month: prevForYekdem.month() + 1,
             });
 
-            if (yRow) {
-              const hasValue = yRow.yekdem_value != null;
-              const hasFinal = yRow.yekdem_final != null;
+            const eff = computeYekdemMahsupWithOverride({
+              naturalTotalKwh: prevPeriodKwh,
+              naturalYekdemOld:
+                yRow?.yekdem_value != null ? Number(yRow.yekdem_value) : null,
+              naturalYekdemNew:
+                yRow?.yekdem_final != null ? Number(yRow.yekdem_final) : null,
+              kbk: monthlyKbk,
+              btvRate,
+              vatRate,
+              override: mahsupOv,
+            });
 
-              if (hasValue && hasFinal) {
-                yekdemMahsupValue = calculateYekdemMahsup({
-                  totalKwh: prevPeriodKwh,
-                  kbk: monthlyKbk,
-                  btvRate,
-                  vatRate,
-                  yekdemOld: Number(yRow.yekdem_value),
-                  yekdemNew: Number(yRow.yekdem_final),
-                });
-                has = true;
-                missing = "none";
-              } else if (!hasValue && !hasFinal) {
-                missing = "both";
-              } else if (!hasValue) {
-                missing = "value";
-              } else {
-                missing = "final";
-              }
-            }
+            yekdemMahsupValue = eff.mahsup;
+            has = eff.has;
+            missing = eff.missing;
           }
         } catch (e) {
           yekdemMahsupValue = 0;
@@ -1256,6 +1284,10 @@ export default function Dashboard() {
         let hasAnyInvoice = false;
         let hasAnyMahsup = false;
 
+        // Fatura metodu haritası: tüm tesisler için bir kez çözülür (cache'li).
+        const methodMap = await resolveInvoiceMethods({ context: "self", userId: uid });
+        if (cancel) return;
+
         for (const serno of allSernos) {
           if (cancel) return;
 
@@ -1352,8 +1384,9 @@ export default function Dashboard() {
           const subYek = await fetchSubscriptionYekdem({ uid, sub: serno, year: pYear, month: pMonth });
           if (cancel) return;
           let subYekdem: number | null = null;
-          if (subYek && (subYek.yekdem_value != null || subYek.yekdem_final != null)) {
-            subYekdem = subYek.yekdem_value ?? subYek.yekdem_final ?? null;
+          if (subYek && subYek.yekdem_value != null) {
+            // Fatura ile hizalı: birim fiyatta yekdem_value kullanılır (yekdem_final değil).
+            subYekdem = Number(subYek.yekdem_value);
           } else {
             const { data: offRow } = await supabase
               .from("yekdem_official")
@@ -1406,16 +1439,20 @@ export default function Dashboard() {
           if (cancel) return;
           if (!tariffRow) continue;
 
-          // Multiplier + btv_enabled
+          // Multiplier + btv_enabled + provider
           const { data: subRow } = await supabase
             .from("owner_subscriptions")
-            .select("multiplier, btv_enabled")
+            .select("multiplier, btv_enabled, provider")
             .eq("user_id", uid)
             .eq("subscription_serno", serno)
             .maybeSingle();
           if (cancel) return;
           const multiplier = subRow?.multiplier != null ? Number(subRow.multiplier) : 1;
           const btvEnabled = subRow?.btv_enabled ?? true;
+          const { methodId: subInvoiceMethodId } = methodForProvider(
+            methodMap,
+            subRow?.provider ?? null
+          );
 
           // Demand
           const { data: demandRow } = await supabase
@@ -1463,7 +1500,22 @@ export default function Dashboard() {
           // Tesis x ay için USD kur (subscription_yekdem.usd_kur'dan, subYek satırında zaten geldi)
           const subUsdKur = subYek?.usd_kur != null ? Number(subYek.usd_kur) : 0;
 
-          const breakdown = calculateInvoice({
+          // Metod 2/3 saatlik-net girdileri (yalnız ilgili metotta).
+          let subMethodInputs: InvoiceMethodInputs | null = null;
+          if (subInvoiceMethodId !== 1) {
+            subMethodInputs = await assembleMethodInputs({
+              supabase,
+              userId: uid,
+              subscriptionSerno: serno,
+              periodYear: pYear,
+              periodMonth: pMonth,
+              kbk: subKbk,
+              tahminiYekdem: subYekdem,
+            });
+            if (cancel) return;
+          }
+
+          const breakdown = calculateInvoiceForMethod(subInvoiceMethodId, {
             totalConsumptionKwh: subKwh,
             unitPriceEnergy,
             unitPriceDistribution,
@@ -1483,11 +1535,14 @@ export default function Dashboard() {
             usdKur: subUsdKur,
             netPositiveDrawKwh: subNetPos,
             netExcessFeedKwh: subNetExcess,
+            methodInputs: subMethodInputs ?? undefined,
           }, subLineOverrides);
 
           // YEKDEM Mahsup (M-1) — Lisanslı Satış tesisleri için atlanır.
+          // D4: Metod 2/3'te fark KDV matrahındaki kalem → toplam sonrası mahsup 0.
+          const subIsNetMethod = subInvoiceMethodId === 2 || subInvoiceMethodId === 3;
           let yekdemMahsupVal = 0;
-          if (!subLisansliSatis) try {
+          if (!subLisansliSatis && !subIsNetMethod) try {
             const billingMonth = dayjsTR().year(pYear).month(pMonth - 1);
             const prevForYekdem = billingMonth.subtract(1, "month");
             const prevStart2 = prevForYekdem.startOf("month");
