@@ -4,6 +4,7 @@ import {
   LayoutDashboard,
   Users,
   Settings,
+  SlidersHorizontal,
   Zap,
   FileText,
   Bell,
@@ -92,6 +93,7 @@ const NAV_CATEGORIES: NavCategory[] = [
     icon: <Receipt size={18} />,
     items: [
       { label: "Fatura Düzenleme", to: "/dashboard/admin/faturalar", icon: <FileText size={16} /> },
+      { label: "Fatura Metodları", to: "/dashboard/admin/fatura-metodlari", icon: <SlidersHorizontal size={16} /> },
       { label: "Invoice Snapshots", to: "/dashboard/admin/invoice-snapshots", icon: <Receipt size={16} /> },
       { label: "Reactive Alerts", to: "/dashboard/admin/reactive-alerts", icon: <AlertTriangle size={16} /> },
       { label: "Aylık Özet", to: "/dashboard/admin/monthly-overview", icon: <Calculator size={16} /> },

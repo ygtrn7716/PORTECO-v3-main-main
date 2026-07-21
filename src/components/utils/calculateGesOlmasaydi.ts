@@ -27,6 +27,7 @@ import {
   type InvoiceMethodId,
 } from "@/lib/invoiceMethods";
 import type { InvoiceMethodInputs } from "@/components/utils/calculateInvoiceNetMethods";
+import { computeHourlyNetAggregates } from "@/components/utils/hourlyNetAggregates";
 
 const PAGE = 1000;
 
@@ -51,6 +52,9 @@ export interface GesOlmasaydiResult {
   hamBirimFiyat: number;      // receiver: = mevcutBirimFiyat
   mevcutBirimFiyat: number;
   gesOlmasaydiBreakdown: InvoiceBreakdown;
+  /** Metod 2/3 tesiste karşı-olgusal saatlik girdiler kurulamadı (o dönem için
+   *  saatlik tüketim/PTF yok) → Metod 1 yaklaşımıyla hesaplandı. UI "yaklaşık" der. */
+  counterfactualApproximate?: boolean;
 }
 
 export interface GesOlmasaydiParams {
@@ -120,6 +124,8 @@ function assembleResult(args: {
   gesUretimKwh: number;
   hamBirimFiyat: number;
   anlikUretimKullanimi?: boolean; // default true (behind-the-meter)
+  /** Metod 2/3'te karşı-olgusal girdiler kurulamadıysa true (UI "yaklaşık" rozeti). */
+  approximate?: boolean;
 }): GesOlmasaydiResult {
   const { params, mode, breakdown } = args;
 
@@ -154,6 +160,77 @@ function assembleResult(args: {
     hamBirimFiyat: args.hamBirimFiyat,
     mevcutBirimFiyat: params.mevcutBirimFiyat,
     gesOlmasaydiBreakdown: breakdown,
+    counterfactualApproximate: args.approximate ?? false,
+  };
+}
+
+/**
+ * 2C — ÜRETİMSİZ dünyanın metod 2/3 karşı-olgusal girdileri.
+ *
+ * receiver / arazi-GES dallarında "GES olmasaydı" senaryosunda efektif gn = 0'dır
+ * (tahsis uygulanmaz / üretim ayrı sayaçtan şebekeye gider) ⇒
+ *   pos = cn · mahsup = 0 · excess = 0 · wPos = cn-ağırlıklı ÇIPLAK PTF.
+ *
+ * Trick: satırlar `gn` OLMADAN çekilir ve view=null geçilir → gesAllocation'ın
+ * "view=null → mevcut davranış" dalına düşer, num(undefined)=0 ⇒ pos_h = cn_h.
+ * İKİNCİ BİR AGREGASYON YOLU KURULMAZ — üretici dalıyla aynı fonksiyon.
+ *
+ * Saatlik veri yoksa null döner → çağıran Metod 1 yaklaşımını korur + "yaklaşık" der.
+ */
+async function buildNoGesCounterfactualMi(p: {
+  supabase: SupabaseClient;
+  userId: string;
+  subscriptionSerno: number;
+  periodYear: number;
+  periodMonth: number;
+  kbk: number;
+  monthlyYekdem: number;
+  prev?: InvoiceMethodInputs | null;
+}): Promise<InvoiceMethodInputs | null> {
+  const startIso = new Date(p.periodYear, p.periodMonth - 1, 1).toISOString();
+  const endIso = new Date(p.periodYear, p.periodMonth, 1).toISOString();
+
+  const [cnRes, ptfRes] = await Promise.all([
+    fetchAllConsumption({
+      supabase: p.supabase,
+      userId: p.userId,
+      subscriptionSerno: p.subscriptionSerno,
+      columns: "ts, cn",
+      startIso,
+      endIso,
+    }),
+    fetchAllPtf({ supabase: p.supabase, columns: "ts, ptf_tl_mwh", startIso, endIso }),
+  ]);
+  if (cnRes.error || ptfRes.error) return null;
+  const rows = (cnRes.data ?? []) as Array<{ ts: string; cn: unknown }>;
+  if (rows.length === 0) return null;
+
+  // hourlyNetAggregates.ts ile AYNI anahtarlama (UTC saat başı).
+  const ptfMap = new Map<string, number>();
+  for (const r of (ptfRes.data ?? []) as Array<{ ts: string; ptf_tl_mwh: unknown }>) {
+    const mwh = Number(r.ptf_tl_mwh);
+    if (!Number.isFinite(mwh)) continue;
+    ptfMap.set(new Date(r.ts).toISOString().slice(0, 13), mwh / 1000);
+  }
+
+  const agg = computeHourlyNetAggregates({ rows, view: null, ptfMap });
+  if (!(agg.sumPos > 0) || !(agg.wPos > 0)) return null;
+
+  return {
+    sumCn: agg.sumCn,
+    sumGn: 0,
+    sumPos: agg.sumPos,
+    sumMahsup: 0,
+    sumExcess: 0,
+    wPos: agg.wPos,
+    kbk: p.kbk,
+    tahminiYekdem: p.monthlyYekdem,
+    // Önceki dönem her iki dünyada da AYNI gerçek → mevcut girdilerden taşınır
+    // (üretici dalındaki kuralın aynısı).
+    prevSumPos: p.prev?.prevSumPos ?? null,
+    prevTahminiYekdem: p.prev?.prevTahminiYekdem ?? null,
+    prevGerceklesenYekdem: p.prev?.prevGerceklesenYekdem ?? null,
+    mahsuplasmaUnitPrice: null,
   };
 }
 
@@ -287,9 +364,23 @@ export async function calculateGesOlmasaydi(
   // fatura" = tahsis SIFIRLANARAK yeniden çalıştırılan fatura motoru (Veriş
   // Mahsup kalemiyle birlikte dağıtım D/2 avantajı ve BTV etkisi de kalkar).
   if (params.mode === "receiver") {
-    // Metod 2/3: karşı-olgusal saatlik ÇIPLAK PTF bu dalda türetilemez (yalnız
-    // füzyonlu mevcutBirimFiyat var) → methodInputs geçilmez, dispatcher bilinçli
-    // olarak Metod 1 tahminine düşer (konsolda uyarır). 2C'de iyileştirilebilir.
+    // 2C: karşı-olgusal = "tahsis hiç uygulanmasaydı" → efektif gn=0.
+    // Saatlik tüketim + PTF'den gerçek metod 2/3 girdileri kurulur; veri yoksa
+    // Metod 1 yaklaşımı korunur ve kart "yaklaşık" rozeti gösterir.
+    const cfMi =
+      methodId === 2 || methodId === 3
+        ? await buildNoGesCounterfactualMi({
+            supabase,
+            userId,
+            subscriptionSerno,
+            periodYear,
+            periodMonth,
+            kbk: params.kbk,
+            monthlyYekdem: params.monthlyYekdem,
+            prev: params.methodInputs,
+          })
+        : null;
+
     const breakdown = calculateInvoiceForMethod(methodId, {
       totalConsumptionKwh: params.mevcutTuketimKwh,
       unitPriceEnergy: params.mevcutBirimFiyat,
@@ -305,6 +396,7 @@ export async function calculateGesOlmasaydi(
       trafoDegeri: params.trafoDegeri,
       totalProductionKwh: 0, // tahsis yok → veriş/mahsup yok
       // netPositiveDraw/netExcessFeed bilinçli geçilmiyor → aylık davranış (mahsup 0)
+      methodInputs: cfMi ?? undefined,
     });
 
     return assembleResult({
@@ -314,6 +406,7 @@ export async function calculateGesOlmasaydi(
       hamTuketimKwh: params.mevcutTuketimKwh,
       gesUretimKwh: 0,
       hamBirimFiyat: params.mevcutBirimFiyat,
+      approximate: (methodId === 2 || methodId === 3) && cfMi == null,
     });
   }
 
@@ -353,6 +446,10 @@ export async function calculateGesOlmasaydi(
       trafoDegeri: params.trafoDegeri,
       totalProductionKwh: 0,
       lisansliSatis: true,
+      // 2C: bu dalın semantiği "karşı-olgusal fatura ≈ mevcut dönem faturası"
+      // (GES tüketim faturasını etkilemez). Metod 2/3'te bu, mevcut girdilerin
+      // aynen kullanılması demektir — ek fetch YOK, Metod 1 yaklaşımından kesin daha doğru.
+      methodInputs: params.methodInputs ?? undefined,
     });
 
     return assembleResult({
@@ -362,6 +459,7 @@ export async function calculateGesOlmasaydi(
       hamTuketimKwh: params.mevcutTuketimKwh,
       gesUretimKwh: totalGesKwh,
       hamBirimFiyat: params.mevcutBirimFiyat,
+      approximate: (methodId === 2 || methodId === 3) && params.methodInputs == null,
     });
   }
 
@@ -393,7 +491,23 @@ export async function calculateGesOlmasaydi(
       periodMonth,
     );
 
-    // Metod 2/3: receiver dalıyla aynı sınırlama → methodInputs geçilmez (m1 tahmini).
+    // 2C: arazi GES → üretim tesisin anlık tüketimini beslemez; karşı-olgusalda
+    // efektif gn=0 (tesis tahsis alıcısı olsa bile mahsup kalkar). Receiver
+    // dalıyla aynı yardımcı; veri yoksa Metod 1 yaklaşımı + "yaklaşık" rozeti.
+    const cfMi =
+      methodId === 2 || methodId === 3
+        ? await buildNoGesCounterfactualMi({
+            supabase,
+            userId,
+            subscriptionSerno,
+            periodYear,
+            periodMonth,
+            kbk: params.kbk,
+            monthlyYekdem: params.monthlyYekdem,
+            prev: params.methodInputs,
+          })
+        : null;
+
     const breakdown = calculateInvoiceForMethod(methodId, {
       totalConsumptionKwh: params.mevcutTuketimKwh,
       unitPriceEnergy: params.mevcutBirimFiyat,
@@ -409,6 +523,7 @@ export async function calculateGesOlmasaydi(
       trafoDegeri: params.trafoDegeri,
       totalProductionKwh: 0, // mahsup yok → dağıtım düzeltmesiz, tam BTV
       // netPositiveDraw/netExcessFeed bilinçli geçilmiyor → aylık davranış (mahsup 0)
+      methodInputs: cfMi ?? undefined,
     });
 
     return assembleResult({
@@ -419,6 +534,7 @@ export async function calculateGesOlmasaydi(
       gesUretimKwh: totalGesKwh,
       hamBirimFiyat: params.mevcutBirimFiyat,
       anlikUretimKullanimi: false,
+      approximate: (methodId === 2 || methodId === 3) && cfMi == null,
     });
   }
 

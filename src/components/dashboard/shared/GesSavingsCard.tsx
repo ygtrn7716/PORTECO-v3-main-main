@@ -95,6 +95,12 @@ export default function GesSavingsCard(props: Props) {
               : noInstantUse
                 ? "Veriş mahsubu uygulanmadan"
                 : `${fmtKwh(result.hamTuketimKwh)} kWh ham tüketim`}
+            {/* Metod 2/3'te saatlik girdiler kurulamadıysa Metod 1 yaklaşımı kullanıldı. */}
+            {result.counterfactualApproximate && (
+              <span className="ml-1 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">
+                yaklaşık
+              </span>
+            )}
           </div>
         </div>
       </div>

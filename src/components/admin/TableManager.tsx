@@ -3,12 +3,32 @@ import { supabase } from "@/lib/supabase";
 
 type ColType = "text" | "number" | "bool" | "enum" | "uuid";
 
+/** type:"enum" kolonunun seçeneklerini DB'den besler (value ≠ label olabilir). */
+export type ColumnOptionSource = {
+  /** Kaynak tablo, örn. "invoice_companies" */
+  table: string;
+  /** <option value> kolonu, örn. "key" */
+  valueKey: string;
+  /** <option> etiketi kolonu, örn. "display_name" */
+  labelKey: string;
+  /** Sıralama kolonu; verilmezse labelKey ASC */
+  orderBy?: string;
+  limit?: number;
+};
+
+type LookupOption = { value: string; label: string };
+
 export type ColumnDef = {
   key: string;
   label: string;
   type: ColType;
   readOnly?: boolean;
   options?: string[];
+  /** DB'den beslenen dropdown; type:"enum" ile kullanılır. `options` ile birlikte
+   *  verilirse optionsFrom önceliklidir. */
+  optionsFrom?: ColumnOptionSource;
+  /** Insert'te girilebilir, mevcut satırda kilitli (PK / doğal anahtar). */
+  lockAfterInsert?: boolean;
   hideInTable?: boolean;
   mask?: boolean;
 
@@ -18,6 +38,26 @@ export type ColumnDef = {
   // slug otomatik doldurma (inline edit)
   autoSlugFrom?: string; // örn: "title"
 };
+
+/**
+ * Bir enum kolonunun seçeneklerini üretir.
+ * Fetch başarısız / liste boş / kayıt silinmiş olsa bile MEVCUT DEĞER KAYBOLMAZ:
+ * listede yoksa sona "(listede yok)" etiketiyle eklenir → <select> boşa düşmez ve
+ * kullanıcı farkında olmadan değeri sıfırlamaz.
+ */
+function optionsForColumn(
+  c: ColumnDef,
+  lookups: Record<string, LookupOption[]>,
+  current: string
+): LookupOption[] {
+  const base: LookupOption[] = c.optionsFrom
+    ? lookups[c.key] ?? []
+    : (c.options ?? []).map((o) => ({ value: o, label: o }));
+  if (current !== "" && !base.some((o) => o.value === current)) {
+    return [...base, { value: current, label: `${current} (listede yok)` }];
+  }
+  return base;
+}
 
 function slugifyTR(s: string) {
   return (s ?? "")
@@ -50,7 +90,25 @@ export type TableConfig = {
   filters?: FilterDef[];
   pageSize?: number;
   readOnly?: boolean;
+  /** FK ihlalinde (23503) gösterilecek sayfaya özel Türkçe mesaj. */
+  fkErrorMessage?: string;
 };
+
+/** Ham Postgres hatası kullanıcıya gösterilmesin — bilinen kodlar Türkçeleştirilir. */
+function friendlyDbError(
+  e: { code?: string; message: string },
+  cfg: TableConfig
+): string {
+  if (e.code === "23503") {
+    return (
+      cfg.fkErrorMessage ??
+      "Bu kayda bağlı başka kayıtlar var; önce onları taşıyın veya silin."
+    );
+  }
+  if (e.code === "23505") return "Bu anahtar zaten kayıtlı.";
+  if (e.code === "23502") return "Zorunlu bir alan boş bırakılamaz.";
+  return e.message;
+}
 
 function toPatchValue(type: ColType, v: any) {
   if (type === "bool") return !!v;
@@ -128,6 +186,56 @@ export default function TableManager({ cfg }: { cfg: TableConfig }) {
       mounted = false;
     };
   }, [hasUserFilter]);
+
+  // ── optionsFrom: DB'den beslenen enum seçenekleri ────────────────────────
+  const [lookups, setLookups] = useState<Record<string, LookupOption[]>>({});
+
+  // ⚠️ `cfg` her render'da yeni bir obje literal'i (admin sayfaları inline cfg
+  // veriyor) → dep olarak cfg.columns/dizi verilirse effect SONSUZ döner.
+  // Bu yüzden dep, kolonlardan türetilen STABİL STRING imzadır.
+  const lookupSig = useMemo(
+    () =>
+      cfg.columns
+        .filter((c) => c.type === "enum" && c.optionsFrom)
+        .map(
+          (c) =>
+            `${c.key}:${c.optionsFrom!.table}:${c.optionsFrom!.valueKey}:${c.optionsFrom!.labelKey}:${c.optionsFrom!.orderBy ?? ""}`
+        )
+        .join("|"),
+    [cfg.columns]
+  );
+
+  useEffect(() => {
+    const cols = cfg.columns.filter((c) => c.type === "enum" && c.optionsFrom);
+    if (cols.length === 0) return;
+    let mounted = true;
+    (async () => {
+      const next: Record<string, LookupOption[]> = {};
+      for (const c of cols) {
+        const src = c.optionsFrom!;
+        const { data, error } = await supabase
+          .from(src.table)
+          .select(`${src.valueKey},${src.labelKey}`)
+          .order(src.orderBy ?? src.labelKey, { ascending: true })
+          .limit(src.limit ?? 1000);
+        if (error) {
+          // Sessiz düş: optionsForColumn mevcut değeri yine de gösterir.
+          console.error(`[optionsFrom ${src.table}]`, error.message);
+          continue;
+        }
+        next[c.key] = ((data as any[]) ?? []).map((r: any) => ({
+          value: String(r[src.valueKey] ?? ""),
+          label: String(r[src.labelKey] ?? r[src.valueKey] ?? ""),
+        }));
+      }
+      if (!mounted) return;
+      setLookups(next);
+    })();
+    return () => {
+      mounted = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lookupSig]);
 
   async function fetchRows() {
     setLoading(true);
@@ -213,7 +321,8 @@ export default function TableManager({ cfg }: { cfg: TableConfig }) {
     }
 
     const { error } = await supabase.from(cfg.table).update(patch).match(buildMatch(r));
-    if (error) setErr(error.message);
+    // FK'de ON UPDATE yok → kullanımdaki bir doğal anahtarı yeniden adlandırmak da 23503 doğurur.
+    if (error) setErr(friendlyDbError(error, cfg));
     setSavingKey(null);
     await fetchRows();
   }
@@ -222,7 +331,7 @@ export default function TableManager({ cfg }: { cfg: TableConfig }) {
     if (!confirm("Bu satır silinsin mi?")) return;
     setErr(null);
     const { error } = await supabase.from(cfg.table).delete().match(buildMatch(r));
-    if (error) setErr(error.message);
+    if (error) setErr(friendlyDbError(error, cfg));
     await fetchRows();
   }
 
@@ -276,7 +385,7 @@ export default function TableManager({ cfg }: { cfg: TableConfig }) {
       payload[col.key] = v;
     }
     const { error } = await supabase.from(cfg.table).insert(payload);
-    if (error) setErr(error.message);
+    if (error) setErr(friendlyDbError(error, cfg));
     setShowNew(false);
     setNewRow({});
     await fetchRows();
@@ -480,7 +589,11 @@ export default function TableManager({ cfg }: { cfg: TableConfig }) {
                   <tr key={rk} className="border-b last:border-b-0">
                     {visibleCols.map((c) => {
                       const current = edited[c.key] ?? r[c.key] ?? "";
-                      const disabled = !!c.readOnly || isReadOnly;
+                      // lockAfterInsert: mevcut satırda kilitli (yeni satır modalında serbest).
+                      const disabled =
+                        !!c.readOnly ||
+                        isReadOnly ||
+                        (!!c.lockAfterInsert && r[c.key] != null);
 
                       if (c.type === "bool") {
                         return (
@@ -495,7 +608,8 @@ export default function TableManager({ cfg }: { cfg: TableConfig }) {
                         );
                       }
 
-                      if (c.type === "enum" && c.options?.length) {
+                      if (c.type === "enum" && (c.options?.length || c.optionsFrom)) {
+                        const opts = optionsForColumn(c, lookups, String(current ?? ""));
                         return (
                           <td key={c.key} className="px-3 py-2">
                             <select
@@ -505,9 +619,9 @@ export default function TableManager({ cfg }: { cfg: TableConfig }) {
                               onChange={(e) => setEdit(r, c.key, e.target.value)}
                             >
                               <option value="">—</option>
-                              {c.options.map((op) => (
-                                <option key={op} value={op}>
-                                  {op}
+                              {opts.map((op) => (
+                                <option key={op.value} value={op.value}>
+                                  {op.label}
                                 </option>
                               ))}
                             </select>
@@ -658,7 +772,8 @@ export default function TableManager({ cfg }: { cfg: TableConfig }) {
                       );
                     }
 
-                    if (c.type === "enum" && c.options?.length) {
+                    if (c.type === "enum" && (c.options?.length || c.optionsFrom)) {
+                      const opts = optionsForColumn(c, lookups, String(newRow[c.key] ?? ""));
                       return (
                         <label key={c.key} className={wrapClass}>
                           <div className="text-xs text-neutral-500 mb-1">{c.label}</div>
@@ -668,9 +783,9 @@ export default function TableManager({ cfg }: { cfg: TableConfig }) {
                             onChange={(e) => setNewField(c.key, e.target.value)}
                           >
                             <option value="">—</option>
-                            {c.options.map((op) => (
-                              <option key={op} value={op}>
-                                {op}
+                            {opts.map((op) => (
+                              <option key={op.value} value={op.value}>
+                                {op.label}
                               </option>
                             ))}
                           </select>

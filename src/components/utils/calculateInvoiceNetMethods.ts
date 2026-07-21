@@ -108,6 +108,60 @@ export function calculateYekFarki(p: {
   return base * (Number(p.prevGerceklesenYekdem) - Number(p.prevTahminiYekdem)) * kbk;
 }
 
+/**
+ * Aşama 2C — manuel YEKDEM override'ının ("yekdem_mahsup") metod 2/3 "YEK Farkı /
+ * Önceki YEKDEM Mahsup" kalemine köprüsü.
+ *
+ * SAF: override objesi dispatcher'dan gelir, Supabase OKUNMAZ — bu modül
+ * runtime-import'suz kalmalı (kabul testi harness'ı doğrudan import ediyor).
+ *
+ * Öncelik — MANUEL KAZANIR:
+ *   1) isExcluded              → 0        (checkbox kalemi kapatır)
+ *   2) payload alanı girilmiş  → MANUEL   (girilmeyen alan doğaldan tamamlanır)
+ *   3) override yok / etkisiz  → DOĞAL    (calculateYekFarki; bit-identik)
+ *   4) hiçbiri yok             → 0        (kalem gizli)
+ *
+ * ⚠️ Metod 1'in calculateYekdemMahsup formülü (BTV+KDV DAHİL, toplam SONRASI)
+ * buraya TAŞINMAZ. Yalnız GİRDİLER köprülenir; tutar metod 2/3'ün KDV ÖNCESİ
+ * kalem formülüyle hesaplanır: taban × ÇIPLAK fark × KBK.
+ * payload.diff_yekdem, invoiceOverrides.ts'teki old=0/new=diff hilesiyle aynı
+ * anlama gelir: net (gerçekleşen − tahmini) farkı.
+ */
+export function resolveYekFarkiWithOverride(p: {
+  prevSumPos?: number | null;
+  prevTahminiYekdem?: number | null;
+  prevGerceklesenYekdem?: number | null;
+  kbk: number;
+  override?: InvoiceLineOverride | null;
+}): { amount: number; overridden: boolean; excluded: boolean } {
+  const natural = calculateYekFarki(p);
+  const ov = p.override;
+  if (!ov) return { amount: natural, overridden: false, excluded: false };
+
+  if (ov.isExcluded) return { amount: 0, overridden: true, excluded: true };
+
+  const pKwh = ov.payload?.total_kwh;
+  const pDiff = ov.payload?.diff_yekdem;
+  const hasKwh = isFin(pKwh);
+  const hasDiff = isFin(pDiff);
+  if (!hasKwh && !hasDiff) return { amount: natural, overridden: false, excluded: false };
+
+  // Girilmeyen alan doğal veriden tamamlanır.
+  const base = hasKwh ? Number(pKwh) : isFin(p.prevSumPos) ? Number(p.prevSumPos) : NaN;
+  const diff = hasDiff
+    ? Number(pDiff)
+    : isFin(p.prevGerceklesenYekdem) && isFin(p.prevTahminiYekdem)
+      ? Number(p.prevGerceklesenYekdem) - Number(p.prevTahminiYekdem)
+      : NaN;
+  const kbk = Number(p.kbk);
+
+  // Manuel girdi hesap için yetmiyorsa doğala düş (sessiz sıfırlama yok).
+  if (!(base > 0) || !Number.isFinite(diff) || !Number.isFinite(kbk)) {
+    return { amount: natural, overridden: false, excluded: false };
+  }
+  return { amount: base * diff * kbk, overridden: true, excluded: false };
+}
+
 type NetMethodId = 2 | 3;
 
 function calculateNetMethod(
@@ -149,13 +203,16 @@ function calculateNetMethod(
   const yekBase = method === 2 ? sumCn : sumPos;
   let yekTahminiCharge = yekBase * (num(m.tahminiYekdem) * kbk);
 
-  // ── 3) Önceki dönem farkı — iki metodda da taban NET (ortak fonksiyon)
-  let yekFarkiCharge = calculateYekFarki({
+  // ── 3) Önceki dönem farkı — iki metodda da taban NET (ortak fonksiyon).
+  // 2C: manuel YEKDEM override'ı ("yekdem_mahsup") bu kaleme köprülenir; MANUEL KAZANIR.
+  const yekFarkiResolved = resolveYekFarkiWithOverride({
     prevSumPos: m.prevSumPos,
     prevTahminiYekdem: m.prevTahminiYekdem,
     prevGerceklesenYekdem: m.prevGerceklesenYekdem,
     kbk,
+    override: ov?.yekdem_mahsup,
   });
+  const yekFarkiCharge = yekFarkiResolved.amount;
 
   // ── 4) Dağıtım — m3 taban NET, m2 taban BRÜT (m2'de muhtelif yok, tek satır)
   const distributionBaseKwh = method === 2 ? sumCn : sumPos;
@@ -236,6 +293,11 @@ function calculateNetMethod(
       powerExcessCharge = 0;
     }
   }
+
+  // yekFarkiCharge applyItem'dan GEÇMEZ (kendi öncelik mantığı var, yukarıda
+  // çözüldü) → override özeti burada elle işlenir.
+  if (yekFarkiResolved.excluded) excludedItems.push("yekdem_mahsup");
+  else if (yekFarkiResolved.overridden) amountOverriddenItems.push("yekdem_mahsup");
 
   const muhtelif2Net = muhtelif2Dagitim - muhtelif2MahsupKredisi;
 

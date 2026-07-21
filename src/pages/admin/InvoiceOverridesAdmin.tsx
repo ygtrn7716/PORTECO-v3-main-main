@@ -505,6 +505,11 @@ export default function InvoiceOverridesAdmin() {
     return periodYear * 12 + periodMonth < m1.year() * 12 + (m1.month() + 1);
   }, [periodYear, periodMonth]);
 
+  // Metod 2/3'te YEKDEM farkı toplam sonrası mahsup DEĞİL, KDV matrahındaki bir
+  // KALEMdir (yekFarkiCharge) → manuel kart etiketleri ve önizleme buna göre değişir.
+  const isNetMethod =
+    inputs?.invoiceMethodId === 2 || inputs?.invoiceMethodId === 3;
+
   const showVerisWarning =
     draft.enerji.isExcluded && (naturalResult?.breakdown.verisMahsupKwh ?? 0) > 0;
   const showHistoricalReactiveWarning =
@@ -723,7 +728,6 @@ export default function InvoiceOverridesAdmin() {
     ];
     // Metod 2/3 kalemleri (metod 1 önizlemesi değişmez).
     const mId = inputs?.invoiceMethodId;
-    const isNetMethod = mId === 2 || mId === 3;
     if (isNetMethod) {
       rows.push({
         label: mId === 2 ? "YEK Bedeli" : "Tahmini YEKDEM",
@@ -736,7 +740,8 @@ export default function InvoiceOverridesAdmin() {
           label: mId === 2 ? "YEK Farkı" : "Önceki YEKDEM Mahsup",
           natural: nb.yekFarkiCharge ?? 0,
           edited: eb.yekFarkiCharge ?? 0,
-          excluded: false,
+          // Manuel kartın "çıkar" kutusu bu kalemi kapatır (2C köprüsü).
+          excluded: draft.yekdem_mahsup.isExcluded,
         });
       }
     }
@@ -766,12 +771,16 @@ export default function InvoiceOverridesAdmin() {
     rows.push({ label: "KDV Hariç Toplam", natural: nb.subtotalBeforeVat, edited: eb.subtotalBeforeVat, excluded: false, strong: true });
     rows.push({ label: "KDV", natural: nb.vatCharge, edited: eb.vatCharge, excluded: false });
     rows.push({ label: "Genel Toplam (KDV Dahil)", natural: nb.totalInvoice, edited: eb.totalInvoice, excluded: false, strong: true });
-    rows.push({
-      label: "YEKDEM Mahsubu",
-      natural: naturalResult.yekdemMahsup,
-      edited: editedResult.yekdemMahsup,
-      excluded: draft.yekdem_mahsup.isExcluded,
-    });
+    // Metod 2/3'te fark yukarıda KDV matrahındaki KALEM olarak gösteriliyor;
+    // toplam-sonrası mahsup 0'a zorlandığı için burada yanıltıcı 0/0 satırı çizilmez.
+    if (!isNetMethod) {
+      rows.push({
+        label: "YEKDEM Mahsubu",
+        natural: naturalResult.yekdemMahsup,
+        edited: editedResult.yekdemMahsup,
+        excluded: draft.yekdem_mahsup.isExcluded,
+      });
+    }
     rows.push({
       label: "Ödenecek Toplam (Mahsup Dahil)",
       natural: naturalResult.totalWithMahsup,
@@ -780,7 +789,7 @@ export default function InvoiceOverridesAdmin() {
       strong: true,
     });
     return rows;
-  }, [naturalResult, editedResult, inputs, draft.yekdem_mahsup.isExcluded]);
+  }, [naturalResult, editedResult, inputs, isNetMethod, draft.yekdem_mahsup.isExcluded]);
 
   const diff =
     naturalResult && editedResult
@@ -1153,7 +1162,11 @@ export default function InvoiceOverridesAdmin() {
               <div className="mt-4 rounded-xl border border-neutral-200 bg-neutral-50 p-3">
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-xs font-medium text-neutral-700">
-                    YEKDEM Mahsubu (Manuel)
+                    {isNetMethod
+                      ? inputs?.invoiceMethodId === 2
+                        ? "YEK Farkı (Manuel)"
+                        : "Önceki YEKDEM Mahsup (Manuel)"
+                      : "YEKDEM Mahsubu (Manuel)"}
                   </span>
                   {inputs && (
                     <span className="text-[11px] text-neutral-500">
@@ -1177,13 +1190,17 @@ export default function InvoiceOverridesAdmin() {
                         }
                         className="h-4 w-4 rounded border-neutral-300"
                       />
-                      Bu ay YEKDEM mahsubunu çıkar
+                      {isNetMethod
+                        ? "Bu ay bu kalemi faturadan çıkar"
+                        : "Bu ay YEKDEM mahsubunu çıkar"}
                     </label>
 
                     <div className="mt-3 flex flex-wrap gap-3">
                       <label className="block">
                         <span className="text-xs font-medium text-neutral-600 mb-1 block">
-                          Mahsup Dönemi Toplam Tüketim (kWh)
+                          {isNetMethod
+                            ? "Önceki Dönem Mahsuplu Tüketim — Σpos (kWh)"
+                            : "Mahsup Dönemi Toplam Tüketim (kWh)"}
                         </span>
                         <input
                           type="number"
@@ -1194,18 +1211,24 @@ export default function InvoiceOverridesAdmin() {
                             setRow("yekdem_mahsup", { totalKwh: e.target.value })
                           }
                           placeholder={
-                            inputs
-                              ? inputs.mahsupNaturalTotalKwh > 0
-                                ? `Doğal: ${fmtKwh(inputs.mahsupNaturalTotalKwh)}`
+                            isNetMethod
+                              ? inputs?.methodInputs?.prevSumPos != null
+                                ? `Doğal: ${fmtKwh(inputs.methodInputs.prevSumPos)}`
                                 : "Veri yok"
-                              : "—"
+                              : inputs
+                                ? inputs.mahsupNaturalTotalKwh > 0
+                                  ? `Doğal: ${fmtKwh(inputs.mahsupNaturalTotalKwh)}`
+                                  : "Veri yok"
+                                : "—"
                           }
                           className="w-56 rounded-lg border border-neutral-300 px-3 py-2 text-sm disabled:bg-neutral-100 disabled:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-blue-200"
                         />
                       </label>
                       <label className="block">
                         <span className="text-xs font-medium text-neutral-600 mb-1 block">
-                          YEKDEM Farkı (Gerçekleşen − Tahmin, TL/kWh)
+                          {isNetMethod
+                            ? "YEKDEM Farkı (Gerçekleşen − Tahmini, ÇIPLAK TL/kWh; motor KBK ile çarpar)"
+                            : "YEKDEM Farkı (Gerçekleşen − Tahmin, TL/kWh)"}
                         </span>
                         <input
                           type="number"
@@ -1216,14 +1239,22 @@ export default function InvoiceOverridesAdmin() {
                             setRow("yekdem_mahsup", { diffYekdem: e.target.value })
                           }
                           placeholder={
-                            inputs &&
-                            inputs.mahsupNaturalYekdemValue != null &&
-                            inputs.mahsupNaturalYekdemFinal != null
-                              ? `Doğal: ${fmtUnit(
-                                  inputs.mahsupNaturalYekdemFinal -
-                                    inputs.mahsupNaturalYekdemValue
-                                )}`
-                              : "Veri yok"
+                            isNetMethod
+                              ? inputs?.methodInputs?.prevGerceklesenYekdem != null &&
+                                inputs?.methodInputs?.prevTahminiYekdem != null
+                                ? `Doğal: ${fmtUnit(
+                                    inputs.methodInputs.prevGerceklesenYekdem -
+                                      inputs.methodInputs.prevTahminiYekdem
+                                  )}`
+                                : "Veri yok"
+                              : inputs &&
+                                  inputs.mahsupNaturalYekdemValue != null &&
+                                  inputs.mahsupNaturalYekdemFinal != null
+                                ? `Doğal: ${fmtUnit(
+                                    inputs.mahsupNaturalYekdemFinal -
+                                      inputs.mahsupNaturalYekdemValue
+                                  )}`
+                                : "Veri yok"
                           }
                           className="w-56 rounded-lg border border-neutral-300 px-3 py-2 text-sm disabled:bg-neutral-100 disabled:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-blue-200"
                         />
@@ -1232,19 +1263,35 @@ export default function InvoiceOverridesAdmin() {
 
                     {editedResult && (
                       <div className="mt-2 text-[11px] text-neutral-600">
-                        Hesaplanan mahsup:{" "}
-                        <span className="font-semibold">
-                          {fmtMoney2(editedResult.yekdemMahsup)} ₺
-                        </span>{" "}
-                        <span className="text-neutral-400">
-                          (doğal: {fmtMoney2(naturalResult?.yekdemMahsup ?? 0)} ₺)
-                        </span>
+                        {isNetMethod ? (
+                          <>
+                            Hesaplanan kalem:{" "}
+                            <span className="font-semibold">
+                              {fmtMoney2(editedResult.breakdown.yekFarkiCharge ?? 0)} ₺
+                            </span>{" "}
+                            <span className="text-neutral-400">
+                              (doğal: {fmtMoney2(naturalResult?.breakdown.yekFarkiCharge ?? 0)} ₺)
+                              — KDV matrahına girer
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            Hesaplanan mahsup:{" "}
+                            <span className="font-semibold">
+                              {fmtMoney2(editedResult.yekdemMahsup)} ₺
+                            </span>{" "}
+                            <span className="text-neutral-400">
+                              (doğal: {fmtMoney2(naturalResult?.yekdemMahsup ?? 0)} ₺)
+                            </span>
+                          </>
+                        )}
                       </div>
                     )}
 
                     <div className="mt-1 text-[10px] text-neutral-400">
-                      Bu değerler sadece YEKDEM mahsup satırını etkiler; enerji/dağıtım/diğer
-                      kalemlere ve veriş mahsubuna dokunmaz.
+                      {isNetMethod
+                        ? "Bu değerler sadece YEK Farkı / Önceki YEKDEM Mahsup kalemini etkiler; KDV matrahına girer, diğer kalemlere dokunmaz."
+                        : "Bu değerler sadece YEKDEM mahsup satırını etkiler; enerji/dağıtım/diğer kalemlere ve veriş mahsubuna dokunmaz."}
                     </div>
                   </>
                 )}

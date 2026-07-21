@@ -15,9 +15,12 @@ import {
   calculateInvoiceMethod2,
   calculateInvoiceMethod3,
   calculateYekFarki,
+  resolveYekFarkiWithOverride,
   type InvoiceMethodInputs,
   type MethodInvoiceInput,
 } from "../src/components/utils/calculateInvoiceNetMethods";
+// type-only → tsx'te silinir, @/lib/supabase zincirine girmez.
+import type { InvoiceOverrides } from "../src/components/utils/invoiceOverrides";
 
 // ── Test harness ────────────────────────────────────────────────
 let failures = 0;
@@ -136,6 +139,129 @@ console.log("\n── Sentetik · Önceki YEKDEM farkı aritmetiği ──");
   };
   const b = calculateInvoiceMethod3(baseInput({}), null, mi);
   assertClose("Motor yekFarkiCharge", b.yekFarkiCharge!, 1099065.83, 1);
+}
+
+// ── FIXTURE 5 (2C): Manuel YEKDEM override köprüsü — MANUEL KAZANIR ───────
+// Manuel değerler F3 ile aynı: 1.540.509 × 0,703593 × 1,014 = 1.099.065,83.
+// Doğal (otomatik) senaryo BİLİNÇLİ farklı: 1.000.000 × 0,5 × 1,014 = 507.000
+// → hangi kaynağın kazandığı tek bakışta görünür.
+console.log("\n── 2C · Manuel YEKDEM override köprüsü ──");
+{
+  const kbk = 1.014;
+  const MANUAL = 1099065.83;
+  const NATURAL = 507000.0;
+
+  const ov = (
+    payload: { total_kwh?: number; diff_yekdem?: number } | null,
+    isExcluded = false
+  ): InvoiceOverrides => ({
+    yekdem_mahsup: {
+      isExcluded,
+      unitPriceOverride: null,
+      amountOverride: null,
+      payload,
+      note: null,
+    },
+  });
+
+  // Otomatik (doğal) önceki dönem verisi VAR.
+  const miWith: InvoiceMethodInputs = {
+    sumCn: 1000, sumGn: 0, sumPos: 1000, sumMahsup: 0, sumExcess: 0,
+    wPos: 1, kbk, tahminiYekdem: 0,
+    prevSumPos: 1000000, prevTahminiYekdem: 0.5, prevGerceklesenYekdem: 1.0,
+    mahsuplasmaUnitPrice: null,
+  };
+  // Otomatik veri YOK.
+  const miNone: InvoiceMethodInputs = {
+    ...miWith, prevSumPos: null, prevTahminiYekdem: null, prevGerceklesenYekdem: null,
+  };
+  const input = baseInput({});
+
+  // (0) Regresyon: override yok → doğal (bit-identik) + alakasız override dokunmaz.
+  assertClose("(0) override yok → doğal", calculateInvoiceMethod3(input, null, miWith).yekFarkiCharge!, NATURAL, 0.01);
+  assertClose(
+    "(0) alakasız override → doğal",
+    calculateInvoiceMethod3(
+      input,
+      { enerji: { isExcluded: false, unitPriceOverride: 2, amountOverride: null, payload: null, note: null } },
+      miWith
+    ).yekFarkiCharge!,
+    NATURAL, 0.01
+  );
+
+  // (i) K1(c): OTOMATİK VERİ VAR + MANUEL GİRİLDİ → MANUEL KAZANIR.
+  const bMan = calculateInvoiceMethod3(input, ov({ total_kwh: 1540509, diff_yekdem: 0.703593 }), miWith);
+  assertClose("(i) manuel öncelik (m3)", bMan.yekFarkiCharge!, MANUAL, 1);
+  assertClose(
+    "(i) manuel öncelik (m2)",
+    calculateInvoiceMethod2(input, ov({ total_kwh: 1540509, diff_yekdem: 0.703593 }), miWith).yekFarkiCharge!,
+    MANUAL, 1
+  );
+  // Kalem KDV ÖNCESİ matraha girdiği için ara toplam da aynı kadar artmalı.
+  const bNat = calculateInvoiceMethod3(input, null, miWith);
+  assertClose("(i) matraha yansıma", bMan.subtotalBeforeVat - bNat.subtotalBeforeVat, MANUAL - NATURAL, 1);
+  {
+    const list = bMan.appliedOverrides?.amountOverriddenItems ?? [];
+    const ok = list.includes("yekdem_mahsup");
+    if (!ok) failures++;
+    console.log(`  ${ok ? "✅" : "❌"} (i) appliedOverrides.amountOverriddenItems = ${JSON.stringify(list)}`);
+  }
+
+  // (ii) Otomatik veri YOK + manuel girildi → manuel.
+  assertClose("(ii) otomatik yok → doğal 0", calculateInvoiceMethod3(input, null, miNone).yekFarkiCharge!, 0, 0.0001);
+  assertClose(
+    "(ii) otomatik yok + manuel",
+    calculateInvoiceMethod3(input, ov({ total_kwh: 1540509, diff_yekdem: 0.703593 }), miNone).yekFarkiCharge!,
+    MANUAL, 1
+  );
+
+  // (iii) forceZero — checkbox kalemi kapatır (otomatik veri OLMASINA rağmen).
+  const bZero = calculateInvoiceMethod3(input, ov(null, true), miWith);
+  assertClose("(iii) isExcluded → 0", bZero.yekFarkiCharge!, 0, 0.0001);
+  assertClose("(iii) matrah düşüşü", bNat.subtotalBeforeVat - bZero.subtotalBeforeVat, NATURAL, 0.01);
+  {
+    const list = bZero.appliedOverrides?.excludedItems ?? [];
+    const ok = list.includes("yekdem_mahsup");
+    if (!ok) failures++;
+    console.log(`  ${ok ? "✅" : "❌"} (iii) appliedOverrides.excludedItems = ${JSON.stringify(list)}`);
+  }
+
+  // (iv) Kısmi: yalnız diff_yekdem → taban doğaldan (1.540.509) tamamlanır.
+  const miPartial: InvoiceMethodInputs = {
+    ...miWith, prevSumPos: 1540509, prevTahminiYekdem: 0.5, prevGerceklesenYekdem: 0.6,
+  };
+  assertClose("(iv) kısmi doğal (fark 0,1)", calculateInvoiceMethod3(input, null, miPartial).yekFarkiCharge!, 156207.61, 1);
+  assertClose(
+    "(iv) yalnız fark manuel",
+    calculateInvoiceMethod3(input, ov({ diff_yekdem: 0.703593 }), miPartial).yekFarkiCharge!,
+    MANUAL, 1
+  );
+
+  // (v) Kısmi: yalnız total_kwh → fark doğaldan (0,703593) tamamlanır.
+  const miPartial2: InvoiceMethodInputs = {
+    ...miWith, prevSumPos: 100000, prevTahminiYekdem: 0.5, prevGerceklesenYekdem: 1.203593,
+  };
+  assertClose("(v) kısmi doğal (taban 100k)", calculateInvoiceMethod3(input, null, miPartial2).yekFarkiCharge!, 71344.33, 1);
+  assertClose(
+    "(v) yalnız taban manuel",
+    calculateInvoiceMethod3(input, ov({ total_kwh: 1540509 }), miPartial2).yekFarkiCharge!,
+    MANUAL, 1
+  );
+
+  // (vi) Saf fonksiyon doğrudan.
+  const direct = resolveYekFarkiWithOverride({
+    prevSumPos: 1000000, prevTahminiYekdem: 0.5, prevGerceklesenYekdem: 1.0, kbk,
+    override: {
+      isExcluded: false, unitPriceOverride: null, amountOverride: null,
+      payload: { total_kwh: 1540509, diff_yekdem: 0.703593 }, note: null,
+    },
+  });
+  assertClose("(vi) resolveYekFarkiWithOverride()", direct.amount, MANUAL, 1);
+  {
+    const ok = direct.overridden === true && direct.excluded === false;
+    if (!ok) failures++;
+    console.log(`  ${ok ? "✅" : "❌"} (vi) overridden=${direct.overridden} excluded=${direct.excluded}`);
+  }
 }
 
 // ── FIXTURE 4: Metod 1 regresyonu (golden snapshot) ──────────────
