@@ -45,6 +45,8 @@ export function methodInputsFromSnapshotRow(
   row: RecomputeRow
 ): InvoiceMethodInputs | undefined {
   const methodId = coerceInvoiceMethodId(row.invoice_method);
+  // Metod 1 ve Metod 4 (GES'siz düz fatura) saatlik-net girdisi taşımaz (w_pos yok) →
+  // undefined; dispatcher metod-1 çekirdeğinden hesaplar (m4 dalı üretimi sıfırlar).
   if (methodId !== 2 && methodId !== 3) return undefined;
   // Aşama 2A geçiş dönemi: invoice_method=2/3 damgalı ama w_pos'suz satırlar
   // (2B öncesi yazım) METOD 1 MOTORUYLA hesaplanmıştı. Replay de m1 ile yapılmalı

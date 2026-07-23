@@ -1310,13 +1310,27 @@ const excludedItems = new Set<string>(
               <p className="text-xl font-semibold text-neutral-900">
                 {fmtKwh(data.totalConsumptionKwh)}
               </p>
+              {/* Metod 2/3: fatura NET (mahsuplu) çekiş üzerinden kesilir */}
+              {(data.invoiceMethodId === 2 || data.invoiceMethodId === 3) && (
+                <p className="mt-1 text-xs text-neutral-500">
+                  Faturalanan (mahsuplu):{" "}
+                  {fmtKwh(data.methodInputs?.sumPos ?? data.breakdown.netEnergyKwh)} kWh
+                </p>
+              )}
             </div>
 
             <div className="rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm">
               <p className="text-xs text-neutral-500 mb-1">Enerji Birim Fiyatı</p>
-        
+
               <p className="mt-1 text-xl font-semibold text-neutral-900">
-                {fmtUnit(data.unitPriceEnergy)} TL/kWh
+                {/* Metod 2/3: T-0 = wPos × KBK (data.breakdown.energyUnitPriceApplied);
+                    Metod 1: efektif birim fiyat (PTF+YEKDEM)×KBK. */}
+                {fmtUnit(
+                  data.invoiceMethodId === 2 || data.invoiceMethodId === 3
+                    ? data.breakdown.energyUnitPriceApplied ?? data.unitPriceEnergy
+                    : data.unitPriceEnergy
+                )}{" "}
+                TL/kWh
               </p>
             </div>
 
@@ -1431,6 +1445,8 @@ const excludedItems = new Set<string>(
             </div>
           )}
 
+          {/* Kayseri OSB: OSB tesisinde EPDK dağıtım tarifesi kıyası anlamsız → kart tamamen gizlenir */}
+          {!data.isKayseriOsb && (
           <AlternateTariffInvoiceSection
             uid={uid!}
             subscriptionSerno={selectedSub!}
@@ -1456,6 +1472,7 @@ const excludedItems = new Set<string>(
             invoiceMethodId={data.invoiceMethodId}
             methodInputs={data.methodInputs}
           />
+          )}
 
 
 
@@ -1500,20 +1517,14 @@ const excludedItems = new Set<string>(
                     </tr>
                   )}
 
-                  {/* Metod 2: YEK Bedeli (brüt taban) · Metod 3: Tahmini YEKDEM (net taban) */}
+                  {/* Metod 2: YEK Bedeli · Metod 3: Tahmini YEKDEM — her ikisinin tabanı NET (netEnergyKwh) */}
                   {(data.invoiceMethodId === 2 || data.invoiceMethodId === 3) && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">
                         {data.invoiceMethodId === 2 ? "YEK Bedeli" : "Tahmini YEKDEM"}
                       </td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        Tahmini YEKDEM × KBK ×{" "}
-                        {fmtKwh(
-                          data.invoiceMethodId === 2
-                            ? data.totalConsumptionKwh
-                            : data.breakdown.netEnergyKwh
-                        )}{" "}
-                        kWh
+                        Tahmini YEKDEM × KBK × {fmtKwh(data.breakdown.netEnergyKwh)} kWh
                       </td>
                       <td className="py-2 pr-4 text-right">
                         {fmtMoney2(data.breakdown.yekTahminiCharge ?? 0)}
@@ -1542,7 +1553,13 @@ const excludedItems = new Set<string>(
                           <tr className="border-b border-neutral-100">
                             <td className="py-2 pr-4">Trafo Kaybı</td>
                             <td className="py-2 pr-4 text-neutral-600">
-                              {fmtUnit(data.unitPriceEnergy)} TL/kWh × {fmtKwh(data.trafoDegeri)} kWh
+                              {/* Metod 2/3: trafo tutarı da wPos × KBK (energyUnitPriceApplied) ile hesaplanır — açıklama tutarla uzlaşsın */}
+                              {fmtUnit(
+                                data.invoiceMethodId === 2 || data.invoiceMethodId === 3
+                                  ? data.breakdown.energyUnitPriceApplied ?? 0
+                                  : data.unitPriceEnergy
+                              )}{" "}
+                              TL/kWh × {fmtKwh(data.trafoDegeri)} kWh
                             </td>
                             <td className="py-2 pr-4 text-right">
                               {fmtMoney2(data.breakdown.trafoCharge)}
@@ -1603,7 +1620,7 @@ const excludedItems = new Set<string>(
                         {data.invoiceMethodId === 2
                           ? "Enerji bedeli × BTV oranı"
                           : data.invoiceMethodId === 3
-                          ? "(Enerji − mahsuplaşma kredisi) × BTV oranı"
+                          ? "(Enerji + Tahmini YEKDEM − mahsuplaşma kredisi) × BTV oranı"
                           : "Net enerji bedeli × BTV oranı"}
                       </td>
                       <td className="py-2 pr-4 text-right">
@@ -1762,8 +1779,9 @@ const excludedItems = new Set<string>(
             </div>
           </div>
 
-          {/* Talep Birleştirme bilgi notu — üç durum */}
-          {data.gesAlloc?.role === "assigned" && data.gesAlloc.isSource && (
+          {/* Talep Birleştirme bilgi notu — üç durum. Metod 4'te gösterilmez
+              (düz fatura; mahsup/tahsis kavramı yok). */}
+          {data.invoiceMethodId !== 4 && data.gesAlloc?.role === "assigned" && data.gesAlloc.isSource && (
             <div className="rounded-2xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800">
               Talep Birleştirme: bu tesis üretim kaynağıdır. Üretim önce kendi tüketiminden
               mahsup edildi; bu faturaya {fmtKwh(data.gesAlloc.allocatedKwh)} kWh mahsup tahsis
@@ -1772,7 +1790,7 @@ const excludedItems = new Set<string>(
                 " Tüm tesislerden artan fazla üretimin satışı bu tesisin faturasında gösterilir."}
             </div>
           )}
-          {data.gesAlloc?.role === "assigned" && !data.gesAlloc.isSource && (
+          {data.invoiceMethodId !== 4 && data.gesAlloc?.role === "assigned" && !data.gesAlloc.isSource && (
             <div className="rounded-2xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800">
               Talep Birleştirme: bu faturaya {fmtKwh(data.gesAlloc.allocatedKwh)} kWh GES mahsubu
               tahsis edildi (öncelik {data.gesAlloc.priority}).
@@ -1780,7 +1798,7 @@ const excludedItems = new Set<string>(
                 " Fazla üretim satışı bu tesisin faturasında gösterilir."}
             </div>
           )}
-          {data.gesAlloc?.role === "source" && (
+          {data.invoiceMethodId !== 4 && data.gesAlloc?.role === "source" && (
             <div className="rounded-2xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800">
               Bu sayacın üretimi Talep Birleştirme ile diğer tesislere mahsup edilmektedir;
               veriş bu faturada 0 kabul edilir.
@@ -1797,24 +1815,33 @@ const excludedItems = new Set<string>(
             />
           )}
 
-          {/* GES Üretim Satışı — fazla üretim satışı, faturaya dahil DEĞİL */}
-          {data.breakdown.verisFazlaKwh > 0 && (
-            <GesUretimSatisiCard
-              result={calculateGesUretimSatisi({
-                satisKwh: data.breakdown.verisFazlaKwh,
-                onYil: data.onYil,
-                usdKur: data.usdKur,
-                perakendeEnerjiBedeli: data.perakendeEnerjiBedeli,
-                dagitimBedeli: data.dagitimUreticiBedeli,
-              })}
-              lisansliSatis={data.lisansliSatis}
-            />
-          )}
+          {/* GES Üretim Satışı — fazla üretim satışı, faturaya dahil DEĞİL.
+              Metod 4 (GES'siz düz fatura): mahsup yok → satılan veriş = dönem TOPLAM üretimi
+              (excess değil); diğer metotlarda fazla üretim (verisFazlaKwh). */}
+          {(() => {
+            const satisKwh =
+              data.invoiceMethodId === 4
+                ? data.totalProductionKwh ?? 0
+                : data.breakdown.verisFazlaKwh;
+            return satisKwh > 0 ? (
+              <GesUretimSatisiCard
+                result={calculateGesUretimSatisi({
+                  satisKwh,
+                  onYil: data.onYil,
+                  usdKur: data.usdKur,
+                  perakendeEnerjiBedeli: data.perakendeEnerjiBedeli,
+                  dagitimBedeli: data.dagitimUreticiBedeli,
+                })}
+                lisansliSatis={data.lisansliSatis}
+              />
+            ) : null;
+          })()}
         </>
       )}
       {/* GES Olmasaydı tetik butonu — kendi GES'i olan VEYA Talep Birleştirme
-          ile mahsup alan (assigned) tesislerde görünür */}
-      {data && (hasGes || data.gesAlloc?.role === "assigned") && (
+          ile mahsup alan (assigned) tesislerde görünür.
+          Metod 4'te gizli: fatura GES'ten bağımsız (düz), GES'in değeri satış kartında. */}
+      {data && data.invoiceMethodId !== 4 && (hasGes || data.gesAlloc?.role === "assigned") && (
         <button
           onClick={handleGesOlmasaydiOpen}
           className="fixed bottom-6 right-6 z-30 flex items-center gap-2 rounded-full bg-amber-500 px-5 py-3 text-sm font-medium text-white shadow-lg hover:bg-amber-600 transition-colors"

@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import {
-  type InvoiceBreakdown,
   type TariffType,
 } from "@/components/utils/calculateInvoice";
 import {
@@ -9,7 +8,10 @@ import {
   DEFAULT_INVOICE_METHOD,
   type InvoiceMethodId,
 } from "@/lib/invoiceMethods";
-import type { InvoiceMethodInputs } from "@/components/utils/calculateInvoiceNetMethods";
+import type {
+  InvoiceMethodInputs,
+  MethodInvoiceBreakdown,
+} from "@/components/utils/calculateInvoiceNetMethods";
 
 const fmtMoney2 = (n: number | null | undefined) =>
   n == null || !Number.isFinite(Number(n))
@@ -109,7 +111,9 @@ export default function AlternateTariffInvoiceSection(props: {
   const [err, setErr] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
 
-  const [altBreakdown, setAltBreakdown] = useState<InvoiceBreakdown | null>(
+  // MethodInvoiceBreakdown: metod 2/3 alanları (yekTahminiCharge, muhtelif2*,
+  // energyUnitPriceApplied ...) render'da açığa çıksın. Dispatcher zaten bu tipi döndürüyor.
+  const [altBreakdown, setAltBreakdown] = useState<MethodInvoiceBreakdown | null>(
     null
   );
   const [altMeta, setAltMeta] = useState<{
@@ -122,7 +126,8 @@ export default function AlternateTariffInvoiceSection(props: {
     altVatRate: number;
     altPowerPrice: number;
     altPowerExcessPrice: number;
-    assumedContractKw: number;
+    resolvedContractKw: number;
+    powerSource: "limit" | "demand" | "none";
   } | null>(null);
 
   useEffect(() => {
@@ -139,7 +144,7 @@ export default function AlternateTariffInvoiceSection(props: {
 
         const { data: settings, error: settingsErr } = await supabase
           .from("subscription_settings")
-          .select("terim, gerilim, tarife")
+          .select("terim, gerilim, tarife, guc_bedel_limit")
           .eq("user_id", uid)
           .eq("subscription_serno", subscriptionSerno)
           .maybeSingle();
@@ -225,18 +230,35 @@ export default function AlternateTariffInvoiceSection(props: {
 
         const altTariffType: TariffType = altTerm === "cift_terim" ? "dual" : "single";
 
-        let assumedContractKw = 0;
+        // Güç Bedeli kaynağı (öncelik): sözleşme gücü (guc_bedel_limit) → demand×1.1
+        // türevi → yok. Sözleşme gücü ile demand ARTIK ayrı beslenir; motor güç aşımını
+        // max(0, demand − sözleşme) × guc_bedeli_asim ile gerçek hesaplar (eskiden ikisi
+        // eşitti, aşım yapısal olarak hep 0'dı).
+        const contractKwFromLimit =
+          settings.guc_bedel_limit != null &&
+          Number.isFinite(Number(settings.guc_bedel_limit))
+            ? Number(settings.guc_bedel_limit)
+            : 0;
+        const realDemandKw = hasDemandData ? Number(monthFinalDemandKw ?? 0) : 0;
+
+        let resolvedContractKw = 0;
+        let powerSource: "limit" | "demand" | "none" = "none";
         let contractPowerKw = 0;
         let monthFinalDemandKwForCalc = 0;
         let powerPriceForCalc = 0;
         let powerExcessPriceForCalc = 0;
 
         if (altTariffType === "dual") {
-          const base = hasDemandData ? Number(monthFinalDemandKw ?? 0) : 0;
-          assumedContractKw = base > 0 ? base * 1.1 : 0;
+          if (contractKwFromLimit > 0) {
+            resolvedContractKw = contractKwFromLimit;
+            powerSource = "limit";
+          } else if (realDemandKw > 0) {
+            resolvedContractKw = realDemandKw * 1.1;
+            powerSource = "demand";
+          }
 
-          contractPowerKw = assumedContractKw;
-          monthFinalDemandKwForCalc = assumedContractKw;
+          contractPowerKw = resolvedContractKw;
+          monthFinalDemandKwForCalc = realDemandKw;
 
           powerPriceForCalc = altPowerPrice;
           powerExcessPriceForCalc = altPowerExcessPrice;
@@ -278,7 +300,8 @@ export default function AlternateTariffInvoiceSection(props: {
           altVatRate,
           altPowerPrice,
           altPowerExcessPrice,
-          assumedContractKw,
+          resolvedContractKw,
+          powerSource,
         });
       } catch (e: any) {
         if (!cancel) setErr(e?.message ?? "Alternatif terim hesabı yapılamadı.");
@@ -309,9 +332,15 @@ export default function AlternateTariffInvoiceSection(props: {
 
   const altTotalWithExtras = useMemo(() => {
     if (!altBreakdown) return null;
-    const m = hasYekdemMahsup && yekdemMahsup != null ? Number(yekdemMahsup) : 0;
+    // Ana faturayla aynı kural: metod 2/3'te YEKDEM zaten matrah-içi yekFarkiCharge
+    // olarak var → toplam-sonrası mahsup EKLENMEZ (çift sayım engellenir).
+    const isNetMethod = invoiceMethodId === 2 || invoiceMethodId === 3;
+    const m =
+      !isNetMethod && hasYekdemMahsup && yekdemMahsup != null
+        ? Number(yekdemMahsup)
+        : 0;
     return altBreakdown.totalInvoice + m + (Number(digerDegerler ?? 0) || 0);
-  }, [altBreakdown, hasYekdemMahsup, yekdemMahsup, digerDegerler]);
+  }, [altBreakdown, invoiceMethodId, hasYekdemMahsup, yekdemMahsup, digerDegerler]);
 
   if (loading) {
     return (
@@ -344,8 +373,11 @@ export default function AlternateTariffInvoiceSection(props: {
           </h2>
           <p className="text-xs text-neutral-500">
             Tarife: {altMeta.altTarife} • Gerilim: {altMeta.altGerilim}
-            {altMeta.altTariffType === "dual" && altMeta.assumedContractKw > 0 && (
-              <> • Varsayılan sözleşme gücü: {altMeta.assumedContractKw.toFixed(3)} kW (demand×1.1)</>
+            {altMeta.altTariffType === "dual" && altMeta.resolvedContractKw > 0 && (
+              <>
+                {" "}• Sözleşme gücü: {fmtKwh(altMeta.resolvedContractKw)} kW
+                {altMeta.powerSource === "demand" ? " (demand×1.1 varsayım)" : ""}
+              </>
             )}
           </p>
         </div>
@@ -388,16 +420,25 @@ export default function AlternateTariffInvoiceSection(props: {
       {fmtMoney2(altTotalWithExtras)} TL
     </div>
 
-    {/* ✅ Tasarruf / Optimal */}
+    {/* ✅ İşarete duyarlı: tasarruf / ek maliyet / optimal */}
     {currentTotalWithMahsup != null && altTotalWithExtras != null && (
       (() => {
-        const diff = Number(currentTotalWithMahsup) - Number(altTotalWithExtras); 
-        // diff > 0 => alternatif daha ucuz => tasarruf
+        const diff = Number(currentTotalWithMahsup) - Number(altTotalWithExtras);
+        // diff > 0 => alternatif daha ucuz => tasarruf; diff < 0 => daha pahalı => ek maliyet
+        const EPS = 0.5;
 
-        if (diff > 0) {
+        if (diff > EPS) {
           return (
             <div className="mt-1 text-xs font-medium text-emerald-700">
               {altTermText}e geçilince tasarruf: {fmtMoney2(diff)} TL
+            </div>
+          );
+        }
+
+        if (diff < -EPS) {
+          return (
+            <div className="mt-1 text-xs font-medium text-amber-700">
+              {altTermText}e geçilince ek maliyet: {fmtMoney2(Math.abs(diff))} TL
             </div>
           );
         }
@@ -413,6 +454,13 @@ export default function AlternateTariffInvoiceSection(props: {
 </div>
 
       </button>
+
+      {/* Sözleşme gücü kaynağı yoksa (limit tanımsız + demand yok) güç bedeli 0 — dürüst uyarı */}
+      {altMeta.altTariffType === "dual" && altMeta.powerSource === "none" && (
+        <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          Sözleşme gücü tanımsız — karşılaştırma güç bedeli içermiyor.
+        </div>
+      )}
 
       {/* Smooth details */}
       <div
@@ -435,16 +483,63 @@ export default function AlternateTariffInvoiceSection(props: {
                 <tr className="border-b border-neutral-100">
                   <td className="py-2 pr-4">Enerji Bedeli</td>
                   <td className="py-2 pr-4 text-neutral-600">
-                    {fmtUnit(unitPriceEnergy)} TL/kWh × {fmtKwh(totalConsumptionKwh)} kWh
+                    {/* Metod 2/3: taban NET pozitif çekiş, fiyat = wPos × KBK (T-0) */}
+                    {invoiceMethodId === 2 || invoiceMethodId === 3 ? (
+                      <>
+                        {fmtUnit(altBreakdown.energyUnitPriceApplied ?? 0)} TL/kWh ×{" "}
+                        {fmtKwh(altBreakdown.netEnergyKwh)} kWh
+                      </>
+                    ) : (
+                      <>
+                        {fmtUnit(unitPriceEnergy)} TL/kWh × {fmtKwh(totalConsumptionKwh)} kWh
+                      </>
+                    )}
                   </td>
                   <td className="py-2 pr-4 text-right">{fmtMoney2(altBreakdown.energyCharge)}</td>
                 </tr>
+
+                {/* Metod 2: YEK Bedeli · Metod 3: Tahmini YEKDEM — taban NET (netEnergyKwh) */}
+                {(invoiceMethodId === 2 || invoiceMethodId === 3) && (
+                  <tr className="border-b border-neutral-100">
+                    <td className="py-2 pr-4">
+                      {invoiceMethodId === 2 ? "YEK Bedeli" : "Tahmini YEKDEM"}
+                    </td>
+                    <td className="py-2 pr-4 text-neutral-600">
+                      Tahmini YEKDEM × KBK × {fmtKwh(altBreakdown.netEnergyKwh)} kWh
+                    </td>
+                    <td className="py-2 pr-4 text-right">
+                      {fmtMoney2(altBreakdown.yekTahminiCharge ?? 0)}
+                    </td>
+                  </tr>
+                )}
+
+                {/* Önceki dönem YEKDEM farkı — veri yoksa 0 ve satır gizli */}
+                {(invoiceMethodId === 2 || invoiceMethodId === 3) &&
+                  (altBreakdown.yekFarkiCharge ?? 0) !== 0 && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">
+                        {invoiceMethodId === 2 ? "YEK Farkı" : "Önceki YEKDEM Mahsup"}
+                      </td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        Önceki dönem net çekiş × (Gerçekleşen − Tahmini) × KBK
+                      </td>
+                      <td className="py-2 pr-4 text-right">
+                        {fmtMoney2(altBreakdown.yekFarkiCharge ?? 0)}
+                      </td>
+                    </tr>
+                  )}
 
                 {Number(trafoDegeri ?? 0) > 0 && (
                   <tr className="border-b border-neutral-100">
                     <td className="py-2 pr-4">Trafo Kaybı</td>
                     <td className="py-2 pr-4 text-neutral-600">
-                      {fmtUnit(unitPriceEnergy)} TL/kWh × {fmtKwh(trafoDegeri)} kWh
+                      {/* Metod 2/3: trafo da wPos × KBK ile fiyatlanır */}
+                      {fmtUnit(
+                        invoiceMethodId === 2 || invoiceMethodId === 3
+                          ? altBreakdown.energyUnitPriceApplied ?? 0
+                          : unitPriceEnergy
+                      )}{" "}
+                      TL/kWh × {fmtKwh(trafoDegeri)} kWh
                     </td>
                     <td className="py-2 pr-4 text-right">{fmtMoney2(altBreakdown.trafoCharge)}</td>
                   </tr>
@@ -453,25 +548,79 @@ export default function AlternateTariffInvoiceSection(props: {
                 <tr className="border-b border-neutral-100">
                   <td className="py-2 pr-4">Dağıtım Bedeli</td>
                   <td className="py-2 pr-4 text-neutral-600">
-                    {fmtUnit(altMeta.altUnitPriceDistribution)} TL/kWh × {fmtKwh(altBreakdown.distributionBaseKwh)} kWh
+                    {/* Efektif birim × mahsup bazı — tutarla uzlaşır (m1 saatlik-net gate dahil) */}
+                    {fmtUnit(altBreakdown.effectiveDistributionUnitPrice)} TL/kWh ×{" "}
+                    {fmtKwh(altBreakdown.distributionChargeKwh)} kWh
                   </td>
                   <td className="py-2 pr-4 text-right">{fmtMoney2(altBreakdown.distributionCharge)}</td>
                 </tr>
 
+                {/* Metod 3: Muhtelif-2 (+mahsup×dağıtım − mahsup×mahsuplaşma) */}
+                {invoiceMethodId === 3 && (
+                  <tr className="border-b border-neutral-100">
+                    <td
+                      className={
+                        "py-2 pr-4 " +
+                        ((altBreakdown.muhtelif2Net ?? 0) < 0 ? "text-emerald-700" : "")
+                      }
+                    >
+                      Muhtelif-2
+                    </td>
+                    <td className="py-2 pr-4 text-neutral-600">
+                      +{fmtMoney2(altBreakdown.muhtelif2Dagitim ?? 0)} dağıtım −{" "}
+                      {fmtMoney2(altBreakdown.muhtelif2MahsupKredisi ?? 0)} mahsuplaşma (
+                      {fmtUnit(altBreakdown.mahsuplasmaUnitPriceApplied ?? 0)} TL/kWh ×{" "}
+                      {fmtKwh(altBreakdown.verisMahsupKwh)} kWh)
+                    </td>
+                    <td
+                      className={
+                        "py-2 pr-4 text-right " +
+                        ((altBreakdown.muhtelif2Net ?? 0) < 0 ? "text-emerald-700" : "")
+                      }
+                    >
+                      {(altBreakdown.muhtelif2Net ?? 0) < 0 ? "−" : ""}
+                      {fmtMoney2(Math.abs(altBreakdown.muhtelif2Net ?? 0))}
+                    </td>
+                  </tr>
+                )}
+
                 <tr className="border-b border-neutral-100">
                   <td className="py-2 pr-4">BTV</td>
-                  <td className="py-2 pr-4 text-neutral-600">Enerji bedeli × BTV</td>
+                  <td className="py-2 pr-4 text-neutral-600">
+                    {invoiceMethodId === 3
+                      ? "(Enerji + Tahmini YEKDEM − mahsuplaşma kredisi) × BTV"
+                      : "Enerji bedeli × BTV"}
+                  </td>
                   <td className="py-2 pr-4 text-right">{fmtMoney2(altBreakdown.btvCharge)}</td>
                 </tr>
 
                 <tr className="border-b border-neutral-100">
                   <td className="py-2 pr-4">Güç Bedeli</td>
                   <td className="py-2 pr-4 text-neutral-600">
-                    {altMeta.altTariffType === "dual"
-                      ? "Güç bedeli × varsayılan sözleşme gücü"
-                      : "Tek terimde yok"}
+                    {altMeta.altTariffType === "dual" ? (
+                      altMeta.resolvedContractKw > 0 ? (
+                        <>
+                          {/* Gerçek çarpanlar: güç bedeli × sözleşme gücü (+ varsa aşım) */}
+                          {fmtUnit(altMeta.altPowerPrice)} TL/kW ×{" "}
+                          {fmtKwh(altMeta.resolvedContractKw)} kW
+                          {(altBreakdown.powerExcessCharge ?? 0) > 0 && (
+                            <>
+                              {" "}+ aşım {fmtUnit(altMeta.altPowerExcessPrice)} TL/kW ×{" "}
+                              {fmtKwh(
+                                Math.max(0, Number(monthFinalDemandKw ?? 0) - altMeta.resolvedContractKw)
+                              )}{" "}
+                              kW
+                            </>
+                          )}
+                        </>
+                      ) : (
+                        "Sözleşme gücü tanımsız"
+                      )
+                    ) : (
+                      "Tek terimde yok"
+                    )}
                   </td>
-                  <td className="py-2 pr-4 text-right">{fmtMoney2(altBreakdown.powerBaseCharge)}</td>
+                  <td className="py-2 pr-4 text-right">{fmtMoney2(altBreakdown.powerTotalCharge)}</td>
                 </tr>
 
                 <tr className="border-b border-neutral-100">

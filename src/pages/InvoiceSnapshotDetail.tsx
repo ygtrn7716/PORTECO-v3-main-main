@@ -321,7 +321,7 @@ const yekdemCell = useMemo(() => {
                     </tr>
                   )}
 
-                  {/* Metod 2: YEK Bedeli (brüt) · Metod 3: Tahmini YEKDEM (net) */}
+                  {/* Metod 2: YEK Bedeli · Metod 3: Tahmini YEKDEM — her ikisinin tabanı NET */}
                   {snapIsNetMethod && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">{snapIsM3 ? "Tahmini YEKDEM" : "YEK Bedeli"}</td>
@@ -380,7 +380,7 @@ const yekdemCell = useMemo(() => {
                       <td className="py-2 pr-4 text-neutral-600">
                         {snapIsNetMethod
                           ? snapIsM3
-                            ? "(Enerji − mahsuplaşma kredisi) × BTV oranı"
+                            ? "(Enerji + Tahmini YEKDEM − mahsuplaşma kredisi) × BTV oranı"
                             : "Enerji bedeli × BTV oranı"
                           : "Net enerji bedeli × BTV oranı"}
                       </td>

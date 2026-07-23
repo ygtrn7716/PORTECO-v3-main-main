@@ -30,7 +30,7 @@ export type {
  * bkz. billedInvoiceInputs.ts başındaki not) → admin bağlamında doğrudan sorgu.
  */
 
-export type InvoiceMethodId = 1 | 2 | 3;
+export type InvoiceMethodId = 1 | 2 | 3 | 4;
 export const DEFAULT_INVOICE_METHOD: InvoiceMethodId = 1;
 
 export type BillingIntegrationMethod = {
@@ -46,7 +46,7 @@ export type ResolveInvoiceMethodsParams =
   | { context: "admin"; userId: string; supabase: SupabaseClient };
 
 export function isInvoiceMethodId(v: unknown): v is InvoiceMethodId {
-  return v === 1 || v === 2 || v === 3;
+  return v === 1 || v === 2 || v === 3 || v === 4;
 }
 
 /** Snapshot/DB'den gelen metod değerini güvenle daraltır.
@@ -201,6 +201,13 @@ export function calculateInvoiceForMethod(
   const mi = methodInputs ?? input.methodInputs;
 
   if (methodId === 2 || methodId === 3) {
+    // Lisanslı satış: net motor (saatlik mahsuplaşma) bu senaryoyu desteklemiyor.
+    // Metod 1 lisanslı semantiğini tam onurlandırıyor (mahsuplaşma kapalı, gross
+    // dağıtım, verisMahsup=0, tüm üretim → fazla/satış) → Metod 1'e yönlendir.
+    // Bugün tüm tesisler lisansli_satis=false olduğundan davranış byte-identik.
+    if (input.lisansliSatis) {
+      return calculateInvoice(input, overrides);
+    }
     if (!mi) {
       console.warn(
         `invoiceMethods: Metod ${methodId} için saatlik-net girdileri (methodInputs) yok — Metod 1 ile hesaplanıyor.`
@@ -210,6 +217,19 @@ export function calculateInvoiceForMethod(
     return methodId === 2
       ? calculateInvoiceMethod2(input, overrides, mi)
       : calculateInvoiceMethod3(input, overrides, mi);
+  }
+
+  if (methodId === 4) {
+    // Metod 4 — GES'siz düz fatura (BKA Enerji). Metod 1 çekirdeği AYNEN; yalnız üretim
+    // etkileri sıfırlanır → mahsup yok, dağıtım = D×(brüt+trafo), veriş mahsup satırı yok.
+    // GES tahsisi BİLEREK yok sayılır (net alanlar undefined; ges_mahsup_assignments'a satır
+    // eklense bile mahsup alınmaz). calculateInvoice'a dokunulmaz; canlı hesap + snapshot
+    // replay bu daldan geçer. Net alanlar `0` DEĞİL `undefined` — dağıtım birim-fiyat gösterimi
+    // temiz kalsın (mahsupBaz sıfır-bölme guard'ına düşmesin).
+    return calculateInvoice(
+      { ...input, totalProductionKwh: 0, netPositiveDrawKwh: undefined, netExcessFeedKwh: undefined },
+      overrides
+    );
   }
 
   return calculateInvoice(input, overrides);

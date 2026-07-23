@@ -199,8 +199,11 @@ function calculateNetMethod(
     : 0;
   let trafoCharge = energyUnitPrice * trafoKwh;
 
-  // ── 2) m3 "Tahmini YEKDEM" (taban NET) · m2 "YEK Bedeli" (taban BRÜT)
-  const yekBase = method === 2 ? sumCn : sumPos;
+  // ── 2) m3 "Tahmini YEKDEM" · m2 "YEK Bedeli" — her ikisinin tabanı NET (sumPos).
+  // Uludağ YEK'i net (mahsuplu) tüketimden alır; tahmini ≈ gerçekleşen olduğundan
+  // YEK FARKI küçüktür (2026-06 faturasıyla doğrulandı). Yalnız DAĞITIM tabanı m2'de
+  // brüt kalır (satır 218).
+  const yekBase = sumPos;
   let yekTahminiCharge = yekBase * (num(m.tahminiYekdem) * kbk);
 
   // ── 3) Önceki dönem farkı — iki metodda da taban NET (ortak fonksiyon).
@@ -241,10 +244,17 @@ function calculateNetMethod(
     ? Number(input.reactivePenaltyCharge)
     : 0;
 
-  // ── 7) BTV — m3: %1 × (Enerji − mahsuplaşma kredisi) · m2: %1 × Enerji
-  // (VARSAYIM: örnek faturalarda BTV satırı yoktu. Trafo, metod 1'deki gibi tabana dahil.)
+  // ── 7) BTV — m3: %1 × (Enerji + Tahmini YEKDEM − mahsuplaşma kredisi) · m2: %1 × Enerji.
+  // Trepaş enerji ve YEKDEM'i faturada ayrı satır gösterse de BTV ikisinin TOPLAMINDAN
+  // kesilir; Önceki YEKDEM Mahsup satırı ve Muhtelif-2'nin DAĞITIM bileşeni matraha GİRMEZ.
+  // Trafo, metod 1'deki gibi tabana dahil.
+  // m2: Uludağ BTV'yi yalnız enerji bedelinden keser (2026-06 faturası: 9.513,56 =
+  // 951.356,23 × %1); YEKDEM matraha dahil EDİLMEZ.
   const btvRate = num(input.btvRate);
-  const btvEnergyBase = method === 3 ? energyCharge - muhtelif2MahsupKredisi : energyCharge;
+  const btvEnergyBase =
+    method === 3
+      ? energyCharge + yekTahminiCharge - muhtelif2MahsupKredisi
+      : energyCharge;
   let btvCharge = (btvEnergyBase + trafoCharge) * btvRate;
 
   // ── Güç — kural setinde geçmiyor; metod 1 semantiği (yalnız çift terim). VARSAYIM.
@@ -388,7 +398,7 @@ function calculateNetMethod(
   };
 }
 
-/** Metod 2 — Uedaş. Dağıtım ve YEK Bedeli tabanı BRÜT (sumCn), enerji tabanı NET (sumPos). */
+/** Metod 2 — Uedaş. YEK Bedeli ve enerji tabanı NET (sumPos); yalnız DAĞITIM tabanı BRÜT (sumCn). */
 export function calculateInvoiceMethod2(
   input: MethodInvoiceInput,
   overrides?: InvoiceOverrides | null,

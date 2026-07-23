@@ -1501,8 +1501,9 @@ export default function Dashboard() {
           const subUsdKur = subYek?.usd_kur != null ? Number(subYek.usd_kur) : 0;
 
           // Metod 2/3 saatlik-net girdileri (yalnız ilgili metotta).
+          // Metod 4 düz fatura (metod-1 motoru) → net-girdi montajını atlar (metod 1 gibi).
           let subMethodInputs: InvoiceMethodInputs | null = null;
-          if (subInvoiceMethodId !== 1) {
+          if (subInvoiceMethodId === 2 || subInvoiceMethodId === 3) {
             subMethodInputs = await assembleMethodInputs({
               supabase,
               userId: uid,

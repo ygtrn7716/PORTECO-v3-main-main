@@ -17,6 +17,11 @@
 // replay ediliyor; yani yalnızca ESKİ SNAPSHOT KAYDIYLA tutarlılar, gerçek
 // tedarikçi faturasının yapısıyla değil. Sayfaları açmak onları GERÇEK FATURA
 // YAPISINA HİZALAR.
+//
+// KAPSAM: kontroller yalnız saatlik-net metotlarını (2, 3) hedefler. Metod 1 ve
+// Metod 4 (GES'siz düz fatura) metod-1 motorundan geçer, w_pos/kbk/yekdem_tahmini
+// gibi saatlik-net kolonlarını STAMPLAMAZ → filtreler bilerek `IN (2,3)` kalır;
+// metod 4 bu sağlık kontrolleri açısından kapsam dışıdır (normal, eksik damga değil).
 
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";

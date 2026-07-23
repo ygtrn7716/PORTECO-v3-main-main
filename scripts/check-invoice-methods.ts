@@ -18,6 +18,7 @@ import {
   resolveYekFarkiWithOverride,
   type InvoiceMethodInputs,
   type MethodInvoiceInput,
+  type MethodInvoiceBreakdown,
 } from "../src/components/utils/calculateInvoiceNetMethods";
 // type-only → tsx'te silinir, @/lib/supabase zincirine girmez.
 import type { InvoiceOverrides } from "../src/components/utils/invoiceOverrides";
@@ -81,6 +82,10 @@ console.log("\n── Metod 3 (Tredaş) · Tesis 52503 · 2026-06 ──");
   assertClose("Muhtelif-2 dağıtım (+)", b.muhtelif2Dagitim!, 962727, 1);
   assertClose("Muhtelif-2 mahsup kredisi (−)", b.muhtelif2MahsupKredisi!, 1360228, 1);
   assertClose("Önceki YEKDEM Mahsup (veri yok→0)", b.yekFarkiCharge!, 0, 0.0001);
+  // 2G: BTV matrahı = Enerji + Tahmini YEKDEM − mahsuplaşma kredisi (btv_enabled=açık, rate %1).
+  // (2.492.001,33 + 878.740,90 − 1.360.228,47) × %1 ≈ 20.105,14 (Önceki YEKDEM Mahsup ve
+  // Muhtelif-2 dağıtım bileşeni matraha girmez).
+  assertClose("BTV (Enerji+YEKDEM−mahsup kredisi)", b.btvCharge, 20105.14, 1);
 
   // Mahsuplaşma override'ı (gerçek Trepaş faturasındaki 1,82375) → −1.484.851,44
   const bOv = calculateInvoiceMethod3(input, { mahsuplasma: { isExcluded: false, unitPriceOverride: 1.82375, amountOverride: null, payload: null, note: null } }, mi);
@@ -88,7 +93,13 @@ console.log("\n── Metod 3 (Tredaş) · Tesis 52503 · 2026-06 ──");
 }
 
 // ── FIXTURE 2: Tesis 99980910 — Metod 2 (Uedaş), 2026-06 ─────────
-// KBK=1,014 (D1 fixture; canlı DB 1,0375 — kapsam dışı) · tahminiYekdem=0,56466
+// GERÇEK TESİS DEĞERLERİ (2026-06 Uludağ faturasından türetildi):
+//  • tahminiYekdem ≈ 1,0945 = faturadaki 557.059,46 (YEK Bedeli) ÷ 490.581,885 (sumPos)
+//    ÷ KBK 1,0375. Tam hassasiyet 1,0944652 kullanılır (kaba 1,0945 NET tabanla ±5
+//    dışına, ~557.077'ye taşardı).
+//  • KBK = 1,0375 = canlı tesis değeri (yekdem_final 1,083629 ile ~%1 tutarlı).
+// Not: YEK Bedeli tabanı D2'de NET'e çekildi (eski brüt sumCn × sahte 0,56466/1,014
+// kombinasyonu 557k'ya "iki hata birbirini götürerek" oturuyordu).
 console.log("\n── Metod 2 (Uedaş) · Tesis 99980910 · 2026-06 ──");
 {
   const mi: InvoiceMethodInputs = {
@@ -98,8 +109,8 @@ console.log("\n── Metod 2 (Uedaş) · Tesis 99980910 · 2026-06 ──");
     sumMahsup: 482331.915,
     sumExcess: 714448.935,
     wPos: 1.863666483320883322057438,
-    kbk: 1.014,
-    tahminiYekdem: 0.56466, // kullanıcı kararı: tam değer (0,5646 yuvarlanmıştı)
+    kbk: 1.0375,
+    tahminiYekdem: 1.0944652, // ≈1,0945; 557059.46 / 490581.885 / 1.0375
     prevSumPos: null,
     prevTahminiYekdem: null,
     prevGerceklesenYekdem: null,
@@ -108,12 +119,15 @@ console.log("\n── Metod 2 (Uedaş) · Tesis 99980910 · 2026-06 ──");
   const input: MethodInvoiceInput = baseInput({ onYil: false, perakendeEnerjiBedeli: 2.909687 });
 
   const b = calculateInvoiceMethod2(input, null, mi);
-  assertClose("Enerji birim fiyat", b.energyUnitPriceApplied!, 1.889757, 0.00001);
+  assertClose("Enerji birim fiyat", b.energyUnitPriceApplied!, 1.933554, 0.00001);
   assertClose("Dağıtım (brüt taban)", b.distributionCharge, 1150429, 1);
-  // YEK Bedeli tabanı BRÜT (sumCn). 0,56466 girdisi yuvarlanmış olduğundan gerçek
-  // faturadaki 557.059'a ~2,4 TL kalır (0,564662 tam eşler) → bilinçli ±5 TL tolerans.
-  assertClose("YEK Bedeli (brüt taban)", b.yekTahminiCharge!, 557059, 5);
+  // YEK Bedeli tabanı NET (sumPos). Tam-hassasiyetli girdi gerçek faturayı üretir
+  // (490.581,885 × 1,0944652 × 1,0375 ≈ 557.059,5) → ±5 TL tolerans.
+  assertClose("YEK Bedeli (net taban)", b.yekTahminiCharge!, 557059, 5);
   assertClose("YEK Farkı (veri yok→0)", b.yekFarkiCharge!, 0, 0.0001);
+  // 2G sigortası: m2 BTV YALNIZ enerji bedelinden kesilir (YEKDEM matraha GİRMEZ) —
+  // m3 matrah değişikliği yanlışlıkla m2'ye sıçramasın. Enerji × %1 ≈ 9.485,67.
+  assertClose("BTV (yalnız enerji, m2 sigortası)", b.btvCharge, 9485.67, 1);
 }
 
 // ── FIXTURE 3 (SENTETİK): Önceki YEKDEM Mahsup / YEK Farkı aritmetiği ─────
@@ -288,6 +302,165 @@ console.log("\n── Metod 1 regresyonu (golden) ──");
   assertClose("reactivePenaltyCharge", b.reactivePenaltyCharge, 1234.5, 0.01);
   // subtotal = 250000 + 118245.7 + btv + 65000 + 1234.5 (üretim 0 → veriş 0)
   console.log(`     (subtotalBeforeVat = ${money(b.subtotalBeforeVat)}, totalInvoice = ${money(b.totalInvoice)})`);
+}
+
+// ── FIXTURE 6 (SENTETİK, 2E): Çift terim net-metod güç bedeli ─────────────
+// Alt-terim kartı tek→çift senaryosunda net motora dual güç girdisi besler.
+// Gerçek OG sanayi çift-terim tarifesi: guc_bedeli=35,575915 · guc_bedeli_asim=71,15183.
+// Sözleşme gücü 3.360 kW (99980910 guc_bedel_limit), demand 3.500 kW → aşım 140 kW.
+//   base   = 35,575915 × 3.360            = 119.535,0744
+//   aşım   = (3.500 − 3.360) × 71,15183   =   9.961,2562
+//   toplam = base + aşım                  = 129.496,3306
+// (Sözleşme gücü ile demand ARTIK ayrı → aşım gerçek hesaplanır; eskiden ikisi eşitti, aşım hep 0'dı.)
+console.log("\n── Sentetik · Çift terim net-metod güç bedeli (2E) ──");
+{
+  const mi: InvoiceMethodInputs = {
+    sumCn: 1000, sumGn: 0, sumPos: 1000, sumMahsup: 0, sumExcess: 0,
+    wPos: 1, kbk: 1, tahminiYekdem: 0,
+    prevSumPos: null, prevTahminiYekdem: null, prevGerceklesenYekdem: null,
+    mahsuplasmaUnitPrice: null,
+  };
+  const dual = calculateInvoiceMethod2(
+    baseInput({
+      tariffType: "dual",
+      contractPowerKw: 3360,
+      monthFinalDemandKw: 3500,
+      powerPrice: 35.575915,
+      powerExcessPrice: 71.15183,
+    }),
+    null,
+    mi
+  );
+  assertClose("Güç bedeli base (fiyat×sözleşme)", dual.powerBaseCharge, 119535.07, 0.5);
+  assertClose("Güç aşımı ((demand−söz)×aşım)", dual.powerExcessCharge, 9961.26, 0.5);
+  assertClose("Güç bedeli toplam (base+aşım)", dual.powerTotalCharge, 129496.33, 0.5);
+
+  // Tek terim tarafta güç bedeli yok (alt = tek terim senaryosu).
+  const single = calculateInvoiceMethod2(
+    baseInput({
+      tariffType: "single",
+      contractPowerKw: 3360,
+      monthFinalDemandKw: 3500,
+      powerPrice: 35.575915,
+      powerExcessPrice: 71.15183,
+    }),
+    null,
+    mi
+  );
+  assertClose("Tek terim güç bedeli (yok→0)", single.powerTotalCharge, 0, 0.01);
+}
+
+// ── FIXTURE 7 (SENTETİK, 2E): lisansli_satis dispatcher yönlendirme ───────
+// Dispatcher (calculateInvoiceForMethod) lisansli_satis=true net-metod tesisini metod 1'e
+// yönlendirir — guard literal: `if (input.lisansliSatis) return calculateInvoice(...)`.
+// Bu test dosyası @/lib/supabase zincirine girmemek için dispatcher'ı import ETMEZ; guard
+// mantığını birebir yansıtır ve iki yolun AYRIŞTIĞINI (yani yönlendirmenin gerçekten fark
+// yarattığını) kanıtlar. Net motor lisansli_satis'i yok sayar → yönlendirme olmasa yanlış hesap.
+console.log("\n── Sentetik · lisansli_satis dispatcher yönlendirme (2E) ──");
+{
+  const mi: InvoiceMethodInputs = {
+    sumCn: 200000, sumGn: 120000, sumPos: 100000, sumMahsup: 100000, sumExcess: 20000,
+    wPos: 1.5, kbk: 1.0, tahminiYekdem: 0.5,
+    prevSumPos: null, prevTahminiYekdem: null, prevGerceklesenYekdem: null,
+    mahsuplasmaUnitPrice: null,
+  };
+  const input = baseInput({
+    totalConsumptionKwh: 200000,
+    unitPriceEnergy: 2.5,
+    lisansliSatis: true,
+    totalProductionKwh: 120000,
+  });
+
+  // Dispatcher guard'ının seçtiği yol (lisansliSatis=true → metod 1):
+  const routed = input.lisansliSatis
+    ? calculateInvoice(input, null)
+    : calculateInvoiceMethod2(input, null, mi);
+  const method1 = calculateInvoice(input, null); // yönlendirme hedefi
+  const netEngine = calculateInvoiceMethod2(input, null, mi); // yönlendirme OLMASA çalışacak yol
+
+  // 1) Yönlendirilen sonuç metod 1 ile birebir (aynı çekirdek).
+  assertClose("Yönlendirilen = Metod 1 (toplam)", routed.totalInvoice, method1.totalInvoice, 0.01);
+  // 2) Net motor lisansli'yi yok sayar → AYRI sonuç → yönlendirme gerçekten gerekli.
+  const divergence = Math.abs(method1.totalInvoice - netEngine.totalInvoice);
+  console.log(
+    `     (metod1 = ${money(method1.totalInvoice)}, net motor = ${money(netEngine.totalInvoice)}, ayrışma = ${money(divergence)})`
+  );
+  if (divergence <= 1) {
+    failures++;
+    console.log("  ❌ Yönlendirme testi anlamsız: iki yol ayrışmıyor.");
+  } else {
+    console.log("  ✅ Metod 1 ile net motor ayrışıyor → yönlendirme gözlemlenebilir.");
+  }
+  // 3) Kalem şekli farkı: net-metod YEK Bedeli üretir, metod 1 üretmez.
+  assertClose(
+    "Metod 1'de yekTahminiCharge yok",
+    (method1 as MethodInvoiceBreakdown).yekTahminiCharge ?? 0,
+    0,
+    0.01
+  );
+}
+
+// ── FIXTURE 8 (SENTETİK, 2F): Metod 4 — GES'siz düz fatura (m1 vs m4) ─────
+// Metod 4 = metod-1 motoru + üretim girdileri sıfırlanmış (mahsup yok, dağıtım = D×brüt,
+// üretimin tamamı satışa gider). Dispatcher (@/lib/supabase zinciri) import EDİLEMEZ →
+// dispatcher'ın metod-4 dalı satır-içi aynalanır:
+//   m4 = calculateInvoice({ ...input, totalProductionKwh:0, netPositiveDrawKwh:undefined, netExcessFeedKwh:undefined })
+console.log("\n── Sentetik · Metod 4 düz fatura (m1 vs m4) (2F) ──");
+{
+  const toM4 = (inp: InvoiceInput): InvoiceInput => ({
+    ...inp,
+    totalProductionKwh: 0,
+    netPositiveDrawKwh: undefined,
+    netExcessFeedKwh: undefined,
+  });
+
+  // (A) Üretimsiz senaryo: m1 ve m4 birebir aynı (trafo dahil).
+  {
+    const input = baseInput({
+      totalConsumptionKwh: 200000,
+      unitPriceEnergy: 2.5,
+      unitPriceDistribution: 1.182457,
+      trafoDegeri: 5000,
+      totalProductionKwh: 0,
+    });
+    const m1 = calculateInvoice(input);
+    const m4 = calculateInvoice(toM4(input));
+    assertClose("(A) enerji m1==m4", m4.energyCharge, m1.energyCharge, 0.001);
+    assertClose("(A) dağıtım m1==m4", m4.distributionCharge, m1.distributionCharge, 0.001);
+    assertClose("(A) BTV m1==m4", m4.btvCharge, m1.btvCharge, 0.001);
+    assertClose("(A) trafo m1==m4", m4.trafoCharge, m1.trafoCharge, 0.001);
+    assertClose("(A) ara toplam m1==m4", m4.subtotalBeforeVat, m1.subtotalBeforeVat, 0.001);
+    assertClose("(A) veriş mahsup (ikisi de 0)", m4.verisMahsupBedeli, 0, 0.001);
+  }
+
+  // (B) Üretimli senaryo: cn=200.000, gn=120.000, D=1,182457, trafo=5.000, enerji=2,5.
+  //   m4 dağıtım = 1,182457 × 205.000 = 242.403,685 · m4 BTV = (500.000+12.500)×%1 = 5.125.
+  {
+    const input = baseInput({
+      totalConsumptionKwh: 200000,
+      unitPriceEnergy: 2.5,
+      unitPriceDistribution: 1.182457,
+      trafoDegeri: 5000,
+      totalProductionKwh: 120000,
+    });
+    const m1 = calculateInvoice(input);
+    const m4 = calculateInvoice(toM4(input));
+
+    assertClose("(B) enerji m1==m4 (brüt)", m4.energyCharge, m1.energyCharge, 0.001);
+    assertClose("(B) m1 veriş mahsup > 0 (sanity)", m1.verisMahsupBedeli, 300000, 0.5);
+    assertClose("(B) m4 veriş mahsup = 0", m4.verisMahsupBedeli, 0, 0.001);
+    assertClose("(B) m4 dağıtım = D×(cn+trafo)", m4.distributionCharge, 242403.685, 0.01);
+    assertClose(
+      "(B) m4 dağıtım = m1 + gn/2 kredisi",
+      m4.distributionCharge,
+      m1.distributionCharge + m1.distributionAdjustment,
+      0.001
+    );
+    assertClose("(B) m4 BTV = (enerji+trafo)×%1", m4.btvCharge, 5125, 0.01);
+    console.log(
+      `     (m1 dağıtım = ${money(m1.distributionCharge)}, m4 dağıtım = ${money(m4.distributionCharge)}, gn/2 kredisi = ${money(m1.distributionAdjustment)})`
+    );
+  }
 }
 
 console.log(
