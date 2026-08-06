@@ -8,6 +8,10 @@
 // Net gelir = brüt gelir − dağıtım kesintisi. Hesap GES sayfasındaki
 // "Devlete Satılan Enerji Bedeli" ile birebir aynıdır (ortak yardımcı:
 // src/lib/ges/gesUretimSatisi.ts).
+//
+// GesUretimSatisiBody: satır/dipnot gövdesi ayrı export — GES sayfasındaki
+// "Devlete Satılan Enerji Bedeli" kartı aynı gövdeyi kendi başlığıyla sarar
+// (markup paritesi tek yerde durur). Varsayılan kart davranışı değişmedi.
 
 import type { GesUretimSatisiResult } from "@/lib/ges/gesUretimSatisi";
 
@@ -20,32 +24,24 @@ const fmtKwh = (n: number) =>
 const fmtUnit = (n: number) =>
   n.toLocaleString("tr-TR", { minimumFractionDigits: 4, maximumFractionDigits: 4 });
 
-interface GesUretimSatisiCardProps {
+interface GesUretimSatisiBodyProps {
   result: GesUretimSatisiResult;
   /** Dağıtım kesintisi tarife açıklaması için (lisanslı / lisanssız üretici). */
   lisansliSatis?: boolean;
+  /** on_yil tesisinde USD kuru girilmemişse perakende fallback uyarısı (amber).
+   *  Çağıran on_yil bilgisini verir; not yalnız perakende modunda görünür.
+   *  Fatura kartı bu notu göstermez (default false → çıktı birebir korunur). */
+  showPerakendeFallbackNote?: boolean;
 }
 
-export default function GesUretimSatisiCard({
+/** Satış kartının satır + dipnot gövdesi — chrome'suz. */
+export function GesUretimSatisiBody({
   result,
   lisansliSatis = false,
-}: GesUretimSatisiCardProps) {
-  if (!(result.satisKwh > 0)) return null;
-
+  showPerakendeFallbackNote = false,
+}: GesUretimSatisiBodyProps) {
   return (
-    <div className="mt-4 rounded-2xl border border-amber-200/70 bg-gradient-to-br from-amber-50/60 to-white p-4 shadow-sm">
-      <div className="mb-3 flex items-start justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold text-neutral-900">GES Üretim Satışı</h2>
-          <p className="mt-0.5 text-xs text-neutral-500">
-            Fazla üretiminiz için devlete kestiğiniz fatura — yukarıdaki faturaya dahil değildir.
-          </p>
-        </div>
-        <span className="shrink-0 rounded-full bg-amber-100 px-2.5 py-1 text-[11px] font-semibold text-amber-700">
-          Ayrı tahsilat
-        </span>
-      </div>
-
+    <>
       <div className="space-y-2">
         <div className="flex items-center justify-between">
           <span className="text-sm text-neutral-600">Satılan Veriş</span>
@@ -112,12 +108,51 @@ export default function GesUretimSatisiCard({
         </p>
       )}
 
-      {result.satisModu === "usd" && (
+      {result.satisModu === "usd" ? (
         <p className="mt-1 text-xs text-neutral-400">
           Brüt gelir USD bazlı: 0,1330 USD/kWh × {fmtUnit(result.satisUsdKur)} TL/USD ={" "}
           {fmtUnit(result.satisBrutBirim)} TL/kWh
         </p>
+      ) : (
+        showPerakendeFallbackNote &&
+        result.perakendeRate > 0 && (
+          <p className="mt-1 text-xs text-amber-600">
+            Bu ay için USD/TL kuru girilmemiş — perakende enerji bedeli (
+            {fmtUnit(result.perakendeRate)} TL/kWh) ile fallback hesaplandı.
+          </p>
+        )
       )}
+    </>
+  );
+}
+
+interface GesUretimSatisiCardProps {
+  result: GesUretimSatisiResult;
+  /** Dağıtım kesintisi tarife açıklaması için (lisanslı / lisanssız üretici). */
+  lisansliSatis?: boolean;
+}
+
+export default function GesUretimSatisiCard({
+  result,
+  lisansliSatis = false,
+}: GesUretimSatisiCardProps) {
+  if (!(result.satisKwh > 0)) return null;
+
+  return (
+    <div className="mt-4 rounded-2xl border border-amber-200/70 bg-gradient-to-br from-amber-50/60 to-white p-4 shadow-sm">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold text-neutral-900">GES Üretim Satışı</h2>
+          <p className="mt-0.5 text-xs text-neutral-500">
+            Fazla üretiminiz için devlete kestiğiniz fatura — yukarıdaki faturaya dahil değildir.
+          </p>
+        </div>
+        <span className="shrink-0 rounded-full bg-amber-100 px-2.5 py-1 text-[11px] font-semibold text-amber-700">
+          Ayrı tahsilat
+        </span>
+      </div>
+
+      <GesUretimSatisiBody result={result} lisansliSatis={lisansliSatis} />
     </div>
   );
 }

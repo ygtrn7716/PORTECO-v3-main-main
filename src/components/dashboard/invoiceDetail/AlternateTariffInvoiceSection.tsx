@@ -67,6 +67,9 @@ export default function AlternateTariffInvoiceSection(props: {
   currentTotalWithMahsup?: number;
   yekdemMahsup?: number;
   hasYekdemMahsup?: boolean;
+  /** Ana faturanın çözülmüş (override-farkında) Önceki YEKDEM Mahsup / YEK Farkı TL'si
+   *  (pre-VAT, m2/m3 matrah-içi). Alt karş-olgusala aynen taşınır (2H). */
+  mainYekFarkiCharge?: number;
 
   totalProductionKwh?: number;
   onYil?: boolean;
@@ -96,6 +99,7 @@ export default function AlternateTariffInvoiceSection(props: {
     currentTotalWithMahsup,
     yekdemMahsup,
     hasYekdemMahsup,
+    mainYekFarkiCharge,
     totalProductionKwh,
     onYil,
     lisansliSatis,
@@ -330,17 +334,37 @@ export default function AlternateTariffInvoiceSection(props: {
     methodInputs,
   ]);
 
-  const altTotalWithExtras = useMemo(() => {
+  // 2H — Ana faturanın dış mahsup kalemleri karş-olgusala AYNEN taşınır (yeniden hesap YOK):
+  //  • yekFarki (m2/m3, matrah-içi KDV'li): altın kendi (override'sız) yekFarki'si ÇIKARILIR,
+  //    ana faturanınki EKLENİR → alt zaten içeriyorsa delta 0, içermiyorsa tam fark. Doğal ve
+  //    override durumu karşılıklı dışlayan olduğundan çift sayım yapısal olarak imkânsız.
+  //  • m1 YEKDEM mahsubu (post-total imzalı TL) ve Diğer Bedeller: aynen (mevcut kural).
+  // Böylece (ana Ödenecek − alt Ödenecek) yalnız dağıtım+güç ekseninden gelir.
+  const carried = useMemo(() => {
     if (!altBreakdown) return null;
-    // Ana faturayla aynı kural: metod 2/3'te YEKDEM zaten matrah-içi yekFarkiCharge
-    // olarak var → toplam-sonrası mahsup EKLENMEZ (çift sayım engellenir).
     const isNetMethod = invoiceMethodId === 2 || invoiceMethodId === 3;
-    const m =
-      !isNetMethod && hasYekdemMahsup && yekdemMahsup != null
-        ? Number(yekdemMahsup)
-        : 0;
-    return altBreakdown.totalInvoice + m + (Number(digerDegerler ?? 0) || 0);
-  }, [altBreakdown, invoiceMethodId, hasYekdemMahsup, yekdemMahsup, digerDegerler]);
+    const vat = altMeta ? Number(altMeta.altVatRate) : 0;
+
+    const yekFarkiCarried = isNetMethod
+      ? (Number(mainYekFarkiCharge ?? 0) - Number(altBreakdown.yekFarkiCharge ?? 0)) * (1 + vat)
+      : 0;
+    const m1Mahsup =
+      !isNetMethod && hasYekdemMahsup && yekdemMahsup != null ? Number(yekdemMahsup) : 0;
+    const diger = Number(digerDegerler ?? 0) || 0;
+
+    const payable = altBreakdown.totalInvoice + yekFarkiCarried + m1Mahsup + diger;
+    return { yekFarkiCarried, m1Mahsup, diger, payable };
+  }, [
+    altBreakdown,
+    altMeta,
+    invoiceMethodId,
+    hasYekdemMahsup,
+    yekdemMahsup,
+    mainYekFarkiCharge,
+    digerDegerler,
+  ]);
+
+  const altTotalWithExtras = carried?.payable ?? null;
 
   if (loading) {
     return (
@@ -652,6 +676,72 @@ export default function AlternateTariffInvoiceSection(props: {
                     {fmtMoney2(altBreakdown.totalInvoice)} TL
                   </td>
                 </tr>
+
+                {/* 2H — Ana faturadan taşınan dış mahsup kalemleri (post-total, yeniden hesap YOK).
+                    Böylece Ödenecek ana faturayla aynı dış kalem setini içerir; fark yalnız
+                    dağıtım+güç ekseninden gelir. */}
+                {(invoiceMethodId === 2 || invoiceMethodId === 3) &&
+                  (carried?.yekFarkiCarried ?? 0) !== 0 && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4">
+                        {invoiceMethodId === 2 ? "YEK Farkı" : "Önceki YEKDEM Mahsup"}
+                      </td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        Ana faturadan taşındı (KDV dahil)
+                      </td>
+                      <td className="py-2 pr-4 text-right">
+                        {carried!.yekFarkiCarried > 0 ? "+" : "-"}
+                        {fmtMoney2(Math.abs(carried!.yekFarkiCarried))} TL
+                      </td>
+                    </tr>
+                  )}
+
+                {invoiceMethodId !== 2 &&
+                  invoiceMethodId !== 3 &&
+                  hasYekdemMahsup &&
+                  (carried?.m1Mahsup ?? 0) !== 0 && (
+                    <tr className="border-b border-neutral-100">
+                      <td className="py-2 pr-4 font-semibold">Önceki Dönem YEKDEM Mahsubu</td>
+                      <td className="py-2 pr-4 text-neutral-600">
+                        Tedarikçi Tahmin − Gerçekleşen YEKDEM
+                      </td>
+                      <td
+                        className={
+                          "py-2 pr-4 text-right font-semibold " +
+                          (carried!.m1Mahsup > 0 ? "text-red-600" : "text-emerald-600")
+                        }
+                      >
+                        {carried!.m1Mahsup > 0 ? "+" : "-"}
+                        {fmtMoney2(Math.abs(carried!.m1Mahsup))} TL
+                      </td>
+                    </tr>
+                  )}
+
+                {(carried?.diger ?? 0) !== 0 && (
+                  <tr className="border-b border-neutral-100">
+                    <td className="py-2 pr-4 font-semibold">Diğer Bedeller</td>
+                    <td className="py-2 pr-4 text-neutral-600">KDV dahil şekilde Diğer Bedeller</td>
+                    <td className="py-2 pr-4 text-right font-semibold">
+                      {carried!.diger > 0 ? "+" : "-"}
+                      {fmtMoney2(Math.abs(carried!.diger))} TL
+                    </td>
+                  </tr>
+                )}
+
+                {altTotalWithExtras != null &&
+                  ((carried?.yekFarkiCarried ?? 0) !== 0 ||
+                    (carried?.m1Mahsup ?? 0) !== 0 ||
+                    (carried?.diger ?? 0) !== 0) && (
+                    <tr className="border-t border-neutral-200">
+                      <td className="py-3 pr-4 font-semibold text-neutral-900">
+                        Genel Toplam (Ödenecek)
+                      </td>
+                      <td className="py-3 pr-4 text-neutral-600">Ödenecek toplam</td>
+                      <td className="py-3 pr-4 text-right text-lg font-semibold text-neutral-900">
+                        {fmtMoney2(altTotalWithExtras)} TL
+                      </td>
+                    </tr>
+                  )}
               </tbody>
             </table>
           </div>

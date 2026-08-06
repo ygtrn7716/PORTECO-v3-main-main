@@ -2,13 +2,16 @@ export type ReportType =
   | "consumption_vs_production"
   | "ptf_analysis"
   | "invoice_comparison"
-  | "settlement_performance";
+  | "settlement_performance"
+  | "ges_tasarruf_analizi";
 
 export type ReportTypeMeta = {
   id: ReportType;
   title: string;
   description: string;
   enabled: boolean;
+  /** İlerleme metnindeki birim ("X/Y … yükleniyor"). Yoksa "tesis". */
+  progressNoun?: string;
 };
 
 export type TesisOption = {
@@ -82,4 +85,28 @@ export type MahsupPerformanceResult = {
   tesisler: TesisOption[];
   monthly: MahsupMonthlyRow[];
   mahsupByTesis: Record<number, (number | null)[]>;
+};
+
+// ---- GES Tasarruf Analizi (kayıtlı billed + backdated snapshot'lar) ----
+export type GesTasarrufRow = {
+  serno: number;
+  month: number; // 1-12
+  /** invoice_type='backdated' — Dönem hücresinde "(geriye dönük)" işareti. */
+  backdated: boolean;
+  cekilenKwh: number | null; // snapshot.total_consumption_kwh
+  mahsupKwh: number | null; // breakdown.verisMahsupKwh
+  satilanKwh: number | null; // breakdown.verisFazlaKwh
+  mevcutFaturaTl: number; // recomputeSnapshotTotalWithMahsup
+  satisNetGelirTl: number | null; // Kart 2 net gelir; null = satış yok
+  gesOlmasaydiTl: number | null; // Kart 3; null = motor hesaplayamadı
+  tasarrufTl: number | null; // Kart 4
+  tasarrufPct: number | null; // tasarrufYuzde (×100 hazır)
+};
+
+export type GesTasarrufAnaliziResult = {
+  year: number;
+  /** Yalnız çıktıda en az bir satırı olan tesisler (GES sinyalsizler elenmiş). */
+  tesisler: TesisOption[];
+  /** tesisler[] sırası, tesis içinde ay artan. */
+  rows: GesTasarrufRow[];
 };

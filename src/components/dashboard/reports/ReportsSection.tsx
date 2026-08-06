@@ -8,11 +8,16 @@ import { fetchInvoiceComparison } from "./fetchInvoiceComparison";
 import { exportInvoiceComparisonXlsx } from "./exportInvoiceComparisonXlsx";
 import { fetchMahsupPerformance } from "./fetchMahsupPerformance";
 import { exportMahsupPerformanceXlsx } from "./exportMahsupPerformanceXlsx";
+import { fetchGesTasarrufAnalizi } from "./fetchGesTasarrufAnalizi";
+import { exportGesTasarrufAnaliziXlsx } from "./exportGesTasarrufAnaliziXlsx";
 import type { ReportType, ReportTypeMeta, TesisOption } from "./types";
 
 type Props = {
   uid: string | null;
   sessionLoading: boolean;
+  /** GES tespit sinyali (ChartsPage'in detectVerisPresence sonucu) —
+   *  yalnız GES'i olan kullanıcıda GES Tasarruf Analizi kartı gösterilir. */
+  showGes?: boolean;
 };
 
 const REPORT_TYPES: ReportTypeMeta[] = [
@@ -40,6 +45,13 @@ const REPORT_TYPES: ReportTypeMeta[] = [
     description: "YEKDEM mahsup ve net fayda dökümü.",
     enabled: true,
   },
+  {
+    id: "ges_tasarruf_analizi",
+    title: "GES Tasarruf Analizi",
+    description: "GES'in fatura üzerindeki yıllık net etkisi.",
+    enabled: true,
+    progressNoun: "dönem",
+  },
 ];
 
 const tesisLabel = (t: TesisOption): string => {
@@ -48,13 +60,29 @@ const tesisLabel = (t: TesisOption): string => {
   return nick ? `${tesisNo} - ${nick}` : tesisNo;
 };
 
-export function ReportsSection({ uid, sessionLoading }: Props) {
+export function ReportsSection({ uid, sessionLoading, showGes }: Props) {
   const { tesisler, loading: tesislerLoading, error: tesislerErr } =
     useTesisListForReports(uid, sessionLoading);
 
   const [reportType, setReportType] = useState<ReportType>(
     "consumption_vs_production",
   );
+
+  // GES'i olmayan kullanıcıda GES Tasarruf Analizi kartı gizlenir.
+  const visibleReportTypes = useMemo(
+    () =>
+      showGes
+        ? REPORT_TYPES
+        : REPORT_TYPES.filter((rt) => rt.id !== "ges_tasarruf_analizi"),
+    [showGes],
+  );
+
+  // showGes sonradan false olursa (asenkron tespit) seçim varsayılana döner.
+  useEffect(() => {
+    if (!showGes && reportType === "ges_tasarruf_analizi") {
+      setReportType("consumption_vs_production");
+    }
+  }, [showGes, reportType]);
   const [selectedSernos, setSelectedSernos] = useState<number[]>([]);
   const [year, setYear] = useState<number>(() => new Date().getFullYear());
   const [exporting, setExporting] = useState(false);
@@ -116,6 +144,11 @@ export function ReportsSection({ uid, sessionLoading }: Props) {
           await exportMahsupPerformanceXlsx(result);
           break;
         }
+        case "ges_tasarruf_analizi": {
+          const result = await fetchGesTasarrufAnalizi(fetchArgs);
+          await exportGesTasarrufAnaliziXlsx(result);
+          break;
+        }
         default: {
           const result = await fetchConsumptionVsProduction(fetchArgs);
           await exportConsumptionVsProductionXlsx(result);
@@ -143,7 +176,7 @@ export function ReportsSection({ uid, sessionLoading }: Props) {
       </header>
 
       <div className="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        {REPORT_TYPES.map((rt) => {
+        {visibleReportTypes.map((rt) => {
           const isActive = reportType === rt.id;
           const base =
             "relative rounded-xl border p-4 text-left transition";
@@ -208,7 +241,8 @@ export function ReportsSection({ uid, sessionLoading }: Props) {
           <div className="flex items-center gap-2">
             {exporting && progress ? (
               <span className="text-xs text-neutral-500">
-                {progress.done}/{progress.total} tesis yükleniyor…
+                {progress.done}/{progress.total}{" "}
+                {activeReport.progressNoun ?? "tesis"} yükleniyor…
               </span>
             ) : null}
             <button

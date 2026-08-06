@@ -50,6 +50,12 @@ export type HourlyNetAggregates = {
   ptfCoveredPosKwh: number;
   /** PTF'i olmadığı için wPos'a giremeyen pozitif çekiş kWh'ı. */
   ptfMissingPosKwh: number;
+  /** Mahsup-ağırlıklı ÇIPLAK PTF (TL/kWh). PTF'li mahsup yoksa 0. Metod 3 mahsuplaşma formülü. */
+  wMahsup: number;
+  /** Σ(mahsup_h × PTF_h) — yalnız PTF'i olan saatler. */
+  vMahsup: number;
+  /** wMahsup'a giren mahsup (saat-içi örtüşme) kWh'ı. */
+  ptfCoveredMahsupKwh: number;
 };
 
 type HourlyRow = { ts?: string | number | Date; cn?: unknown; gn?: unknown };
@@ -76,6 +82,9 @@ export function computeHourlyNetAggregates(p: {
   let vPos = 0;
   let ptfCoveredPosKwh = 0;
   let ptfMissingPosKwh = 0;
+  // Mahsup (saat-içi örtüşme) PTF ağırlıklandırması — wMahsup için.
+  let vMahsup = 0;
+  let ptfCoveredMahsupKwh = 0;
 
   // Saat başına efektif gn'i applyAllocationToHourlyRows ile AYNI kuralla türet;
   // yalnız PTF ağırlıklandırması için pos_h'ı yeniden hesapla.
@@ -106,23 +115,42 @@ export function computeHourlyNetAggregates(p: {
     }
 
     const posH = Math.max(0, cn - effGn);
-    if (posH <= 0 || row.ts == null) continue;
+    const mahsupH = cn - posH; // = min(cn, effGn) ≥ 0
+    if (row.ts == null) continue; // ts yoksa PTF ağırlıklandırması yapılamaz (pos ve mahsup)
 
     const ptf = ptfMap.get(hourKeyUtc(row.ts));
-    if (ptf == null || !Number.isFinite(ptf)) {
-      ptfMissingPosKwh += posH;
-      continue;
+    const ptfOk = ptf != null && Number.isFinite(ptf);
+
+    // Pozitif çekiş → wPos (mevcut davranış BİREBİR korunur).
+    if (posH > 0) {
+      if (ptfOk) {
+        ptfCoveredPosKwh += posH;
+        vPos += posH * ptf!;
+      } else {
+        ptfMissingPosKwh += posH;
+      }
     }
-    ptfCoveredPosKwh += posH;
-    vPos += posH * ptf;
+
+    // Mahsup → wMahsup (YENİ). posH işaretinden BAĞIMSIZ: mahsup-baskın saatler (posH=0)
+    // en büyük mahsupH'ı taşır; eski `posH<=0 → continue` bunları atlıyordu.
+    if (mahsupH > 0 && ptfOk) {
+      ptfCoveredMahsupKwh += mahsupH;
+      vMahsup += mahsupH * ptf!;
+    }
   }
 
   // min(cn, effGn) = cn − max(0, cn−effGn) → saat-içi örtüşme (excessTotal lump'ı
   // pos'u etkilemediği için bu kimlik tahsisli tesiste de geçerli).
   const sumMahsup = Math.max(0, sumCn - sumPos);
   const wPos = ptfCoveredPosKwh > 0 ? vPos / ptfCoveredPosKwh : 0;
+  // wPos deseniyle: pay+paydada yalnız PTF'li saatler. Tam-PTF ayda ptfCoveredMahsupKwh ≈ sumMahsup.
+  const wMahsup = ptfCoveredMahsupKwh > 0 ? vMahsup / ptfCoveredMahsupKwh : 0;
 
-  return { sumCn, sumGn, sumPos, sumMahsup, sumExcess, wPos, vPos, ptfCoveredPosKwh, ptfMissingPosKwh };
+  return {
+    sumCn, sumGn, sumPos, sumMahsup, sumExcess,
+    wPos, vPos, ptfCoveredPosKwh, ptfMissingPosKwh,
+    wMahsup, vMahsup, ptfCoveredMahsupKwh,
+  };
 }
 
 // ── Yükleyici (async) ────────────────────────────────────────────
@@ -148,7 +176,8 @@ async function loadUncached(p: {
   // Ay sınırı: billedInvoiceInputs.ts:210-214 ile aynı idiyom, endInclusive=false.
   // getFacilityAllocation'ın cache anahtarı endInclusive içerdiği için tüketim
   // fetch'i ile allocation'a AYNI aralık geçilmeli.
-  const m = dayjsTR().year(periodYear).month(periodMonth - 1);
+  // .date(1): ayın 29-31'inde kısa aya .month() set edilince taşmayı önler.
+  const m = dayjsTR().date(1).year(periodYear).month(periodMonth - 1);
   const monthStart = m.startOf("month");
   const monthEndExclusive = monthStart.clone().add(1, "month");
   const startIso = monthStart.toDate().toISOString();
@@ -305,7 +334,7 @@ export async function assembleMethodInputs(p: {
     }));
   if (!cur) return null;
 
-  const prev = dayjsTR().year(p.periodYear).month(p.periodMonth - 1).subtract(1, "month");
+  const prev = dayjsTR().date(1).year(p.periodYear).month(p.periodMonth - 1).subtract(1, "month");
   const prevYear = prev.year();
   const prevMonth = prev.month() + 1;
 
@@ -321,6 +350,7 @@ export async function assembleMethodInputs(p: {
     sumMahsup: cur.sumMahsup,
     sumExcess: cur.sumExcess,
     wPos: cur.wPos,
+    wMahsup: cur.wMahsup,
     kbk: p.kbk,
     tahminiYekdem: p.tahminiYekdem,
     prevSumPos,

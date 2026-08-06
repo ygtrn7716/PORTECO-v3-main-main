@@ -49,6 +49,9 @@ export type InvoiceMethodInputs = {
   sumExcess: number;
   /** Pos-ağırlıklı ÇIPLAK PTF (TL/kWh) */
   wPos: number;
+  /** Mahsup-ağırlıklı ÇIPLAK PTF (TL/kWh). Metod 3 mahsuplaşma formülünde kullanılır.
+   *  Yoksa (eski veri / hesaplanmadı) mahsuplaşma T-0 fiyatına düşer (2B geçiş guard'ı). */
+  wMahsup?: number | null;
   /** subscription_settings.kbk */
   kbk: number;
   /** Dönemin ÇIPLAK tahmini YEKDEM'i (subscription_yekdem.yekdem_value) */
@@ -226,11 +229,21 @@ function calculateNetMethod(
   // kaynağı çözülemedi (bilinçli sapma). Default T-0 fiyatıdır; admin
   // "mahsuplasma" override'ıyla gerçek değeri girebilir. Temmuz faturasıyla test edilecek.
   const mahsuplasmaUnitOv = ov?.mahsuplasma?.unitPriceOverride;
+  // Gerçek kural (Trepaş / EPİAŞ satış makası): mahsuplanan enerji EPİAŞ'a PERAKENDEDEN
+  // satılır; müşteriye perakende ile (piyasa PTF + YEKDEM) maliyeti arasındaki MAKAS iade
+  // edilir → mahsuplaşmaBirim = perakende − (mahsup-ağırlıklı PTF + tahmini YEKDEM) × KBK.
+  // Negatifse FLOOR YOK: perakende < maliyet ise kredi ek bedele döner (matematik neyse o).
+  const mahsuplasmaFormula =
+    isFin(m.wMahsup) && isFin(input.perakendeEnerjiBedeli)
+      ? num(input.perakendeEnerjiBedeli) - (num(m.wMahsup) + num(m.tahminiYekdem)) * kbk
+      : null;
   const mahsuplasmaUnitPrice = isFin(mahsuplasmaUnitOv)
-    ? Number(mahsuplasmaUnitOv)
+    ? Number(mahsuplasmaUnitOv) // admin override — kaçış kapısı, formülü ezer
     : isFin(m.mahsuplasmaUnitPrice)
-      ? Number(m.mahsuplasmaUnitPrice)
-      : energyUnitPrice;
+      ? Number(m.mahsuplasmaUnitPrice) // snapshot replay: donmuş efektif fiyat (idempotent)
+      : mahsuplasmaFormula != null
+        ? mahsuplasmaFormula // YENİ DEFAULT (canlı m3)
+        : energyUnitPrice; // eski m3 snapshot / wMahsup yok → T-0 (2B geçiş guard'ı)
 
   let muhtelif2Dagitim = 0;
   let muhtelif2MahsupKredisi = 0;

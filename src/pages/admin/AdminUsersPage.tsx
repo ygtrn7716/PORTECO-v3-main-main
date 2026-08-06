@@ -34,6 +34,8 @@ type SettingsForm = {
   unit_price_adjustment: number | null;
   // GES Olmasaydı: null/true = behind-the-meter, false = anlık kullanım yok (arazi GES).
   anlik_uretim_kullanimi: boolean | null;
+  // Fatura Detay > GES Olmasaydı panelinde Muhasebe Excel butonunu açar (tesis bazlı opt-in).
+  muhasebe_excel_enabled: boolean;
 };
 
 type YekdemMonth = {
@@ -72,6 +74,7 @@ const EMPTY_SETTINGS: SettingsForm = {
   lisansli_satis: false,
   unit_price_adjustment: null,
   anlik_uretim_kullanimi: null,
+  muhasebe_excel_enabled: false,
 };
 
 const MONTH_NAMES = [
@@ -230,7 +233,7 @@ export default function AdminUsersPage() {
     (async () => {
       const { data } = await supabase
         .from("subscription_settings")
-        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil, satis_hakki, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi")
+        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil, satis_hakki, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi, muhasebe_excel_enabled")
         .eq("user_id", selectedUserId)
         .eq("subscription_serno", selectedSerno)
         .maybeSingle();
@@ -763,6 +766,25 @@ export default function AdminUsersPage() {
                         Lisanslı Satış Üretim Tesisi
                       </span>
                     </label>
+
+                    {/* Muhasebe Excel (Girdi/Çıktı Raporu) — tesis bazlı opt-in */}
+                    <div className="mt-1">
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={settings.muhasebe_excel_enabled ?? false}
+                          onChange={(e) => setSettings((p) => ({ ...p, muhasebe_excel_enabled: e.target.checked }))}
+                          className="rounded border-neutral-300"
+                        />
+                        <span className="text-xs font-medium text-neutral-600">
+                          Muhasebe Excel (Girdi/Çıktı Raporu)
+                        </span>
+                      </label>
+                      <span className="mt-1 block text-[10px] text-neutral-400">
+                        Fatura Detay sayfasındaki GES Olmasaydı panelinde muhasebe raporu butonunu açar.
+                        Varsayılan kapalı, tesis bazlıdır.
+                      </span>
+                    </div>
 
                     {/* GES Anlık Üretim Kullanımı (üç durumlu: NULL / true / false) */}
                     <label className="block mt-1">

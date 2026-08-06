@@ -214,11 +214,25 @@ export default function TalepBirlestirmeAdmin() {
     return m;
   }, [assignments]);
 
-  // Kullanıcı genelinde zaten atanmış tesisler (uq_gma_user_serno — UI'da da engelle)
-  const assignedAnywhere = useMemo(
-    () => new Set(assignments.map((a) => a.subscription_serno)),
-    [assignments]
-  );
+  // Seçili GES'e zaten atanmış tesisler (uq_gma_plant_serno — UI'da da engelle).
+  // uq_gma_user_serno kaldırıldı: bir tesis birden fazla GES'e atanabilir
+  // (waterfall zincirleme işler) — başka GES'e atanmış olmak artık engel değil.
+  const assignedToSelectedPlant = useMemo(() => {
+    const s = new Set<number>();
+    for (const a of assignments) {
+      if (a.ges_plant_id === selectedPlantId) s.add(a.subscription_serno);
+    }
+    return s;
+  }, [assignments, selectedPlantId]);
+
+  // Başka GES'lere atanmış sernolar — dropdown'da bilgi etiketi için
+  const assignedToOtherPlants = useMemo(() => {
+    const s = new Set<number>();
+    for (const a of assignments) {
+      if (a.ges_plant_id !== selectedPlantId) s.add(a.subscription_serno);
+    }
+    return s;
+  }, [assignments, selectedPlantId]);
 
   // Herhangi bir GES'in linked/source hedefi olan sernolar (yumuşak uyarı için)
   const gesTouchedSernos = useMemo(() => {
@@ -395,8 +409,8 @@ export default function TalepBirlestirmeAdmin() {
 
   const availableFacilities = facilities.filter(
     // Kaynak tesis ARTIK seçilebilir (kendi tüketimini de öncelik sırasında
-    // mahsup edebilsin). Yalnız zaten atanmış tesisler hariç tutulur.
-    (f) => !assignedAnywhere.has(f.subscription_serno)
+    // mahsup edebilsin). Yalnız SEÇİLİ GES'e zaten atanmış tesisler hariç tutulur.
+    (f) => !assignedToSelectedPlant.has(f.subscription_serno)
   );
 
   return (
@@ -642,6 +656,9 @@ export default function TalepBirlestirmeAdmin() {
                           {facilityLabel(f, f.subscription_serno)}
                           {f.subscription_serno === selectedPlantSourceSerno
                             ? " (kaynak tesis)"
+                            : ""}
+                          {assignedToOtherPlants.has(f.subscription_serno)
+                            ? " (başka GES'e de atanmış)"
                             : ""}
                         </option>
                       ))}

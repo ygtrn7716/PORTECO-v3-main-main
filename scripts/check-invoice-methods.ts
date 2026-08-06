@@ -55,7 +55,12 @@ const baseInput = (over: Partial<InvoiceInput>): InvoiceInput => ({
 });
 
 // ── FIXTURE 1: Tesis 52503 — Metod 3 (Tredaş), 2026-06 ───────────
-// KBK=1,014 · D=1,182457 · tahminiYekdem=0,581
+// KBK=1,014 · D=1,182457 · perakende=2,909691 · wMahsup=0,489954 · tahminiYekdem=0,58099
+// 2I: mahsuplaşma birim fiyatı EPİAŞ satış makası formülünden gelir (default, T-0 kalktı):
+//   perakende − (wMahsup + tahminiYekdem) × KBK = 2,909691 − (0,489954+0,58099)×1,014 ≈ 1,823754
+//   → × sumMahsup 814.174,974 ≈ 1.484.852 (gerçek fatura 1.484.851,44) → Muhtelif-2 net ≈ −522.125
+//   (gerçek −522.124,55, İLK KEZ override'sız birebir).
+// tahminiYekdem 0,58099 = gerçek çıplak yekdem_value (tam hassasiyet; kuruş doğrulaması için).
 console.log("\n── Metod 3 (Tredaş) · Tesis 52503 · 2026-06 ──");
 {
   const mi: InvoiceMethodInputs = {
@@ -65,31 +70,37 @@ console.log("\n── Metod 3 (Tredaş) · Tesis 52503 · 2026-06 ──");
     sumMahsup: 814174.974,
     sumExcess: 115420.626,
     wPos: 1.647616587663028946289002, // canlı DB'den tam hassasiyet
+    wMahsup: 0.489954, // mahsup-ağırlıklı çıplak PTF (52503 Haziran)
     kbk: 1.014,
-    tahminiYekdem: 0.581,
+    tahminiYekdem: 0.58099,
     // Önceki dönem (Mayıs) verisi YOK → YEK Farkı kalemi 0 (D3 "veri yok" dalı).
     prevSumPos: null,
     prevTahminiYekdem: null,
     prevGerceklesenYekdem: null,
-    mahsuplasmaUnitPrice: null, // default → T-0 fiyatı
+    mahsuplasmaUnitPrice: null, // default → EPİAŞ makas formülü (perakende − (wMahsup+YEKDEM)×KBK)
   };
-  const input: MethodInvoiceInput = baseInput({ onYil: false, perakendeEnerjiBedeli: 2.909687 });
+  const input: MethodInvoiceInput = baseInput({ onYil: false, perakendeEnerjiBedeli: 2.909691 });
 
   const b = calculateInvoiceMethod3(input, null, mi);
   assertClose("T-0 enerji birim fiyat", b.energyUnitPriceApplied!, 1.67068, 0.00001);
   assertClose("Enerji", b.energyCharge, 2492001, 1);
   assertClose("Dağıtım", b.distributionCharge, 1763760, 1);
   assertClose("Muhtelif-2 dağıtım (+)", b.muhtelif2Dagitim!, 962727, 1);
-  assertClose("Muhtelif-2 mahsup kredisi (−)", b.muhtelif2MahsupKredisi!, 1360228, 1);
+  // 2I: mahsuplaşma birim fiyatı ARTIK formülden — kredi ve net gerçek faturayla birebir.
+  assertClose("Mahsuplaşma birim (EPİAŞ makas)", b.mahsuplasmaUnitPriceApplied!, 1.823754, 0.001);
+  assertClose("Muhtelif-2 mahsup kredisi (−)", b.muhtelif2MahsupKredisi!, 1484852, 5);
+  assertClose("Muhtelif-2 net (dağıtım − kredisi)", b.muhtelif2Net!, -522125, 5);
   assertClose("Önceki YEKDEM Mahsup (veri yok→0)", b.yekFarkiCharge!, 0, 0.0001);
-  // 2G: BTV matrahı = Enerji + Tahmini YEKDEM − mahsuplaşma kredisi (btv_enabled=açık, rate %1).
-  // (2.492.001,33 + 878.740,90 − 1.360.228,47) × %1 ≈ 20.105,14 (Önceki YEKDEM Mahsup ve
-  // Muhtelif-2 dağıtım bileşeni matraha girmez).
-  assertClose("BTV (Enerji+YEKDEM−mahsup kredisi)", b.btvCharge, 20105.14, 1);
+  // 2G BTV matrahı = Enerji + Tahmini YEKDEM − mahsuplaşma kredisi. 2I ile kredi büyüdüğü için
+  // BTV düştü (20.105 → ~18.859) — yeni matrahın kolateral sonucu.
+  assertClose("BTV (Enerji+YEKDEM−mahsup kredisi)", b.btvCharge, 18858.9, 2);
 
-  // Mahsuplaşma override'ı (gerçek Trepaş faturasındaki 1,82375) → −1.484.851,44
+  // Override kaçış kapısı: girilince FORMÜLÜ ezer (davranış aynı). 1,82375 ≈ formülle (tesadüf).
   const bOv = calculateInvoiceMethod3(input, { mahsuplasma: { isExcluded: false, unitPriceOverride: 1.82375, amountOverride: null, payload: null, note: null } }, mi);
   assertClose("Muhtelif-2 kredisi (override 1,82375)", bOv.muhtelif2MahsupKredisi!, 1484851, 1);
+  // Override'ın formülü ezdiği NET görünsün: bariz farklı bir değer (2,5) → uygulanan = 2,5.
+  const bOv2 = calculateInvoiceMethod3(input, { mahsuplasma: { isExcluded: false, unitPriceOverride: 2.5, amountOverride: null, payload: null, note: null } }, mi);
+  assertClose("Override formülü ezer (birim=2,5)", bOv2.mahsuplasmaUnitPriceApplied!, 2.5, 0.0001);
 }
 
 // ── FIXTURE 2: Tesis 99980910 — Metod 2 (Uedaş), 2026-06 ─────────
@@ -461,6 +472,41 @@ console.log("\n── Sentetik · Metod 4 düz fatura (m1 vs m4) (2F) ──");
       `     (m1 dağıtım = ${money(m1.distributionCharge)}, m4 dağıtım = ${money(m4.distributionCharge)}, gn/2 kredisi = ${money(m1.distributionAdjustment)})`
     );
   }
+}
+
+// ── FIXTURE 9 (2H): Alternatif Terim dış-mahsup taşıma invaryantı ────────
+// Karş-olgusal (override'sız) toplam + ana faturanın yekFarki'sinin KDV'li katkısı,
+// override'lı (matrah-içi) toplamı BİREBİR üretir → post-total "TL taşıma" == matrah-içi;
+// çift sayım/yeni yuvarlama yok. 52503 gibi: doğal yekFarki 0, manuel override dolu (~1,1M).
+// Böylece (ana Ödenecek − alt Ödenecek) yalnız dağıtım+güç ekseninden gelir.
+console.log("\n── Sentetik · Alternatif Terim dış-mahsup taşıma (2H) ──");
+{
+  const miNone: InvoiceMethodInputs = {
+    sumCn: 2000, sumGn: 1000, sumPos: 1200, sumMahsup: 800, sumExcess: 0,
+    wPos: 1.5, kbk: 1.014, tahminiYekdem: 0.4,
+    prevSumPos: null, prevTahminiYekdem: null, prevGerceklesenYekdem: null,
+    mahsuplasmaUnitPrice: null,
+  };
+  const input: MethodInvoiceInput = baseInput({ onYil: false, perakendeEnerjiBedeli: 2.909687 });
+  const ovYek: InvoiceOverrides = {
+    yekdem_mahsup: {
+      isExcluded: false,
+      unitPriceOverride: null,
+      amountOverride: null,
+      payload: { total_kwh: 1540509, diff_yekdem: 0.703593 },
+      note: null,
+    },
+  };
+
+  const bMain = calculateInvoiceMethod3(input, ovYek, miNone); // matrah-içi yekFarki (override)
+  const bAlt = calculateInvoiceMethod3(input, null, miNone);   // override yok → yekFarki 0
+  const V = bMain.yekFarkiCharge!;
+  const carried = (V - (bAlt.yekFarkiCharge ?? 0)) * (1 + 0.2); // altVatRate = KDV %20
+
+  assertClose("Karş-olgusal kendi yekFarki'si (override yok→0)", bAlt.yekFarkiCharge ?? 0, 0, 0.0001);
+  assertClose("Ana yekFarki (override, matrah-içi)", V, 1099065.83, 1);
+  // İnvaryant: post-total taşıma, matrah-içi sonucu birebir üretir (delta = yekFarki×(1+KDV)).
+  assertClose("Taşınan yekFarki + karş-olgusal = ana toplam", bAlt.totalInvoice + carried, bMain.totalInvoice, 0.5);
 }
 
 console.log(

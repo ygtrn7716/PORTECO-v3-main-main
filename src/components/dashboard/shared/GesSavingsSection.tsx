@@ -3,6 +3,11 @@
 // GES Detay sayfasında "GES Olmasaydı Faturanız" kartı wrapper'ı.
 // EnergySoldCard ile paylaşılan tesis seçimine göre invoice_snapshots + yekdem + kbk
 // fetch eder ve calculateGesOlmasaydi çağırarak GesSavingsCard'ı besler.
+//
+// Dönem davranışı EnergySoldCard/InvoiceDetail ile ortak: snapshot varsa replay,
+// yoksa fetchBilledInvoiceInputs + buildBreakdownFromInputs canlı fallback'i —
+// "fatura kaydı henüz oluşturulmadı" boş hali yalnız hesap gerçekten
+// yapılamıyorsa (ok:false) görünür.
 
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
@@ -18,9 +23,17 @@ import {
   methodInputsFromSnapshotRow,
   recomputeSnapshotTotalWithMahsup,
 } from "@/components/utils/invoiceSnapshots";
-import { fetchInvoiceOverrides } from "@/components/utils/invoiceOverrides";
+import {
+  fetchBilledInvoiceInputs,
+  buildBreakdownFromInputs,
+} from "@/components/utils/billedInvoiceInputs";
+import {
+  fetchInvoiceOverrides,
+  resolveUnitPriceOverride,
+} from "@/components/utils/invoiceOverrides";
 import { coerceInvoiceMethodId } from "@/lib/invoiceMethods";
 import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
+import { deriveGesSatisMahsup } from "@/lib/ges/gesSatisMahsup";
 import { resolveGesSatisDagitimRate } from "@/lib/ges/gesSatisDagitimRate";
 import GesSavingsCard from "@/components/dashboard/shared/GesSavingsCard";
 
@@ -153,52 +166,10 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
           return;
         }
 
-        if (!snap) {
-          setError("Geçen ayın fatura kaydı henüz oluşturulmadı.");
-          setLoading(false);
-          return;
-        }
-
-        const kbk = Number(kbkRow.data?.kbk) || 1;
         const hasOwnPlants = (plantsRes.data?.length ?? 0) > 0;
-        const allocatedKwh =
-          snap.allocated_ges_kwh != null ? Number(snap.allocated_ges_kwh) : null;
-        const mode =
-          !hasOwnPlants && (allocatedKwh ?? 0) > 0 ? ("receiver" as const) : ("producer" as const);
 
-        // Kart 1/2 girdileri fatura sayfasıyla (InvoiceDetail/InvoiceSnapshotDetail)
-        // aynı kaynaktan: snapshot girdilerinden canlı recompute edilen breakdown.
-        let verisMahsupKwh = 0;
-        let satisKwh = 0;
-        let satisNetGelir = 0;
-        try {
-          const bd = buildSnapshotBreakdown(snap);
-          verisMahsupKwh = bd.verisMahsupKwh;
-          satisKwh = bd.verisFazlaKwh;
-          if (satisKwh > 0) {
-            const dagitimRate = await resolveGesSatisDagitimRate({
-              supabase,
-              userId,
-              subscriptionSerno,
-              storedRate: snap.ges_satis_dagitim_bedeli,
-              lisansliSatis: snap.lisansli_satis,
-            });
-            satisNetGelir = calculateGesUretimSatisi({
-              satisKwh,
-              onYil: snap.on_yil ?? false,
-              usdKur: Number(snap.usd_kur) || 0,
-              perakendeEnerjiBedeli: Number(snap.perakende_enerji_bedeli) || 0,
-              dagitimBedeli: dagitimRate,
-            }).satisNetGelir;
-          }
-        } catch {
-          // recompute başarısızsa (eksik eski snapshot) mahsup/satış alt bilgileri 0 kalır
-        }
-        if (cancel) return;
-
-        // Fatura kalem override'ları — YALNIZ Kart 1'in (Mevcut Faturanız)
-        // recompute'una geçirilir (fatura sayfasıyla birebir eşleşme korunur).
-        // GES karşı-olgu hesabı ve mahsup/satış kWh alanları doğal kalır.
+        // Fatura kalem override'ları — iki yolda da kullanılır. Fail-open:
+        // sayfa yalnız okur; hata durumunda doğal değerler gösterilir.
         const lineOverrides = await fetchInvoiceOverrides({
           userId,
           subscriptionSerno,
@@ -210,49 +181,167 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
         });
         if (cancel) return;
 
-        const res = await calculateGesOlmasaydi({
-          supabase,
-          userId,
-          subscriptionSerno,
-          periodYear,
-          periodMonth,
-          mode,
-          // Canlı okunur (snapshot kolonu gerekmez): fiziksel tesis özelliği;
-          // sonradan düzeltilirse karşı-olgusalın geriye dönük düzelmesi istenir.
-          anlikUretimKullanimi: (kbkRow.data as any)?.anlik_uretim_kullanimi ?? null,
-          // Kart 1 = fatura sayfasındaki Ödenecek Toplam ile birebir
-          // (canlı recompute + kalem override'ları; eski snapshot'larda stored total'a düşer).
-          mevcutFatura: recomputeSnapshotTotalWithMahsup(snap, lineOverrides ?? undefined),
-          mevcutBirimFiyat: Number(snap.unit_price_energy) || 0,
-          mevcutTuketimKwh: Number(snap.total_consumption_kwh) || 0,
-          verisMahsupKwh,
-          satisKwh,
-          satisNetGelir,
-          yekdemMahsup: Number(snap.yekdem_mahsup) || 0,
-          digerDegerler: Number(snap.diger_degerler) || 0,
-          allocatedKwh,
-          monthlyYekdem: yekdem,
-          kbk,
-          // Snapshot'a yazılan düzeltmeyi kullan → karşı-olgusal birim fiyat,
-          // mevcutBirimFiyat (snap.unit_price_energy) ile aynı bazda kalır.
-          unitPriceAdjustment: Number(snap.unit_price_adjustment) || 0,
-          unitPriceDistribution: Number(snap.unit_price_distribution) || 0,
-          btvRate: Number(snap.btv_rate) || 0,
-          vatRate: Number(snap.vat_rate) || 0,
-          tariffType: (snap.tariff_type as any) ?? "single",
-          contractPowerKw: Number(snap.contract_power_kw) || 0,
-          monthFinalDemandKw: Number(snap.month_final_demand_kw) || 0,
-          powerPrice: Number(snap.power_price) || 0,
-          powerExcessPrice: Number(snap.power_excess_price) || 0,
-          reactivePenaltyCharge: Number(snap.reactive_penalty_charge) || 0,
-          trafoDegeri: Number(snap.trafo_degeri) || 0,
-          onYil: snap.on_yil ?? undefined,
-          perakendeEnerjiBedeli: snap.perakende_enerji_bedeli ?? undefined,
-          // Metod snapshot'tan okunur (null = eski kayıt → metod 1).
-          invoiceMethodId: coerceInvoiceMethodId(snap.invoice_method),
-          // Metod 2/3: karşı-olgusalın önceki dönem YEKDEM alanları snapshot'tan.
-          methodInputs: methodInputsFromSnapshotRow(snap) ?? null,
-        });
+        let res: GesOlmasaydiResult | null;
+
+        if (snap) {
+          // ── SNAPSHOT YOLU (fatura snapshot replay'i — davranış değişmedi) ──
+          const kbk = Number(kbkRow.data?.kbk) || 1;
+          const allocatedKwh =
+            snap.allocated_ges_kwh != null ? Number(snap.allocated_ges_kwh) : null;
+          const mode =
+            !hasOwnPlants && (allocatedKwh ?? 0) > 0 ? ("receiver" as const) : ("producer" as const);
+
+          // Kart 1/2 girdileri fatura sayfasıyla (InvoiceDetail/InvoiceSnapshotDetail)
+          // aynı kaynaktan: snapshot girdilerinden canlı recompute edilen breakdown.
+          let verisMahsupKwh = 0;
+          let satisKwh = 0;
+          let satisNetGelir = 0;
+          try {
+            const bd = buildSnapshotBreakdown(snap);
+            verisMahsupKwh = bd.verisMahsupKwh;
+            satisKwh = bd.verisFazlaKwh;
+            if (satisKwh > 0) {
+              const dagitimRate = await resolveGesSatisDagitimRate({
+                supabase,
+                userId,
+                subscriptionSerno,
+                storedRate: snap.ges_satis_dagitim_bedeli,
+                lisansliSatis: snap.lisansli_satis,
+              });
+              satisNetGelir = calculateGesUretimSatisi({
+                satisKwh,
+                onYil: snap.on_yil ?? false,
+                usdKur: Number(snap.usd_kur) || 0,
+                perakendeEnerjiBedeli: Number(snap.perakende_enerji_bedeli) || 0,
+                dagitimBedeli: dagitimRate,
+              }).satisNetGelir;
+            }
+          } catch {
+            // recompute başarısızsa (eksik eski snapshot) mahsup/satış alt bilgileri 0 kalır
+          }
+          if (cancel) return;
+
+          res = await calculateGesOlmasaydi({
+            supabase,
+            userId,
+            subscriptionSerno,
+            periodYear,
+            periodMonth,
+            mode,
+            // Canlı okunur (snapshot kolonu gerekmez): fiziksel tesis özelliği;
+            // sonradan düzeltilirse karşı-olgusalın geriye dönük düzelmesi istenir.
+            anlikUretimKullanimi: (kbkRow.data as any)?.anlik_uretim_kullanimi ?? null,
+            // Kart 1 = fatura sayfasındaki Ödenecek Toplam ile birebir
+            // (canlı recompute + kalem override'ları; eski snapshot'larda stored total'a düşer).
+            mevcutFatura: recomputeSnapshotTotalWithMahsup(snap, lineOverrides ?? undefined),
+            mevcutBirimFiyat: Number(snap.unit_price_energy) || 0,
+            mevcutTuketimKwh: Number(snap.total_consumption_kwh) || 0,
+            verisMahsupKwh,
+            satisKwh,
+            satisNetGelir,
+            yekdemMahsup: Number(snap.yekdem_mahsup) || 0,
+            digerDegerler: Number(snap.diger_degerler) || 0,
+            allocatedKwh,
+            monthlyYekdem: yekdem,
+            kbk,
+            // Snapshot'a yazılan düzeltmeyi kullan → karşı-olgusal birim fiyat,
+            // mevcutBirimFiyat (snap.unit_price_energy) ile aynı bazda kalır.
+            unitPriceAdjustment: Number(snap.unit_price_adjustment) || 0,
+            unitPriceDistribution: Number(snap.unit_price_distribution) || 0,
+            btvRate: Number(snap.btv_rate) || 0,
+            vatRate: Number(snap.vat_rate) || 0,
+            tariffType: (snap.tariff_type as any) ?? "single",
+            contractPowerKw: Number(snap.contract_power_kw) || 0,
+            monthFinalDemandKw: Number(snap.month_final_demand_kw) || 0,
+            powerPrice: Number(snap.power_price) || 0,
+            powerExcessPrice: Number(snap.power_excess_price) || 0,
+            reactivePenaltyCharge: Number(snap.reactive_penalty_charge) || 0,
+            trafoDegeri: Number(snap.trafo_degeri) || 0,
+            onYil: snap.on_yil ?? undefined,
+            perakendeEnerjiBedeli: snap.perakende_enerji_bedeli ?? undefined,
+            // Metod snapshot'tan okunur (null = eski kayıt → metod 1).
+            invoiceMethodId: coerceInvoiceMethodId(snap.invoice_method),
+            // Metod 2/3: karşı-olgusalın önceki dönem YEKDEM alanları snapshot'tan.
+            methodInputs: methodInputsFromSnapshotRow(snap) ?? null,
+          });
+        } else {
+          // ── CANLI FALLBACK (snapshot yok — fatura sayfasının canlı pipeline'ı) ──
+          const live = await fetchBilledInvoiceInputs({
+            supabase,
+            userId,
+            subscriptionSerno,
+            periodYear,
+            periodMonth,
+            methodContext: "self",
+          });
+          if (cancel) return;
+          if (!live.ok) {
+            setError(live.reason);
+            setLoading(false);
+            return;
+          }
+          const inputs = live.inputs;
+          const built = buildBreakdownFromInputs(inputs, lineOverrides ?? undefined);
+          const effUnitPriceEnergy = resolveUnitPriceOverride(
+            inputs.unitPriceEnergy,
+            lineOverrides?.enerji
+          );
+
+          // Mahsup/satış ayrımı fatura sayfasıyla ortak türeticiden (Metod 4
+          // satış kuralı dahil — snapshot yolundaki verisFazlaKwh kısıtı yok).
+          const derived = deriveGesSatisMahsup({
+            invoiceMethodId: inputs.invoiceMethodId,
+            breakdown: built.breakdown,
+            totalProductionKwh: inputs.totalProductionKwh,
+            lisansliSatis: inputs.lisansliSatis,
+            onYil: inputs.onYil,
+            usdKur: inputs.usdKur,
+            perakendeEnerjiBedeli: inputs.perakendeEnerjiBedeli,
+            dagitimBedeli: inputs.dagitimUreticiBedeli,
+            unitPriceEnergy: effUnitPriceEnergy,
+          });
+
+          const allocatedKwh = inputs.allocatedGesKwh;
+          const mode =
+            !hasOwnPlants && (allocatedKwh ?? 0) > 0 ? ("receiver" as const) : ("producer" as const);
+
+          res = await calculateGesOlmasaydi({
+            supabase,
+            userId,
+            subscriptionSerno,
+            periodYear,
+            periodMonth,
+            mode,
+            anlikUretimKullanimi: (kbkRow.data as any)?.anlik_uretim_kullanimi ?? null,
+            // Kart 1 = fatura sayfasının canlı "Ödenecek Toplam"ı ile birebir.
+            mevcutFatura: built.totalWithMahsup,
+            mevcutBirimFiyat: effUnitPriceEnergy,
+            mevcutTuketimKwh: inputs.totalConsumptionKwh,
+            verisMahsupKwh: derived.mahsupKwh,
+            satisKwh: derived.satisKwh,
+            satisNetGelir: derived.satis?.satisNetGelir ?? 0,
+            yekdemMahsup: built.yekdemMahsup,
+            digerDegerler: inputs.digerDegerler,
+            allocatedKwh,
+            monthlyYekdem: inputs.monthlyYekdem,
+            kbk: inputs.kbk,
+            unitPriceAdjustment: inputs.unitPriceAdjustment,
+            unitPriceDistribution: inputs.unitPriceDistribution,
+            btvRate: inputs.btvRate,
+            vatRate: inputs.vatRate,
+            tariffType: inputs.tariffType,
+            contractPowerKw: inputs.contractPowerKw,
+            monthFinalDemandKw: inputs.monthFinalDemandKw,
+            powerPrice: inputs.powerPrice,
+            powerExcessPrice: inputs.powerExcessPrice,
+            reactivePenaltyCharge: built.reactivePenaltyCharge,
+            trafoDegeri: inputs.trafoDegeri,
+            onYil: inputs.onYil,
+            perakendeEnerjiBedeli: inputs.perakendeEnerjiBedeli,
+            invoiceMethodId: inputs.invoiceMethodId,
+            methodInputs: inputs.methodInputs,
+          });
+        }
 
         if (cancel) return;
         if (!res) {

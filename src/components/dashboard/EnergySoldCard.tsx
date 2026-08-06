@@ -1,32 +1,49 @@
 // src/components/dashboard/EnergySoldCard.tsx
 //
-// Geçen ay için "Mahsup Edilen Enerji Bedeli" (sol) + "Devlete Satılan Enerji Bedeli" (sağ)
-// iki kartlı görünüm.
+// Geçen ay için "Mahsup Edilen Enerji Bedeli" (sol) + "Devlete Satılan Enerji
+// Bedeli" (sağ) + "Yıllık Satış Hakkı" üç kartlı görünüm.
 //
-// Sol kart (mahsup): fatura ile birebir tutması için invoice_snapshots'tan
-//   unit_price_energy + veris_kwh + total_consumption_kwh okur; mahsupKwh
-//   client'ta min(cekis, veris) ile hesaplanır. Snapshot yoksa empty state.
-// Sağ kart (satış): brüt gelir = satisKwh × perakende_enerji_bedeli (on_yil farketmez).
-//   Saat-bazlı PTF mantığı kaldırıldı. Tüm satış kWh'ı, tesisin terim/gerilim/tarife
-//   eşleşmesindeki perakende enerji bedeliyle çarpılır.
-//   Dağıtım kesintisi on_yil flag'ine göre sabit oranla uygulanır:
-//     on_yil = true  → 1,575810 TL/kWh (10 yıl üstü)
-//     on_yil = false → 0,496738 TL/kWh (10 yıl altı)
-//   Kaynak tablolar: consumption_hourly (gn, cn), subscription_settings (tarife, on_yil),
-//   distribution_tariff_official (perakende_enerji_bedeli).
+// TEK KAYNAK: mahsup/satış ayrımı fatura motorundan gelir — ayrı paralel hesap
+// YOKTUR. Akış fatura sayfası (InvoiceDetail) ile birebir aynı:
+//   • Snapshot varsa → buildSnapshotBreakdown replay'i
+//     (/dashboard/invoices/:sub/:year/:month sayfasıyla aynı).
+//   • Snapshot yoksa → fetchBilledInvoiceInputs + buildBreakdownFromInputs
+//     canlı hesabı (fatura sayfasının pipeline'ının yazma yapmayan kopyası;
+//     talep birleştirme, metot 1-4, override'lar dahil). "Fatura dönemi
+//     kapanmamış" boş hali YOK.
+//   • İki yol da deriveGesSatisMahsup'a akar: metod-bazlı mahsup sunumu ve
+//     Metod 4 satış kuralı (satış = toplam üretim) fatura sayfasıyla ortak.
+// Bu bileşen HİÇBİR ŞEY YAZMAZ (snapshot upsert'i yalnız fatura sayfasında).
 
 import { useEffect, useState } from "react";
 import { useSession } from "@/hooks/useSession";
 import { supabase } from "@/lib/supabase";
 import { dayjsTR } from "@/lib/dayjs";
-import { fetchAllConsumption } from "@/lib/paginatedFetch";
-import { getInvoiceSnapshot } from "@/components/utils/invoiceSnapshots";
 import {
-  getFacilityAllocation,
-  applyAllocationToHourlyRows,
-} from "@/components/utils/gesAllocation";
+  getInvoiceSnapshot,
+  buildSnapshotBreakdown,
+} from "@/components/utils/invoiceSnapshots";
+import {
+  fetchBilledInvoiceInputs,
+  buildBreakdownFromInputs,
+} from "@/components/utils/billedInvoiceInputs";
+import {
+  fetchInvoiceOverrides,
+  resolveUnitPriceOverride,
+  type InvoiceOverrides,
+} from "@/components/utils/invoiceOverrides";
+import { getFacilityAllocation } from "@/components/utils/gesAllocation";
+import { coerceInvoiceMethodId } from "@/lib/invoiceMethods";
+import {
+  deriveGesSatisMahsup,
+  type GesSatisMahsupResult,
+} from "@/lib/ges/gesSatisMahsup";
+import { resolveGesSatisDagitimRate } from "@/lib/ges/gesSatisDagitimRate";
 import { calcYearlySatisHakkiUsage } from "@/components/utils/yearlySatisHakki";
-import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
+import { GesUretimSatisiBody } from "@/components/dashboard/shared/GesUretimSatisiCard";
+import TalepBirlestirmeBanner, {
+  type GesAllocSummary,
+} from "@/components/dashboard/shared/TalepBirlestirmeBanner";
 
 type OsosSub = {
   subscription_serno: number;
@@ -36,26 +53,17 @@ type OsosSub = {
 
 type CalcResult = {
   donem: string;
-  toplamVerisKwh: number;
-  toplamCekisKwh: number;
-  mahsupKwh: number;
-  satisKwh: number;
-  // Sol kart (mahsup) — snapshot'tan
-  hasSnapshot: boolean;
-  unitPriceEnergy: number;   // snapshot.unit_price_energy [TL/kWh]
-  mahsupTutari: number;      // TL
-  // Sağ kart (satış) — hourly hesap
-  satisBrutGelir: number;    // TL
-  satisDagitimKesintisi: number; // TL
-  satisNetGelir: number;     // TL
-  dagitimBedeli: number;     // TL/kWh — lisansli_satis'e göre tarife satırından
-  onYil: boolean;            // satış birim fiyatı (USD/perakende) için
-  lisansliSatis: boolean;    // dağıtım kesintisi tarifesi seçimi (açıklama metni için)
-  // Brüt gelirde kullanılan birim fiyat ve mod (USD vs perakende)
-  satisBrutBirim: number;    // TL/kWh — gerçekten uygulanan birim fiyat
-  satisModu: "usd" | "perakende";
-  satisUsdKur: number;       // 0 = USD modu kullanılmadı
-  perakendeRate: number;     // TL/kWh — perakende_enerji_bedeli (her durumda gösterilir)
+  /** Rakamların kaynağı: fatura snapshot replay'i mi, canlı fatura hesabı mı. */
+  source: "snapshot" | "live";
+  /** Metod-bazlı mahsup/satış ayrımı (fatura sayfasıyla ortak türetici).
+   *  null → hesap yapılamadı; liveReason nedeni taşır. */
+  derived: GesSatisMahsupResult | null;
+  /** Canlı hesap yapılamadığında sebep (billedInvoiceInputs ok:false mesajı). */
+  liveReason: string | null;
+  lisansliSatis: boolean;
+  onYil: boolean;
+  /** Talep Birleştirme rolü — fatura sayfasındaki banner ile aynı eşleme. */
+  alloc: GesAllocSummary | null;
   // Yıllık satış hakkı (subscription_settings.satis_hakki) — takvim yılı kümülatifi
   yillikMaxSatisKwh: number | null;     // null = admin tanımlamamış
   yillikKullanilanKwh: number;          // 1 Oca → bugün arası ay-bazlı satış toplamı
@@ -67,16 +75,6 @@ const MONTH_NAMES = [
   "Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
   "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık",
 ];
-
-// Dağıtım kesintisi tarifesi distribution_tariff_official tablosundan okunur:
-//   lisansli_satis = true  → dagitim_uretici_1 (lisanslı satış üretici)
-//   lisansli_satis = false → dagitim_uretici_2 (lisanslı olmayan üretici)
-// on_yil bu seçimi etkilemez; sadece satış birim fiyatı kuralını yönetir.
-
-// 10 yıl üstü tesislerin veriş fazlası satış birim fiyatı (USD/kWh) ve net gelir
-// hesabı artık ortak yardımcıda: src/lib/ges/gesUretimSatisi.ts
-//   Brüt gelir = satisKwh × 0.133 × usd_kur (TL/USD); usd_kur tanımsız/0 ise
-//   perakende_enerji_bedeli fallback. Net gelir = brüt − dağıtım kesintisi.
 
 const fmtKwh = (n: number) =>
   n.toLocaleString("tr-TR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -159,7 +157,7 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
     return () => { cancel = true; };
   }, [uid, sessionLoading]);
 
-  // 2) Hesaplama
+  // 2) Hesaplama — snapshot-first, canlı fallback
   useEffect(() => {
     if (!uid || selectedSerno == null) {
       setResult(null);
@@ -173,193 +171,164 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
       setResult(null);
 
       try {
+        // Dönem = geçen ay (fatura sayfasıyla aynı sabit dönem davranışı).
+        // Aralık konvansiyonu ay başı → sonraki ay başı (exclusive) —
+        // fetchBilledInvoiceInputs / InvoiceDetail ile aynı; tahsis cache'i paylaşılır.
         const prevMonth = dayjsTR().subtract(1, "month");
-        const startIso = prevMonth.startOf("month").toISOString();
-        const endIso = prevMonth.endOf("month").toISOString();
+        const monthStart = prevMonth.startOf("month");
+        const monthEndExclusive = monthStart.clone().add(1, "month");
+        const startIso = monthStart.toDate().toISOString();
+        const endIso = monthEndExclusive.toDate().toISOString();
         const donem = `${MONTH_NAMES[prevMonth.month()]} ${prevMonth.year()}`;
-        const prevYear = prevMonth.year();
-        const prevMonthNum = prevMonth.month() + 1;
+        const periodYear = prevMonth.year();
+        const periodMonth = prevMonth.month() + 1;
 
-        // Paralel fetch:
-        //   1) Geçen ay tüketim (sağ kart cn/gn toplama)
-        //   2) Settings (tarife/on_yil + satis_hakki) — yıllık satış hakkı dahil
-        //   3) Geçen ay snapshot (sol kart)
-        // PTF artık kullanılmıyor — brüt gelir saat-bazlı PTF değil, sabit perakende.
-        // Not: ges_satis_hakki tablosu legacy; satis_hakki artık subscription_settings'te.
-        // Yıllık satış hakkı kümülatifi calcYearlySatisHakkiUsage ile ayrı hesaplanır.
-        const [
-          hourlyRes,
-          settingsRes,
-          snapshotData,
-        ] = await Promise.all([
-          fetchAllConsumption({
-            supabase,
+        // 2a) Fatura kalem override'ları — fail-closed (InvoiceDetail ile aynı):
+        // override'sız doğal rakamları override'lı faturanın yanına asla koyma.
+        let overrides: InvoiceOverrides | null;
+        try {
+          overrides = await fetchInvoiceOverrides({
             userId: uid,
             subscriptionSerno: selectedSerno,
-            columns: "ts, gn, cn",
-            startIso,
-            endIso,
-            endInclusive: true,
-          }),
-          supabase
-            .from("subscription_settings")
-            .select("terim, gerilim, tarife, on_yil, lisansli_satis, satis_hakki")
-            .eq("user_id", uid)
-            .eq("subscription_serno", selectedSerno)
-            .maybeSingle(),
+            periodYear,
+            periodMonth,
+          });
+        } catch (e) {
+          console.error("invoice overrides load error (energy sold):", e);
+          if (!cancel) {
+            setError("Fatura düzeltmeleri yüklenemedi.");
+            setLoading(false);
+          }
+          return;
+        }
+        if (cancel) return;
+
+        // 2b) Paralel: snapshot + yıllık hak limiti + Talep Birleştirme görünümü
+        const [snap, settingsRes, allocView] = await Promise.all([
           getInvoiceSnapshot({
             userId: uid,
             subscriptionSerno: selectedSerno,
-            periodYear: prevYear,
-            periodMonth: prevMonthNum,
+            periodYear,
+            periodMonth,
             invoiceType: "billed",
           }).catch(() => null),
-        ]);
-
-        if (cancel) return;
-
-        if (hourlyRes.error) {
-          setError("Veriş verileri yüklenemedi.");
-          setLoading(false);
-          return;
-        }
-
-        const hourlyData = hourlyRes.data ?? [];
-
-        // Saat bazında: toplam çekiş + veriş + saatlik net fazla veriş.
-        let toplamVerisKwh = 0;
-        let toplamCekisKwh = 0;
-        let netExcessFeedKwh = 0; // Σ max(0, gn − cn)
-        for (const hour of hourlyData) {
-          const cnH = Number((hour as any).cn) || 0;
-          const gnH = Number(hour.gn) || 0;
-          toplamCekisKwh += cnH;
-          toplamVerisKwh += gnH;
-          netExcessFeedKwh += Math.max(0, gnH - cnH);
-        }
-
-        // Talep Birleştirme: tahsis/kaynak rolü varsa efektif değerler —
-        // kaynak sayaçta veriş 0 sayılır (kart gizlenir); p1'de satış = havuz
-        // artığı; p2+ tesiste satış 0 (fatura ile birebir).
-        const allocView = await getFacilityAllocation({
-          supabase,
-          userId: uid,
-          subscriptionSerno: selectedSerno,
-          startIso,
-          endIso,
-          endInclusive: true,
-        });
-        if (cancel) return;
-        if (allocView) {
-          const eff = applyAllocationToHourlyRows(hourlyData, allocView);
-          toplamVerisKwh = eff.totalGn;
-          netExcessFeedKwh = eff.netExcessFeedKwh;
-        }
-
-        // Üretimi/tahsisi olmayan tesis (efektif veriş = 0): satış/mahsup yok → gizle.
-        // Not: saatlik satır hiç olmasa bile p1 tesise havuz artığı yazılabilir;
-        // bu yüzden boş-veri kontrolü de bu efektif değer üzerinden yapılır.
-        if (!(toplamVerisKwh > 0)) {
-          setError("Seçilen tesiste geçen ay veriş kaydı bulunamadı.");
-          setLoading(false);
-          return;
-        }
-
-        // Sağ kart için satış kWh = SAATLİK net fazla veriş (Σ max(0, gn−cn)) —
-        // üretimi olan HER tesiste (net üretici + net tüketici) fatura ile birebir.
-        const satisKwh = netExcessFeedKwh;
-
-        // Sol kart (mahsup) = SAAT-İÇİ öz-tüketim Σ min(cn,gn) = toplam veriş − net fazla veriş.
-        // Fatura'nın verisMahsupKwh'ı ile birebir (aynı consumption_hourly + aynı saatlik netleme;
-        // aylık min(veriş,çekiş) DEĞİL). Enerji birim fiyatı (TL tutarı için) snapshot'tan; snapshot
-        // yoksa sol kart boş kalır.
-        const mahsupKwh = Math.max(0, toplamVerisKwh - netExcessFeedKwh);
-        let hasSnapshot = false;
-        let unitPriceEnergy = 0;
-        let mahsupTutari = 0;
-        if (snapshotData) {
-          hasSnapshot = true;
-          unitPriceEnergy = Number(snapshotData.unit_price_energy) || 0;
-          mahsupTutari = mahsupKwh * unitPriceEnergy;
-        }
-
-        // Sağ kart: satış hesabı.
-        //
-        // BRÜT GELIR (iki mod — on_yil belirler):
-        //   • on_yil = true  ve  subscription_yekdem.usd_kur > 0 →
-        //     satisBrutGelir = satisKwh × 0.133 × usd_kur     (USD bazlı)
-        //   • aksi halde (10 yıl altı VEYA usd_kur tanımsız) →
-        //     satisBrutGelir = satisKwh × perakende_enerji_bedeli   (TL fallback)
-        //
-        // DAĞITIM KESİNTİSİ (lisansli_satis belirler — tarife satırından okunur):
-        //   lisansli_satis = true  → dagitim_uretici_1 (lisanslı satış üretici)
-        //   lisansli_satis = false → dagitim_uretici_2 (lisanslı olmayan üretici)
-        // on_yil dağıtım kesintisini ETKİLEMEZ.
-        const onYil = (settingsRes.data as any)?.on_yil ?? false;
-        const lisansliSatis = (settingsRes.data as any)?.lisansli_satis ?? false;
-        let dagitimBedeli = 0;
-        let perakendeRate = 0;
-        if (settingsRes.data) {
-          const { data: tariff } = await supabase
-            .from("distribution_tariff_official")
-            .select("perakende_enerji_bedeli, dagitim_uretici_1, dagitim_uretici_2")
-            .eq("terim", settingsRes.data.terim)
-            .eq("gerilim", settingsRes.data.gerilim)
-            .eq("tarife", settingsRes.data.tarife)
-            .maybeSingle();
-          if (cancel) return;
-          perakendeRate = Number(tariff?.perakende_enerji_bedeli) || 0;
-          dagitimBedeli = lisansliSatis
-            ? Number(tariff?.dagitim_uretici_1) || 0
-            : Number(tariff?.dagitim_uretici_2) || 0;
-        }
-
-        // USD kur (subscription_yekdem.usd_kur) — geçen ay için
-        let satisUsdKur = 0;
-        if (onYil) {
-          // primary: period_year/period_month
-          const yek1 = await supabase
-            .from("subscription_yekdem")
-            .select("usd_kur")
+          supabase
+            .from("subscription_settings")
+            .select("satis_hakki")
             .eq("user_id", uid)
             .eq("subscription_serno", selectedSerno)
-            .eq("period_year", prevYear)
-            .eq("period_month", prevMonthNum)
-            .maybeSingle();
+            .maybeSingle(),
+          getFacilityAllocation({
+            supabase,
+            userId: uid,
+            subscriptionSerno: selectedSerno,
+            startIso,
+            endIso,
+          }).catch(() => null),
+        ]);
+        if (cancel) return;
 
-          if (!yek1.error && yek1.data?.usd_kur != null) {
-            satisUsdKur = Number(yek1.data.usd_kur) || 0;
-          } else if (yek1.error && /period_year|period_month/.test(String(yek1.error.message))) {
-            // legacy year/month fallback
-            const yek2 = await supabase
-              .from("subscription_yekdem")
-              .select("usd_kur")
-              .eq("user_id", uid)
-              .eq("subscription_serno", selectedSerno)
-              .eq("year", prevYear)
-              .eq("month", prevMonthNum)
-              .maybeSingle();
-            if (!yek2.error && yek2.data?.usd_kur != null) {
-              satisUsdKur = Number(yek2.data.usd_kur) || 0;
-            }
+        // 2c) Breakdown: snapshot replay → olmazsa canlı fatura hesabı
+        let derived: GesSatisMahsupResult | null = null;
+        let liveReason: string | null = null;
+        let source: CalcResult["source"] = "snapshot";
+        let lisansliSatis = false;
+        let onYil = false;
+        let snapshotOk = false;
+
+        if (snap) {
+          try {
+            // InvoiceSnapshotDetail ile aynı replay: saklı girdiler + override'lar.
+            const breakdown = buildSnapshotBreakdown(snap, overrides ?? undefined);
+            const methodId = coerceInvoiceMethodId(snap.invoice_method);
+            const dagitimRate = await resolveGesSatisDagitimRate({
+              supabase,
+              userId: uid,
+              subscriptionSerno: selectedSerno,
+              storedRate: snap.ges_satis_dagitim_bedeli,
+              lisansliSatis: snap.lisansli_satis,
+            });
+            if (cancel) return;
+            lisansliSatis = snap.lisansli_satis ?? false;
+            onYil = snap.on_yil ?? false;
+            derived = deriveGesSatisMahsup({
+              invoiceMethodId: methodId,
+              breakdown,
+              totalProductionKwh: Number(snap.total_production_kwh ?? 0),
+              lisansliSatis,
+              onYil,
+              usdKur: Number(snap.usd_kur ?? 0),
+              perakendeEnerjiBedeli: Number(snap.perakende_enerji_bedeli ?? 0),
+              dagitimBedeli: dagitimRate,
+              // Snapshot efektif fiyatı zaten taşır; override idempotent uygulanır.
+              unitPriceEnergy: resolveUnitPriceOverride(
+                Number(snap.unit_price_energy ?? 0),
+                overrides?.enerji
+              ),
+            });
+            snapshotOk = true;
+          } catch (e) {
+            // Replay edilemeyen (çok eski/eksik) snapshot → canlı yola düş.
+            console.error("snapshot breakdown replay error (energy sold):", e);
           }
         }
 
-        // Satış hesabı tek kaynaktan (fatura görünümleriyle birebir aynı formül).
-        const satis = calculateGesUretimSatisi({
-          satisKwh,
-          onYil,
-          usdKur: satisUsdKur,
-          perakendeEnerjiBedeli: perakendeRate,
-          dagitimBedeli,
-        });
-        const {
-          satisModu,
-          satisBrutBirim,
-          satisBrutGelir,
-          satisDagitimKesintisi,
-          satisNetGelir,
-        } = satis;
+        if (!snapshotOk) {
+          source = "live";
+          const res = await fetchBilledInvoiceInputs({
+            supabase,
+            userId: uid,
+            subscriptionSerno: selectedSerno,
+            periodYear,
+            periodMonth,
+            methodContext: "self",
+          });
+          if (cancel) return;
+          if (!res.ok) {
+            liveReason = res.reason;
+          } else {
+            const { breakdown } = buildBreakdownFromInputs(
+              res.inputs,
+              overrides ?? undefined
+            );
+            lisansliSatis = res.inputs.lisansliSatis;
+            onYil = res.inputs.onYil;
+            derived = deriveGesSatisMahsup({
+              invoiceMethodId: res.inputs.invoiceMethodId,
+              breakdown,
+              totalProductionKwh: res.inputs.totalProductionKwh,
+              lisansliSatis,
+              onYil,
+              usdKur: res.inputs.usdKur,
+              perakendeEnerjiBedeli: res.inputs.perakendeEnerjiBedeli,
+              dagitimBedeli: res.inputs.dagitimUreticiBedeli,
+              unitPriceEnergy: resolveUnitPriceOverride(
+                res.inputs.unitPriceEnergy,
+                overrides?.enerji
+              ),
+            });
+          }
+        }
+        if (cancel) return;
+
+        // 2d) Talep Birleştirme banner özeti — InvoiceDetail'in gesAlloc eşlemesiyle aynı.
+        let alloc: GesAllocSummary | null = null;
+        if (allocView) {
+          if (allocView.role === "assigned") {
+            const allocatedKwh =
+              snapshotOk && snap?.allocated_ges_kwh != null
+                ? Number(snap.allocated_ges_kwh)
+                : allocView.allocTotal;
+            alloc = {
+              role: "assigned",
+              priority: allocView.priority,
+              allocatedKwh,
+              isSource: allocView.isSource,
+            };
+          } else {
+            alloc = { role: "source" };
+          }
+        }
 
         // ── Yıllık Satış Hakkı (subscription_settings.satis_hakki) ──────────
         // Cari takvim yılındaki kümülatif satış kWh'ı: sadece devlete satılan
@@ -394,30 +363,19 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
         if (cancel) return;
         setResult({
           donem,
-          toplamVerisKwh,
-          toplamCekisKwh,
-          mahsupKwh,
-          satisKwh,
-          hasSnapshot,
-          unitPriceEnergy,
-          mahsupTutari,
-          satisBrutGelir,
-          satisDagitimKesintisi,
-          satisNetGelir,
-          dagitimBedeli,
-          onYil,
+          source,
+          derived,
+          liveReason,
           lisansliSatis,
-          satisBrutBirim,
-          satisModu,
-          satisUsdKur,
-          perakendeRate,
+          onYil,
+          alloc,
           yillikMaxSatisKwh,
           yillikKullanilanKwh,
           yillikKalanKwh,
           yillikKullanimYuzde,
         });
-      } catch {
-        if (!cancel) setError("Hesaplama sırasında bir hata oluştu.");
+      } catch (e: any) {
+        if (!cancel) setError(e?.message || "Hesaplama sırasında bir hata oluştu.");
       } finally {
         if (!cancel) setLoading(false);
       }
@@ -425,6 +383,17 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
 
     return () => { cancel = true; };
   }, [uid, selectedSerno]);
+
+  const derived = result?.derived ?? null;
+
+  // Satış kartı boş-durum metni — nedene göre (Metod 4'te "mahsup edildi" deme).
+  const satisBosMesaj = !derived
+    ? null
+    : derived.mahsup.kind === "none" && derived.mahsup.reason === "method4"
+    ? "Geçen ay üretim kaydı bulunamadı."
+    : derived.mahsupKwh > 0
+    ? "Geçen ay veriş tamamen mahsup edildi, devlete satılan fazla enerji yok."
+    : "Geçen ay veriş kaydı bulunamadı.";
 
   return (
     <div>
@@ -462,17 +431,34 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
         </div>
       )}
 
-      {/* Hata (veriş yoksa) */}
+      {/* Hata */}
       {!loading && error && selectedSerno != null && (
         <p className="text-sm text-neutral-500 text-center py-8">
           {error}
         </p>
       )}
 
-      {/* Sonuçlar — iki kart */}
+      {/* Sonuçlar — üç kart */}
       {!loading && result && (
         <div>
-          <p className="text-xs text-neutral-500 mb-3">{result.donem}</p>
+          <p className="text-xs text-neutral-500 mb-3">
+            {result.donem}
+            {result.source === "live" && derived && (
+              <span className="ml-2 text-neutral-400">
+                — canlı hesap, fatura sayfasıyla aynı yöntemle
+              </span>
+            )}
+          </p>
+
+          {/* Talep Birleştirme bilgi notu — fatura sayfasıyla ortak bileşen */}
+          {derived && (
+            <div className="mb-4">
+              <TalepBirlestirmeBanner
+                alloc={result.alloc}
+                invoiceMethodId={derived.invoiceMethodId}
+              />
+            </div>
+          )}
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {/* SOL: Mahsup Edilen Enerji Bedeli */}
@@ -481,27 +467,99 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
                 Mahsup Edilen Enerji Bedeli
               </h3>
               <p className="text-xs text-neutral-500 mt-0.5 mb-4">
-                Geçen ay faturanıza yansıyan mahsup tutarı
+                Geçen ay faturanıza yansıyan mahsup
               </p>
 
-              {!result.hasSnapshot ? (
+              {!derived ? (
                 <p className="text-sm text-neutral-500 py-6 text-center">
-                  Fatura dönemi henüz kapanmamış.
+                  {result.liveReason ?? "Bu dönem için hesap yapılamadı."}
                 </p>
+              ) : derived.mahsup.kind === "none" ? (
+                <p className="text-sm text-neutral-500 py-6 text-center">
+                  {derived.mahsup.reason === "method4"
+                    ? "Bu tesisin fatura metodunda mahsuplaşma uygulanmaz; tüm üretim satış olarak değerlendirilir."
+                    : derived.mahsup.reason === "lisansli"
+                    ? "Lisanslı satış tesisi: mahsuplaşma uygulanmaz; tüm veriş satılır."
+                    : "Bu dönem mahsup edilen veriş yok."}
+                </p>
+              ) : derived.mahsup.kind === "implicit-net" ? (
+                <>
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-neutral-600">Mahsup Edilen Veriş</span>
+                      <span className="text-sm font-medium text-emerald-700">
+                        {fmtKwh(derived.mahsup.kwh)} kWh
+                      </span>
+                    </div>
+                  </div>
+                  <p className="mt-4 text-xs text-neutral-400">
+                    Metot 2: mahsup faturada ayrı satır değil — enerji bedeli saatlik
+                    mahsup sonrası net tüketim üzerinden hesaplanır.
+                  </p>
+                </>
+              ) : derived.mahsup.kind === "muhtelif2" ? (
+                <>
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-neutral-600">Mahsup Edilen Veriş</span>
+                      <span className="text-sm font-medium text-emerald-700">
+                        {fmtKwh(derived.mahsup.kwh)} kWh
+                      </span>
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-neutral-600">Mahsuplaşma Birim Fiyatı</span>
+                      <span className="text-sm font-medium text-neutral-700">
+                        {fmtUnit(derived.mahsup.unitPrice)} TL/kWh
+                      </span>
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-neutral-600">Mahsuplaşma Kredisi</span>
+                      <span className="text-sm font-medium text-emerald-700">
+                        −{fmtTL(derived.mahsup.kredi)} TL
+                      </span>
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-neutral-600">Dağıtım Bileşeni</span>
+                      <span className="text-sm font-medium text-neutral-700">
+                        +{fmtTL(derived.mahsup.dagitim)} TL
+                      </span>
+                    </div>
+
+                    <div className="border-t border-emerald-200/70 my-2" />
+
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-semibold text-neutral-800">Muhtelif-2 Net</span>
+                      <span
+                        className={`text-lg font-bold ${
+                          derived.mahsup.net <= 0 ? "text-emerald-700" : "text-red-600"
+                        }`}
+                      >
+                        {fmtTL(derived.mahsup.net)} TL
+                      </span>
+                    </div>
+                  </div>
+
+                  <p className="mt-4 text-xs text-neutral-400">
+                    Faturanızdaki "Muhtelif-2" kalemiyle birebir aynı değerler.
+                  </p>
+                </>
               ) : (
                 <>
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
                       <span className="text-sm text-neutral-600">Mahsup Edilen Veriş</span>
                       <span className="text-sm font-medium text-emerald-700">
-                        {fmtKwh(result.mahsupKwh)} kWh
+                        {fmtKwh(derived.mahsup.kwh)} kWh
                       </span>
                     </div>
 
                     <div className="flex items-center justify-between">
                       <span className="text-sm text-neutral-600">Birim Fiyat</span>
                       <span className="text-sm font-medium text-neutral-700">
-                        {fmtUnit(result.unitPriceEnergy)} TL/kWh
+                        {fmtUnit(derived.mahsup.unitPrice)} TL/kWh
                       </span>
                     </div>
 
@@ -510,7 +568,7 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
                     <div className="flex items-center justify-between">
                       <span className="text-sm font-semibold text-neutral-800">Mahsup Tutarı</span>
                       <span className="text-lg font-bold text-emerald-700">
-                        {fmtTL(result.mahsupTutari)} TL
+                        {fmtTL(derived.mahsup.tutar)} TL
                       </span>
                     </div>
                   </div>
@@ -531,90 +589,20 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
                 Mahsup sonrası fazladan devlete satılan enerji
               </p>
 
-              {result.satisKwh <= 0 ? (
+              {!derived ? (
                 <p className="text-sm text-neutral-500 py-6 text-center">
-                  Geçen ay veriş tamamen mahsup edildi, devlete satılan fazla enerji yok.
+                  {result.liveReason ?? "Bu dönem için hesap yapılamadı."}
+                </p>
+              ) : !derived.satis ? (
+                <p className="text-sm text-neutral-500 py-6 text-center">
+                  {satisBosMesaj}
                 </p>
               ) : (
-                <>
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-neutral-600">Satılan Veriş</span>
-                      <span className="text-sm font-medium text-amber-700">
-                        {fmtKwh(result.satisKwh)} kWh
-                      </span>
-                    </div>
-
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-neutral-600">
-                        Birim Fiyat
-                        {result.satisModu === "usd" && (
-                          <span className="ml-1 text-[10px] font-medium text-amber-600 uppercase tracking-wide">
-                            USD
-                          </span>
-                        )}
-                      </span>
-                      <span className="text-sm font-medium text-neutral-700">
-                        {fmtUnit(result.satisBrutBirim)} TL/kWh
-                      </span>
-                    </div>
-
-                    {result.satisModu === "usd" && (
-                      <p className="-mt-1 text-[11px] text-neutral-500 text-right">
-                        0,1330 USD/kWh × {fmtUnit(result.satisUsdKur)} TL/USD
-                      </p>
-                    )}
-
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-neutral-600">Brüt Gelir</span>
-                      <span className="text-sm font-medium text-emerald-600">
-                        {fmtTL(result.satisBrutGelir)} TL
-                      </span>
-                    </div>
-
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-neutral-600">Dağıtım Kesintisi</span>
-                      <span className="text-sm font-medium text-red-500">
-                        -{fmtTL(result.satisDagitimKesintisi)} TL
-                      </span>
-                    </div>
-
-                    <div className="border-t border-amber-200/70 my-2" />
-
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm font-semibold text-neutral-800">Net Gelir</span>
-                      <span
-                        className={`text-lg font-bold ${
-                          result.satisNetGelir >= 0 ? "text-emerald-600" : "text-red-600"
-                        }`}
-                      >
-                        {fmtTL(result.satisNetGelir)} TL
-                      </span>
-                    </div>
-                  </div>
-
-                  {result.dagitimBedeli > 0 && (
-                    <p className="mt-4 text-xs text-neutral-400">
-                      Dağıtım Bedeli: {fmtUnit(result.dagitimBedeli)} TL/kWh
-                      ({result.lisansliSatis
-                        ? "Lisanslı satış üretici tarifesi"
-                        : "Lisanslı olmayan üretici tarifesi"})
-                    </p>
-                  )}
-
-                  {result.satisModu === "usd" ? (
-                    <p className="mt-1 text-xs text-neutral-400">
-                      Brüt gelir USD bazlı: 0,1330 USD/kWh × {fmtUnit(result.satisUsdKur)} TL/USD ={" "}
-                      {fmtUnit(result.satisBrutBirim)} TL/kWh
-                    </p>
-                  ) : (
-                    result.onYil && result.perakendeRate > 0 && (
-                      <p className="mt-1 text-xs text-amber-600">
-                        Bu ay için USD/TL kuru girilmemiş — perakende enerji bedeli ({fmtUnit(result.perakendeRate)} TL/kWh) ile fallback hesaplandı.
-                      </p>
-                    )
-                  )}
-                </>
+                <GesUretimSatisiBody
+                  result={derived.satis}
+                  lisansliSatis={result.lisansliSatis}
+                  showPerakendeFallbackNote={result.onYil}
+                />
               )}
             </section>
 

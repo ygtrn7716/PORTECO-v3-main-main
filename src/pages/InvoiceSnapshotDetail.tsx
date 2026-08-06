@@ -1,6 +1,6 @@
 //src/pages/InvoiceSnapshotDetail.tsx
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import DashboardShell from "@/components/dashboard/DashboardShell";
 import { useSession } from "@/hooks/useSession";
 import { supabase } from "@/lib/supabase";
@@ -8,7 +8,9 @@ import {
   getInvoiceSnapshot,
   buildSnapshotBreakdown,
   type InvoiceSnapshotRow,
+  type InvoiceType,
 } from "@/components/utils/invoiceSnapshots";
+import SnapshotGesOlmasaydiCard from "@/components/dashboard/shared/SnapshotGesOlmasaydiCard";
 import type { MethodInvoiceBreakdown } from "@/components/utils/calculateInvoiceNetMethods";
 import {
   fetchInvoiceOverrides,
@@ -44,6 +46,11 @@ export default function InvoiceSnapshotDetail() {
   const year = Number(params.year);
   const month = Number(params.month);
 
+  // ?type=backdated → geriye dönük snapshot; aksi (param'sız eski linkler dahil) billed.
+  const [searchParams] = useSearchParams();
+  const invoiceType: InvoiceType =
+    searchParams.get("type") === "backdated" ? "backdated" : "billed";
+
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [row, setRow] = useState<InvoiceSnapshotRow | null>(null);
@@ -67,7 +74,7 @@ export default function InvoiceSnapshotDetail() {
             subscriptionSerno: sub,
             periodYear: year,
             periodMonth: month,
-            invoiceType: "billed",
+            invoiceType,
           }),
           // Fail-open: sayfa yalnız okur; hata durumunda doğal değerler gösterilir.
           fetchInvoiceOverrides({
@@ -96,7 +103,7 @@ export default function InvoiceSnapshotDetail() {
     return () => {
       cancel = true;
     };
-  }, [uid, sessionLoading, sub, year, month]);
+  }, [uid, sessionLoading, sub, year, month, invoiceType]);
 
 const yekdemCell = useMemo(() => {
   if (!row) return null;
@@ -231,7 +238,14 @@ const yekdemCell = useMemo(() => {
     <DashboardShell>
       <div className="mb-6 flex items-center justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold text-neutral-900">Fatura Detay (Snapshot)</h1>
+          <div className="flex items-center gap-2">
+            <h1 className="text-2xl font-semibold text-neutral-900">Fatura Detay (Snapshot)</h1>
+            {invoiceType === "backdated" && (
+              <span className="shrink-0 rounded-full bg-amber-100 px-2.5 py-1 text-[11px] font-semibold text-amber-700">
+                Geriye dönük
+              </span>
+            )}
+          </div>
           <p className="text-sm text-neutral-500">
             {row?.month_label ?? `${String(month).padStart(2, "0")}.${year}`} • Tesis {sub}
           </p>
@@ -502,6 +516,19 @@ const yekdemCell = useMemo(() => {
             <GesUretimSatisiCard
               result={gesSatisResult}
               lisansliSatis={(row as any).lisansli_satis ?? false}
+            />
+          )}
+
+          {/* GES Olmasaydı Faturanız — sayfanın en sonunda; "Mevcut Faturanız"
+              yukarıdaki Ödenecek Toplam'ın (liveTotalWithMahsup) pass-through'u. */}
+          {uid && (
+            <SnapshotGesOlmasaydiCard
+              userId={uid}
+              row={row}
+              liveBreakdown={liveBreakdown}
+              liveTotalWithMahsup={liveTotalWithMahsup}
+              effUnitPriceEnergy={effUnitPriceEnergyDisplay}
+              gesSatisResult={gesSatisResult}
             />
           )}
         </>

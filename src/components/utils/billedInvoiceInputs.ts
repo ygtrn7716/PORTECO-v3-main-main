@@ -140,6 +140,26 @@ export type BilledInvoiceInputsResult =
   | { ok: true; inputs: BilledInvoiceInputs }
   | { ok: false; reason: string };
 
+/**
+ * Geriye dönük (backdated) fatura akışının manuel YEKDEM girdileri.
+ * Semantik: DB'deki non-null değer HER ZAMAN kazanır; fallback yalnız DB'de
+ * null/eksik olan alanı doldurur (sistemde kayıtlı değer override EDİLEMEZ).
+ * subscription_yekdem'e asla yazılmaz — yalnız hesapta kullanılır ve snapshot'a
+ * donmuş halde kaydedilir.
+ */
+export type YekdemFallback = {
+  /** Dönem M yekdem_value (TL/kWh, çıplak). */
+  yekdemValue?: number | null;
+  /** Dönem M usd_kur (on_yil satış fiyatlaması). */
+  usdKur?: number | null;
+  /** Dönem M diğer bedeller (± TL). */
+  digerDegerler?: number | null;
+  /** M-1 yekdem_value — Metod 1 mahsubu / Metod 2-3 YEK Farkı. */
+  prevYekdemValue?: number | null;
+  /** M-1 yekdem_final — Metod 1 mahsubu / Metod 2-3 YEK Farkı. */
+  prevYekdemFinal?: number | null;
+};
+
 async function fetchSubYekdem(
   supabase: SupabaseClient,
   p: { uid: string; sub: number; year: number; month: number }
@@ -179,10 +199,12 @@ async function fetchSubYekdemForMahsup(
   return data ?? null;
 }
 
+/** DB'de değer yoksa null döner (0 değil) — caller fallback ?? 0 uygular.
+ *  Fallback'siz yol için davranış birebir aynı (null ?? undefined ?? 0 = 0). */
 async function fetchSubDigerDegerler(
   supabase: SupabaseClient,
   p: { uid: string; sub: number; year: number; month: number }
-): Promise<number> {
+): Promise<number | null> {
   const { data, error } = await supabase
     .from("subscription_yekdem")
     .select("diger_degerler")
@@ -192,8 +214,9 @@ async function fetchSubDigerDegerler(
     .eq("period_month", p.month)
     .maybeSingle();
 
-  if (error) return 0;
-  return num(data?.diger_degerler, 0);
+  if (error) return null;
+  const v = data?.diger_degerler;
+  return v != null && Number.isFinite(Number(v)) ? Number(v) : null;
 }
 
 /**
@@ -211,12 +234,29 @@ export async function fetchBilledInvoiceInputs(params: {
   subscriptionSerno: number;
   periodYear: number;
   periodMonth: number;
+  /** Metod çözümleme bağlamı. "admin" (default): user_integrations doğrudan
+   *  sorgulanır — normal kullanıcıda RLS'e takılır ve sessizce Metod 1'e düşer.
+   *  Müşteri yüzeyinden çağırırken "self" verilmeli (get_my_billing_integrations
+   *  RPC'si — InvoiceDetail ile aynı yol ve aynı cache girdisi). */
+  methodContext?: "self" | "admin";
+  /** Backdated akışı manuel YEKDEM'i — yalnız DB'de olmayan alanı doldurur. */
+  yekdemFallback?: YekdemFallback;
 }): Promise<BilledInvoiceInputsResult> {
-  const { supabase, userId, subscriptionSerno, periodYear, periodMonth } = params;
+  const {
+    supabase,
+    userId,
+    subscriptionSerno,
+    periodYear,
+    periodMonth,
+    methodContext = "admin",
+    yekdemFallback,
+  } = params;
 
   const warnings: string[] = [];
 
-  const m = dayjsTR().year(periodYear).month(periodMonth - 1);
+  // .date(1): bugünün günü 29-31 iken kısa aya .month() set edilirse bir sonraki
+  // aya taşar (fatura yanlış aya hesaplanır) — önce günü 1'e sabitle.
+  const m = dayjsTR().date(1).year(periodYear).month(periodMonth - 1);
   const monthStart = m.startOf("month");
   const monthEndExclusive = monthStart.clone().add(1, "month");
   const startIso = monthStart.toDate().toISOString();
@@ -337,14 +377,16 @@ export async function fetchBilledInvoiceInputs(params: {
     year: periodYear,
     month: periodMonth,
   });
-  if (yekRow.yekdem_value == null) {
+  // Backdated manuel girişi: DB non-null ise DB kazanır; yalnız null dolar.
+  const effYekdemValue = yekRow.yekdem_value ?? yekdemFallback?.yekdemValue ?? null;
+  if (effYekdemValue == null) {
     return {
       ok: false,
       reason: "Bu dönem için tesis YEKDEM değeri (yekdem_value) girilmemiş.",
     };
   }
-  const monthlyYekdem = yekRow.yekdem_value;
-  const monthlyUsdKur = yekRow.usd_kur ?? 0;
+  const monthlyYekdem = effYekdemValue;
+  const monthlyUsdKur = yekRow.usd_kur ?? yekdemFallback?.usdKur ?? 0;
 
   // ── 5) Tesis ayarları
   const { data: settings, error: settingsErr } = await supabase
@@ -406,7 +448,12 @@ export async function fetchBilledInvoiceInputs(params: {
 
   // Fatura metodu: admin bağlamında RPC işe yaramaz (auth.uid() admin'i döner,
   // bkz. dosya başındaki not) → user_integrations doğrudan sorgulanır.
-  const methodMap = await resolveInvoiceMethods({ context: "admin", supabase, userId });
+  // Müşteri yüzeyi (methodContext:"self") RPC'den okur — InvoiceDetail ile aynı.
+  const methodMap = await resolveInvoiceMethods(
+    methodContext === "self"
+      ? { context: "self", userId, supabase }
+      : { context: "admin", supabase, userId }
+  );
   const { methodId: invoiceMethodId, invoiceFrom } = methodForProvider(methodMap, provider);
 
   // ── 7) Resmi tarife
@@ -461,13 +508,14 @@ export async function fetchBilledInvoiceInputs(params: {
   // ── 9) Enerji birim fiyatı (InvoiceDetail:655 ile aynı formül)
   const unitPriceEnergy = (monthlyPTF + monthlyYekdem) * kbk + unitPriceAdjustment;
 
-  // ── 10) Diğer bedeller
-  const digerDegerler = await fetchSubDigerDegerler(supabase, {
+  // ── 10) Diğer bedeller (DB kazanır; null ise backdated manuel girişi, o da yoksa 0)
+  const dbDigerDegerler = await fetchSubDigerDegerler(supabase, {
     uid: userId,
     sub: subscriptionSerno,
     year: periodYear,
     month: periodMonth,
   });
+  const digerDegerler = dbDigerDegerler ?? yekdemFallback?.digerDegerler ?? 0;
 
   // ── 11) YEKDEM mahsubu (dönem-göreli M-1). consumption_daily tablosu canlıda
   //       YOK → doğrudan consumption_hourly okunuyor. Fail-open → 0.
@@ -476,6 +524,7 @@ export async function fetchBilledInvoiceInputs(params: {
 
   // Ham girdiler admin override formuna gider — lisanslı satışta da etiket lazım.
   const mahsupPeriod = dayjsTR()
+    .date(1) // ay-sonu taşma koruması (bkz. :231)
     .year(periodYear)
     .month(periodMonth - 1)
     .subtract(1, "month");
@@ -515,10 +564,15 @@ export async function fetchBilledInvoiceInputs(params: {
         month: mahsupPeriod.month() + 1,
       });
 
+      // DB kazanır; yalnız null alanlar backdated manuel girişinden dolar.
       mahsupNaturalYekdemValue =
-        yRow?.yekdem_value != null ? Number(yRow.yekdem_value) : null;
+        (yRow?.yekdem_value != null ? Number(yRow.yekdem_value) : null) ??
+        yekdemFallback?.prevYekdemValue ??
+        null;
       mahsupNaturalYekdemFinal =
-        yRow?.yekdem_final != null ? Number(yRow.yekdem_final) : null;
+        (yRow?.yekdem_final != null ? Number(yRow.yekdem_final) : null) ??
+        yekdemFallback?.prevYekdemFinal ??
+        null;
 
       // Override YOK → doğal mahsup (bugünkü davranışla birebir aynı).
       const natural = computeYekdemMahsupWithOverride({
@@ -557,6 +611,17 @@ export async function fetchBilledInvoiceInputs(params: {
       tahminiYekdem: monthlyYekdem,
       current: netAgg,
     });
+    // Backdated manuel M-1 YEKDEM'i: assembleMethodInputs imzası değişmeden
+    // (3 başka caller'ı var) yalnız null kalan prev alanları doldurulur; DB kazanır.
+    if (methodInputs && yekdemFallback) {
+      methodInputs = {
+        ...methodInputs,
+        prevTahminiYekdem:
+          methodInputs.prevTahminiYekdem ?? yekdemFallback.prevYekdemValue ?? null,
+        prevGerceklesenYekdem:
+          methodInputs.prevGerceklesenYekdem ?? yekdemFallback.prevYekdemFinal ?? null,
+      };
+    }
   }
 
   return {

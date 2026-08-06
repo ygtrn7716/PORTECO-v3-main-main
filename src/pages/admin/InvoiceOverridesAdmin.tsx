@@ -23,13 +23,13 @@ import {
   upsertInvoiceOverride,
   deleteInvoiceOverride,
   deleteInvoiceOverridesForPeriod,
-  resolveUnitPriceOverride,
   type InvoiceOverrideItemKey,
   type InvoiceOverrides,
 } from "@/components/utils/invoiceOverrides";
 import {
   getInvoiceSnapshot,
   upsertInvoiceSnapshot,
+  snapshotParamsFromEngine,
 } from "@/components/utils/invoiceSnapshots";
 
 const MONTH_NAMES = [
@@ -45,7 +45,7 @@ const ITEM_LABELS: Record<InvoiceOverrideItemKey, string> = {
   guc: "Güç Bedeli",
   reaktif: "Reaktif Ceza Bedeli",
   yekdem_mahsup: "YEKDEM Mahsubu",
-  mahsuplasma: "Mahsuplaşma Fiyatı (Muhtelif-2)",
+  mahsuplasma: "Mahsuplaşma Fiyatı (boş = otomatik: perakende − (mahsup PTF + YEKDEM) × KBK)",
 };
 
 /**
@@ -597,69 +597,21 @@ export default function InvoiceOverridesAdmin() {
     try {
       await persistOverrides();
 
-      const effectiveUnitPriceEnergy = resolveUnitPriceOverride(
-        inputs.unitPriceEnergy,
-        draftOverrides.enerji
+      // Haritalama tek kaynaktan (snapshotParamsFromEngine): efektif birim
+      // fiyatlar, efektif mahsup ve metod damgası dahil — backdated writer ile
+      // alan-alan aynı. recomputeSnapshotTotalWithMahsup saklı yekdem_mahsup'ı
+      // AYNEN okur → override'ın Dashboard/InvoiceHistory/grafiklerde
+      // görünmesinin tek yolu bu yazımdır.
+      await upsertInvoiceSnapshot(
+        snapshotParamsFromEngine({
+          userId: selectedUserId,
+          subscriptionSerno: selectedSerno,
+          inputs,
+          result: editedResult,
+          overrides: draftOverrides,
+          invoiceType: "billed",
+        })
       );
-      const effectiveUnitPriceDistribution = resolveUnitPriceOverride(
-        inputs.unitPriceDistribution,
-        draftOverrides.dagitim
-      );
-
-      await upsertInvoiceSnapshot({
-        userId: selectedUserId,
-        subscriptionSerno: selectedSerno,
-        periodYear,
-        periodMonth,
-        invoiceType: "billed",
-        monthLabel: inputs.monthLabel,
-
-        totalConsumptionKwh: inputs.totalConsumptionKwh,
-        // Efektif değerler — InvoiceDetail de böyle yazıyor → recompute idempotent.
-        unitPriceEnergy: effectiveUnitPriceEnergy,
-        unitPriceAdjustment: inputs.unitPriceAdjustment,
-        unitPriceDistribution: effectiveUnitPriceDistribution,
-        btvRate: inputs.btvRate,
-        vatRate: inputs.vatRate,
-        tariffType: inputs.tariffType,
-
-        contractPowerKw: inputs.contractPowerKw,
-        monthFinalDemandKw: inputs.monthFinalDemandKw,
-        hasDemandData: inputs.hasDemandData,
-
-        powerPrice: inputs.powerPrice,
-        powerExcessPrice: inputs.powerExcessPrice,
-
-        reactiveRiPercent: editedResult.riPercent,
-        reactiveRcPercent: editedResult.rcPercent,
-        reactivePenaltyCharge: editedResult.breakdown.reactivePenaltyCharge,
-
-        breakdown: editedResult.breakdown,
-
-        // Efektif (override'lı) mahsup. recomputeSnapshotTotalWithMahsup saklı
-        // yekdem_mahsup'ı AYNEN okur → override'ın Dashboard/InvoiceHistory/
-        // grafiklerde görünmesinin tek yolu bu yazımdır.
-        hasYekdemMahsup: editedResult.hasYekdemMahsup,
-        yekdemMahsup: editedResult.yekdemMahsup,
-        totalWithMahsup: editedResult.totalWithMahsup,
-        trafoDegeri: inputs.trafoDegeri,
-        trafoCharge: editedResult.breakdown.trafoCharge,
-        digerDegerler: inputs.digerDegerler,
-        totalProductionKwh: inputs.totalProductionKwh,
-        onYil: inputs.onYil,
-        lisansliSatis: inputs.lisansliSatis,
-        perakendeEnerjiBedeli: inputs.perakendeEnerjiBedeli,
-        usdKur: inputs.usdKur,
-        gesSatisDagitimBedeli: inputs.dagitimUreticiBedeli,
-        netPositiveDrawKwh: inputs.netPositiveDrawKwh,
-        netExcessFeedKwh: inputs.netExcessFeedKwh,
-        allocatedGesKwh: inputs.allocatedGesKwh,
-        // Fatura metodu damgası — fetchBilledInvoiceInputs'ta admin yolu ile çözüldü.
-        invoiceMethod: inputs.invoiceMethodId,
-        invoiceFrom: inputs.invoiceFrom,
-        // Metod 2/3 replay alanları (metod 1'de null).
-        methodInputs: inputs.methodInputs,
-      });
 
       setHasSnapshot(true);
       setMsg({ type: "ok", text: "Kaydedildi ve snapshot yeniden yazıldı." });

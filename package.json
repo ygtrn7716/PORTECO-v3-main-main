@@ -11,7 +11,8 @@
     "cron:alerts": "tsx scripts/reactive-alerts.ts",
     "test:sms": "tsx scripts/test-sms.ts",
     "check:invoice-methods": "tsx scripts/check-invoice-methods.ts",
-    "check:method-snapshots": "tsx scripts/check-invoice-method-snapshots.ts"
+    "check:method-snapshots": "tsx scripts/check-invoice-method-snapshots.ts",
+    "check:muhasebe": "tsx scripts/check-muhasebe-report.ts"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.2.3",

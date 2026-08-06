@@ -16,9 +16,20 @@ import {
 } from "@/components/utils/gesAllocation";
 import { calculateGesOlmasaydi, type GesOlmasaydiResult } from "@/components/utils/calculateGesOlmasaydi";
 import GesOlmasaydiPanel from "@/components/dashboard/GesOlmasaydiPanel";
+import MuhasebeModal from "@/components/dashboard/invoiceDetail/MuhasebeModal";
+import {
+  buildMuhasebeReport,
+  MUHASEBE_SUPPORTED_METHODS,
+} from "@/components/dashboard/reports/muhasebeReport";
+import type {
+  MuhasebePayload,
+  MuhasebeReport,
+} from "@/components/dashboard/reports/muhasebeReport";
 import GesUretimSatisiCard from "@/components/dashboard/shared/GesUretimSatisiCard";
 import KayseriEkBedellerCard from "@/components/dashboard/shared/KayseriEkBedellerCard";
+import TalepBirlestirmeBanner from "@/components/dashboard/shared/TalepBirlestirmeBanner";
 import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
+import { deriveGesSatisMahsup } from "@/lib/ges/gesSatisMahsup";
 
 import type {
   InvoiceBreakdown,
@@ -327,6 +338,10 @@ export default function InvoiceDetail() {
   const gesOlmasaydiParamsRef = useRef<any>(null);
   const gesOlmasaydiCalced = useRef(false);
 
+  // ---- Muhasebe Excel (Girdi/Çıktı raporu)
+  const muhasebeBaseRef = useRef<any>(null); // payload'ın gesResult HARİÇ tabanı
+  const [muhasebeModalOpen, setMuhasebeModalOpen] = useState(false);
+
   // 0) tesisleri çek
   useEffect(() => {
     if (sessionLoading) return;
@@ -533,7 +548,7 @@ export default function InvoiceDetail() {
         // 4) tesis ayarları (KBK + tarife + güç limit) -> SADECE subscription_settings
         const settingsRes = await supabase
           .from("subscription_settings")
-          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi")
+          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi, muhasebe_excel_enabled")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -566,6 +581,9 @@ export default function InvoiceDetail() {
         // false = anlık üretim kullanımı yok (arazi GES → ham tüketim = çekiş).
         const anlikUretimKullanimi =
           (settingsRes.data as any).anlik_uretim_kullanimi ?? null;
+        // Muhasebe Excel opt-in flag (kolon yoksa → false, sayfa patlamaz).
+        const muhasebeExcelEnabled =
+          (settingsRes.data as any).muhasebe_excel_enabled ?? false;
 
         const missing: string[] = [];
         if (!terim) missing.push("terim");
@@ -1137,6 +1155,60 @@ try {
             invoiceMethodId,
             methodInputs,
           };
+
+          // Muhasebe Excel payload tabanı (gesResult render'da eklenir). Tüm
+          // değerler bu effect'te zaten hesaplanmış locallerden; SIFIR yeni sorgu.
+          muhasebeBaseRef.current = {
+            muhasebeExcelEnabled,
+            serno: selectedSub,
+            monthLabel,
+            periodYear,
+            periodMonth,
+            dataSource: "live" as const,
+            breakdown,
+            totalConsumptionKwh,
+            vatRate,
+            btvRate,
+            lisansliSatis,
+            yekdemMahsup: yekdemMahsupValue,
+            digerDegerler,
+            totalWithMahsup,
+            contractPowerKw,
+            monthFinalDemandKw,
+            powerPrice,
+            powerExcessPrice,
+            reactiveUnitPrice,
+            unitPriceEnergy: effectiveUnitPriceEnergy,
+            naturalUnitPriceEnergy: unitPriceEnergy,
+            unitPriceDistribution: effectiveUnitPriceDistribution,
+            effectiveDistributionUnitPrice: breakdown.effectiveDistributionUnitPrice,
+            trafoDegeri,
+            onYil,
+            usdKur: monthlyUsdKur,
+            perakendeEnerjiBedeli,
+            dagitimUreticiBedeli,
+            kbk,
+            monthlyPTF,
+            monthlyYekdem,
+            unitPriceAdjustment,
+            terim,
+            gerilim,
+            tarife,
+            tariffType,
+            anlikUretimKullanimi,
+            invoiceMethodId,
+            gesAlloc: allocView
+              ? allocView.role === "assigned"
+                ? {
+                    role: "assigned" as const,
+                    priority: allocView.priority,
+                    allocatedKwh: allocatedGesKwh ?? 0,
+                    isSource: allocView.isSource,
+                  }
+                : { role: "source" as const }
+              : null,
+          };
+
           gesOlmasaydiCalced.current = false;
           setGesOlmasaydiResult(null);
         }
@@ -1220,6 +1292,26 @@ try {
 
     return { excessKw, ratio };
   }, [data]);
+
+  // Muhasebe raporu — flag açık VE metot destekli VE gesResult hazır olduğunda kurulur.
+  // Aksi halde null → panelde buton yok, modal mount edilmez (sessiz gizleme).
+  const muhasebeReport = useMemo<MuhasebeReport | null>(() => {
+    const base = muhasebeBaseRef.current;
+    if (!base || !base.muhasebeExcelEnabled) return null;
+    if (!(MUHASEBE_SUPPORTED_METHODS as readonly number[]).includes(base.invoiceMethodId ?? 1)) {
+      return null;
+    }
+    if (!gesOlmasaydiResult) return null;
+    const sel = subs.find((s) => s.subscriptionSerNo === selectedSub);
+    const facilityLabel = sel?.nickname ?? sel?.title ?? `Tesis ${selectedSub}`;
+    const payload: MuhasebePayload = {
+      ...base,
+      facilityLabel,
+      generatedAtIso: dayjsTR().format(),
+      gesResult: gesOlmasaydiResult,
+    };
+    return buildMuhasebeReport(payload);
+  }, [gesOlmasaydiResult, selectedSub, subs]);
 
 const isDualTerm = data?.tariffType === "dual";
 
@@ -1462,6 +1554,7 @@ const excludedItems = new Set<string>(
             currentTotalWithMahsup={data.totalWithMahsup}
             hasYekdemMahsup={data.hasYekdemMahsup}
             yekdemMahsup={data.yekdemMahsup}
+            mainYekFarkiCharge={data.breakdown.yekFarkiCharge ?? 0}
             totalProductionKwh={data.totalProductionKwh}
             onYil={data.onYil}
             lisansliSatis={data.lisansliSatis}
@@ -1779,31 +1872,12 @@ const excludedItems = new Set<string>(
             </div>
           </div>
 
-          {/* Talep Birleştirme bilgi notu — üç durum. Metod 4'te gösterilmez
-              (düz fatura; mahsup/tahsis kavramı yok). */}
-          {data.invoiceMethodId !== 4 && data.gesAlloc?.role === "assigned" && data.gesAlloc.isSource && (
-            <div className="rounded-2xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800">
-              Talep Birleştirme: bu tesis üretim kaynağıdır. Üretim önce kendi tüketiminden
-              mahsup edildi; bu faturaya {fmtKwh(data.gesAlloc.allocatedKwh)} kWh mahsup tahsis
-              edildi (öncelik {data.gesAlloc.priority}).
-              {data.gesAlloc.priority === 1 &&
-                " Tüm tesislerden artan fazla üretimin satışı bu tesisin faturasında gösterilir."}
-            </div>
-          )}
-          {data.invoiceMethodId !== 4 && data.gesAlloc?.role === "assigned" && !data.gesAlloc.isSource && (
-            <div className="rounded-2xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800">
-              Talep Birleştirme: bu faturaya {fmtKwh(data.gesAlloc.allocatedKwh)} kWh GES mahsubu
-              tahsis edildi (öncelik {data.gesAlloc.priority}).
-              {data.gesAlloc.priority === 1 &&
-                " Fazla üretim satışı bu tesisin faturasında gösterilir."}
-            </div>
-          )}
-          {data.invoiceMethodId !== 4 && data.gesAlloc?.role === "source" && (
-            <div className="rounded-2xl border border-sky-200 bg-sky-50 p-3 text-sm text-sky-800">
-              Bu sayacın üretimi Talep Birleştirme ile diğer tesislere mahsup edilmektedir;
-              veriş bu faturada 0 kabul edilir.
-            </div>
-          )}
+          {/* Talep Birleştirme bilgi notu — üç durum, GES sayfasıyla ortak bileşen
+              (metod 4 kapısı ve metinler bileşenin içinde). */}
+          <TalepBirlestirmeBanner
+            alloc={data.gesAlloc}
+            invoiceMethodId={data.invoiceMethodId}
+          />
 
           {/* Ek Bedeller — Kayseri OSB'nin ayrıca tahsil ettiği bedeller, faturaya dahil DEĞİL */}
           {data.isKayseriOsb && data.kayseriEkBedeller && (
@@ -1816,22 +1890,24 @@ const excludedItems = new Set<string>(
           )}
 
           {/* GES Üretim Satışı — fazla üretim satışı, faturaya dahil DEĞİL.
-              Metod 4 (GES'siz düz fatura): mahsup yok → satılan veriş = dönem TOPLAM üretimi
-              (excess değil); diğer metotlarda fazla üretim (verisFazlaKwh). */}
+              Satış kuralı (metod 4: satılan veriş = dönem TOPLAM üretimi; diğer
+              metotlarda verisFazlaKwh) artık deriveGesSatisMahsup'ta — GES
+              sayfası aynı yardımcıyı çağırır (tek kaynak). */}
           {(() => {
-            const satisKwh =
-              data.invoiceMethodId === 4
-                ? data.totalProductionKwh ?? 0
-                : data.breakdown.verisFazlaKwh;
-            return satisKwh > 0 ? (
+            const derived = deriveGesSatisMahsup({
+              invoiceMethodId: data.invoiceMethodId,
+              breakdown: data.breakdown,
+              totalProductionKwh: data.totalProductionKwh ?? 0,
+              lisansliSatis: data.lisansliSatis,
+              onYil: data.onYil,
+              usdKur: data.usdKur,
+              perakendeEnerjiBedeli: data.perakendeEnerjiBedeli,
+              dagitimBedeli: data.dagitimUreticiBedeli,
+              unitPriceEnergy: data.unitPriceEnergy,
+            });
+            return derived.satis ? (
               <GesUretimSatisiCard
-                result={calculateGesUretimSatisi({
-                  satisKwh,
-                  onYil: data.onYil,
-                  usdKur: data.usdKur,
-                  perakendeEnerjiBedeli: data.perakendeEnerjiBedeli,
-                  dagitimBedeli: data.dagitimUreticiBedeli,
-                })}
+                result={derived.satis}
                 lisansliSatis={data.lisansliSatis}
               />
             ) : null;
@@ -1857,7 +1933,19 @@ const excludedItems = new Set<string>(
         loading={gesOlmasaydiLoading}
         result={gesOlmasaydiResult}
         error={gesOlmasaydiErr}
+        muhasebeEnabled={!!muhasebeReport}
+        muhasebeReport={muhasebeReport}
+        onOpenMuhasebe={() => setMuhasebeModalOpen(true)}
       />
+
+      {/* Muhasebe modal — yalnız rapor kurulabildiğinde mount edilir (gating). */}
+      {muhasebeReport && (
+        <MuhasebeModal
+          open={muhasebeModalOpen}
+          onClose={() => setMuhasebeModalOpen(false)}
+          report={muhasebeReport}
+        />
+      )}
     </DashboardShell>
   );
 }

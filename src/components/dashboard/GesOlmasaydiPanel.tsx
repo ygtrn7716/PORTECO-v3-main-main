@@ -2,8 +2,9 @@
 //
 // GES olmasaydı fatura karşılaştırma paneli — sağdan açılan drawer.
 
-import { X, Sun, Loader2 } from "lucide-react";
+import { X, Sun, Loader2, FileSpreadsheet } from "lucide-react";
 import type { GesOlmasaydiResult } from "@/components/utils/calculateGesOlmasaydi";
+import type { MuhasebeReport } from "@/components/dashboard/reports/muhasebeReport";
 import GesSavingsCard from "@/components/dashboard/shared/GesSavingsCard";
 
 interface Props {
@@ -12,9 +13,22 @@ interface Props {
   loading: boolean;
   result: GesOlmasaydiResult | null;
   error?: string | null;
+  // Muhasebe Excel — yalnız flag açık VE metot destekliyken (InvoiceDetail gate'ler) dolu gelir.
+  muhasebeEnabled?: boolean;
+  muhasebeReport?: MuhasebeReport | null;
+  onOpenMuhasebe?: () => void;
 }
 
-export default function GesOlmasaydiPanel({ open, onClose, loading, result, error }: Props) {
+export default function GesOlmasaydiPanel({
+  open,
+  onClose,
+  loading,
+  result,
+  error,
+  muhasebeEnabled = false,
+  muhasebeReport = null,
+  onOpenMuhasebe,
+}: Props) {
   return (
     <>
       {open && (
@@ -65,7 +79,20 @@ export default function GesOlmasaydiPanel({ open, onClose, loading, result, erro
           )}
 
           {!loading && result && (
-            <GesSavingsCard variant="panel" result={result} />
+            <>
+              <GesSavingsCard variant="panel" result={result} />
+
+              {/* Muhasebe Excel — flag açık VE fatura metodu destekleniyorsa (aksi halde hiç yok) */}
+              {muhasebeEnabled && muhasebeReport && (
+                <button
+                  onClick={onOpenMuhasebe}
+                  className="mt-5 flex w-full items-center justify-center gap-2 rounded-lg bg-[#00AEEF] py-2.5 text-sm font-semibold text-white shadow transition-colors hover:bg-[#40CFFF]"
+                >
+                  <FileSpreadsheet className="h-4 w-4" />
+                  Muhasebe Excel
+                </button>
+              )}
+            </>
           )}
         </div>
       </div>

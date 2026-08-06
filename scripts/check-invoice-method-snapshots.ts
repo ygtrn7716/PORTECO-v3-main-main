@@ -54,11 +54,12 @@ type SnapRow = {
   kbk: number | null;
   yekdem_tahmini: number | null;
   mahsuplasma_unit_price: number | null;
+  w_mahsup: number | null;
 };
 
 const SNAP_FIELDS =
   "user_id, subscription_serno, period_year, period_month, invoice_type, invoice_method, " +
-  "invoice_from, total_with_mahsup, w_pos, kbk, yekdem_tahmini, mahsuplasma_unit_price";
+  "invoice_from, total_with_mahsup, w_pos, kbk, yekdem_tahmini, mahsuplasma_unit_price, w_mahsup";
 
 const donem = (r: SnapRow) => `${r.period_year}-${String(r.period_month).padStart(2, "0")}`;
 
@@ -102,6 +103,10 @@ async function main() {
       if (r.yekdem_tahmini == null) eksik.push("yekdem_tahmini");
       if (r.invoice_method === 3 && r.mahsuplasma_unit_price == null) {
         eksik.push("mahsuplasma_unit_price");
+      }
+      // 2I: m3 mahsuplaşma formülünün girdisi — replay determinizmi için damgalanmalı.
+      if (r.invoice_method === 3 && r.w_mahsup == null) {
+        eksik.push("w_mahsup");
       }
       return { r, eksik };
     })

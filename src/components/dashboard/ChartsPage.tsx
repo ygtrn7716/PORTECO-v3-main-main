@@ -624,7 +624,7 @@ export default function ChartsPage() {
 
   return (
     <DashboardShell>
-      <ReportsSection uid={uid} sessionLoading={sessionLoading} />
+      <ReportsSection uid={uid} sessionLoading={sessionLoading} showGes={showGes} />
 
       {/* Header */}
       <div className="mb-6 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">

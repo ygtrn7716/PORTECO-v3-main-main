@@ -47,6 +47,43 @@ export default function GesSavingsCard(props: Props) {
       ? "grid-cols-1 sm:grid-cols-3"
       : "grid-cols-1 sm:grid-cols-2";
 
+  // DETAY satırları — panel'de 3 gruba ayrılır (Enerji Akışı / Fiyatlandırma /
+  // Mahsup & Satış). Inline (dashboard GesSavingsSection) düz liste AYNEN kalır.
+  type DetayRow = { group: "enerji" | "fiyat" | "mahsup"; label: string; value: string; highlight?: boolean };
+  const detayRows: DetayRow[] = isReceiver
+    ? [
+        { group: "enerji", label: "Mevcut Tüketim (Çekiş)", value: `${fmtKwh(result.mevcutTuketimKwh)} kWh` },
+        { group: "mahsup", label: "Tahsis Edilen Mahsup", value: `${fmtKwh(result.allocatedKwh ?? result.verisMahsupKwh)} kWh`, highlight: true },
+        { group: "fiyat", label: "Birim Fiyat", value: `${fmtUnit(result.mevcutBirimFiyat)} TL/kWh` },
+      ]
+    : noInstantUse
+      ? [
+          { group: "enerji", label: "Mevcut Tüketim (Çekiş)", value: `${fmtKwh(result.mevcutTuketimKwh)} kWh` },
+          { group: "enerji", label: "GES Üretim (Şebekeye Verilen)", value: `${fmtKwh(result.gesUretimKwh)} kWh` },
+          { group: "enerji", label: "Ham Tüketim (= Çekiş)", value: `${fmtKwh(result.hamTuketimKwh)} kWh`, highlight: true },
+          { group: "fiyat", label: "Birim Fiyat", value: `${fmtUnit(result.mevcutBirimFiyat)} TL/kWh` },
+        ]
+      : [
+          { group: "enerji", label: "Mevcut Tüketim (Çekiş)", value: `${fmtKwh(result.mevcutTuketimKwh)} kWh` },
+          { group: "enerji", label: "GES Üretim", value: `${fmtKwh(result.gesUretimKwh)} kWh` },
+          { group: "enerji", label: "Ham Tüketim (GES'siz)", value: `${fmtKwh(result.hamTuketimKwh)} kWh`, highlight: true },
+          { group: "fiyat", label: "Birim Fiyat (GES'li)", value: `${fmtUnit(result.mevcutBirimFiyat)} TL/kWh` },
+          { group: "fiyat", label: "Birim Fiyat (GES'siz)", value: `${fmtUnit(result.hamBirimFiyat)} TL/kWh` },
+        ];
+
+  // Panel'e özgü Mahsup & Satış grubu ek satırları (inline'ı ETKİLEMEZ).
+  const mahsupRows: DetayRow[] = detayRows.filter((r) => r.group === "mahsup");
+  if (isPanel) {
+    if (!isReceiver && result.verisMahsupKwh > 0) {
+      mahsupRows.push({ group: "mahsup", label: "Uygulanan Mahsup", value: `${fmtKwh(result.verisMahsupKwh)} kWh` });
+    }
+    if (result.satis) {
+      mahsupRows.push({ group: "mahsup", label: "Satılan Enerji", value: `${fmtKwh(result.satis.satisKwh)} kWh` });
+    }
+  }
+  const flowRows = detayRows.filter((r) => r.group === "enerji");
+  const priceRows = detayRows.filter((r) => r.group === "fiyat");
+
   return (
     <div className="space-y-5">
       {isInline && (
@@ -121,34 +158,19 @@ export default function GesSavingsCard(props: Props) {
         <h3 className="text-xs font-semibold text-neutral-500 uppercase tracking-wider">
           Detay
         </h3>
-        <div className="rounded-xl border border-neutral-200 divide-y divide-neutral-100">
-          {isReceiver ? (
-            <>
-              <Row label="Mevcut Tüketim (Çekiş)" value={`${fmtKwh(result.mevcutTuketimKwh)} kWh`} />
-              <Row
-                label="Tahsis Edilen Mahsup"
-                value={`${fmtKwh(result.allocatedKwh ?? result.verisMahsupKwh)} kWh`}
-                highlight
-              />
-              <Row label="Birim Fiyat" value={`${fmtUnit(result.mevcutBirimFiyat)} TL/kWh`} />
-            </>
-          ) : noInstantUse ? (
-            <>
-              <Row label="Mevcut Tüketim (Çekiş)" value={`${fmtKwh(result.mevcutTuketimKwh)} kWh`} />
-              <Row label="GES Üretim (Şebekeye Verilen)" value={`${fmtKwh(result.gesUretimKwh)} kWh`} />
-              <Row label="Ham Tüketim (= Çekiş)" value={`${fmtKwh(result.hamTuketimKwh)} kWh`} highlight />
-              <Row label="Birim Fiyat" value={`${fmtUnit(result.mevcutBirimFiyat)} TL/kWh`} />
-            </>
-          ) : (
-            <>
-              <Row label="Mevcut Tüketim (Çekiş)" value={`${fmtKwh(result.mevcutTuketimKwh)} kWh`} />
-              <Row label="GES Üretim" value={`${fmtKwh(result.gesUretimKwh)} kWh`} />
-              <Row label="Ham Tüketim (GES'siz)" value={`${fmtKwh(result.hamTuketimKwh)} kWh`} highlight />
-              <Row label="Birim Fiyat (GES'li)" value={`${fmtUnit(result.mevcutBirimFiyat)} TL/kWh`} />
-              <Row label="Birim Fiyat (GES'siz)" value={`${fmtUnit(result.hamBirimFiyat)} TL/kWh`} />
-            </>
-          )}
-        </div>
+        {isPanel ? (
+          <div className="space-y-3">
+            <DetayGroup title="Enerji Akışı" rows={flowRows} />
+            <DetayGroup title="Fiyatlandırma" rows={priceRows} />
+            <DetayGroup title="Mahsup & Satış" rows={mahsupRows} />
+          </div>
+        ) : (
+          <div className="rounded-xl border border-neutral-200 divide-y divide-neutral-100">
+            {detayRows.map((r, i) => (
+              <Row key={i} label={r.label} value={r.value} highlight={r.highlight} />
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Açıklama */}
@@ -177,6 +199,28 @@ export default function GesSavingsCard(props: Props) {
           Olmasaydı Faturanız − Mevcut Faturanız{hasSatis ? " + Satılan Enerji Net Geliri" : ""}.
         </p>
       )}
+    </div>
+  );
+}
+
+function DetayGroup({
+  title,
+  rows,
+}: {
+  title: string;
+  rows: { label: string; value: string; highlight?: boolean }[];
+}) {
+  if (rows.length === 0) return null;
+  return (
+    <div className="space-y-1">
+      <div className="px-1 text-[10px] font-semibold uppercase tracking-wider text-neutral-400">
+        {title}
+      </div>
+      <div className="rounded-xl border border-neutral-200 divide-y divide-neutral-100">
+        {rows.map((r, i) => (
+          <Row key={i} label={r.label} value={r.value} highlight={r.highlight} />
+        ))}
+      </div>
     </div>
   );
 }
