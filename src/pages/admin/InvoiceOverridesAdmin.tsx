@@ -18,6 +18,7 @@ import {
   type BilledInvoiceInputs,
   type BilledInvoiceResult,
 } from "@/components/utils/billedInvoiceInputs";
+import { isNetInvoiceMethod } from "@/lib/invoiceMethods";
 import {
   fetchInvoiceOverrides,
   upsertInvoiceOverride,
@@ -46,6 +47,7 @@ const ITEM_LABELS: Record<InvoiceOverrideItemKey, string> = {
   reaktif: "Reaktif Ceza Bedeli",
   yekdem_mahsup: "YEKDEM Mahsubu",
   mahsuplasma: "Mahsuplaşma Fiyatı (boş = otomatik: perakende − (mahsup PTF + YEKDEM) × KBK)",
+  yek: "YEK Bedeli",
 };
 
 /**
@@ -55,12 +57,13 @@ const ITEM_LABELS: Record<InvoiceOverrideItemKey, string> = {
  * görünürlük guard'ı, persist) onu ayrıca ele alır.
  */
 const ITEM_ORDER: InvoiceOverrideItemKey[] = [
-  "enerji", "trafo", "dagitim", "btv", "guc", "reaktif", "mahsuplasma",
+  "enerji", "yek", "trafo", "dagitim", "btv", "guc", "reaktif", "mahsuplasma",
 ];
 
-/** Yalnız enerji/dagitim/mahsuplasma kaleminde birim fiyat override'ı anlamlı.
- *  (mahsuplasma: metod 3 muhtelif-2 kredisinin fiyatı; motor yalnız unitPrice okur.) */
-const UNIT_PRICE_ITEMS = new Set<InvoiceOverrideItemKey>(["enerji", "dagitim", "mahsuplasma"]);
+/** Yalnız enerji/dagitim/mahsuplasma/yek kaleminde birim fiyat override'ı anlamlı.
+ *  (mahsuplasma: metod 3 muhtelif-2 kredisinin fiyatı; motor yalnız unitPrice okur.
+ *   yek: TL/kWh — doğal birim tahminiYekdem × KBK'nın yerine geçer.) */
+const UNIT_PRICE_ITEMS = new Set<InvoiceOverrideItemKey>(["enerji", "dagitim", "mahsuplasma", "yek"]);
 
 // ---- formatters (InvoiceDetail ile aynı)
 const fmtMoney2 = (n: number | null | undefined) =>
@@ -128,6 +131,7 @@ const emptyDraft = (): Draft => ({
   reaktif: emptyRow(),
   yekdem_mahsup: emptyRow(),
   mahsuplasma: emptyRow(),
+  yek: emptyRow(),
 });
 
 /** DB'den gelen override'ları form taslağına çevirir. */
@@ -482,6 +486,9 @@ export default function InvoiceOverridesAdmin() {
       if (key === "guc") return selectedFacility.terim === "cift_terim";
       // Muhtelif-2 mahsuplaşma fiyatı yalnız Metod 3 (Tredaş) faturasında var.
       if (key === "mahsuplasma") return inputs?.invoiceMethodId === 3;
+      // YEK Bedeli satırı yalnız net metod (2/3/5) faturalarında var.
+      if (key === "yek")
+        return inputs != null && isNetInvoiceMethod(inputs.invoiceMethodId);
       return true;
     });
   }, [selectedFacility, inputs]);
@@ -505,10 +512,10 @@ export default function InvoiceOverridesAdmin() {
     return periodYear * 12 + periodMonth < m1.year() * 12 + (m1.month() + 1);
   }, [periodYear, periodMonth]);
 
-  // Metod 2/3'te YEKDEM farkı toplam sonrası mahsup DEĞİL, KDV matrahındaki bir
+  // Metod 2/3/5'te YEKDEM farkı toplam sonrası mahsup DEĞİL, KDV matrahındaki bir
   // KALEMdir (yekFarkiCharge) → manuel kart etiketleri ve önizleme buna göre değişir.
   const isNetMethod =
-    inputs?.invoiceMethodId === 2 || inputs?.invoiceMethodId === 3;
+    inputs != null && isNetInvoiceMethod(inputs.invoiceMethodId);
 
   const showVerisWarning =
     draft.enerji.isExcluded && (naturalResult?.breakdown.verisMahsupKwh ?? 0) > 0;
@@ -678,18 +685,18 @@ export default function InvoiceOverridesAdmin() {
     }[] = [
       { label: "Enerji Bedeli", natural: nb.energyCharge, edited: eb.energyCharge, excluded: excluded.has("enerji") },
     ];
-    // Metod 2/3 kalemleri (metod 1 önizlemesi değişmez).
+    // Metod 2/3/5 kalemleri (metod 1 önizlemesi değişmez).
     const mId = inputs?.invoiceMethodId;
     if (isNetMethod) {
       rows.push({
-        label: mId === 2 ? "YEK Bedeli" : "Tahmini YEKDEM",
+        label: mId === 3 ? "Tahmini YEKDEM" : "YEK Bedeli",
         natural: nb.yekTahminiCharge ?? 0,
         edited: eb.yekTahminiCharge ?? 0,
-        excluded: false,
+        excluded: excluded.has("yek"),
       });
       if ((nb.yekFarkiCharge ?? 0) !== 0 || (eb.yekFarkiCharge ?? 0) !== 0) {
         rows.push({
-          label: mId === 2 ? "YEK Farkı" : "Önceki YEKDEM Mahsup",
+          label: mId === 3 ? "Önceki YEKDEM Mahsup" : "YEK Farkı",
           natural: nb.yekFarkiCharge ?? 0,
           edited: eb.yekFarkiCharge ?? 0,
           // Manuel kartın "çıkar" kutusu bu kalemi kapatır (2C köprüsü).
@@ -976,15 +983,17 @@ export default function InvoiceOverridesAdmin() {
                           ? null
                           : key === "enerji"
                             ? nb.energyCharge
-                            : key === "trafo"
-                              ? nb.trafoCharge
-                              : key === "dagitim"
-                                ? nb.distributionCharge
-                                : key === "btv"
-                                  ? nb.btvCharge
-                                  : key === "guc"
-                                    ? nb.powerTotalCharge
-                                    : nb.reactivePenaltyCharge;
+                            : key === "yek"
+                              ? nb.yekTahminiCharge ?? 0
+                              : key === "trafo"
+                                ? nb.trafoCharge
+                                : key === "dagitim"
+                                  ? nb.distributionCharge
+                                  : key === "btv"
+                                    ? nb.btvCharge
+                                    : key === "guc"
+                                      ? nb.powerTotalCharge
+                                      : nb.reactivePenaltyCharge;
 
                       return (
                         <tr key={key} className="border-b border-neutral-100 align-top">
@@ -994,6 +1003,12 @@ export default function InvoiceOverridesAdmin() {
                               <div className="mt-1 text-[10px] text-neutral-400 max-w-[14rem]">
                                 Enerji birim fiyatı değişince trafo, BTV ve veriş mahsup bedeli de bu fiyattan
                                 hesaplanır.
+                              </div>
+                            )}
+                            {key === "yek" && (
+                              <div className="mt-1 text-[10px] text-neutral-400 max-w-[14rem]">
+                                Birim fiyat TL/kWh (doğal: tahmini YEKDEM × KBK). Metod 5'te BTV
+                                matrahına efektif değeriyle girer; metod 2/3'te BTV'yi etkilemez.
                               </div>
                             )}
                           </td>
@@ -1115,9 +1130,9 @@ export default function InvoiceOverridesAdmin() {
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-xs font-medium text-neutral-700">
                     {isNetMethod
-                      ? inputs?.invoiceMethodId === 2
-                        ? "YEK Farkı (Manuel)"
-                        : "Önceki YEKDEM Mahsup (Manuel)"
+                      ? inputs?.invoiceMethodId === 3
+                        ? "Önceki YEKDEM Mahsup (Manuel)"
+                        : "YEK Farkı (Manuel)"
                       : "YEKDEM Mahsubu (Manuel)"}
                   </span>
                   {inputs && (

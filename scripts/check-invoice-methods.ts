@@ -10,10 +10,11 @@
 // import ile sorunsuz yüklenir (@/lib/supabase zincirine girmez).
 
 import type { InvoiceInput } from "../src/components/utils/calculateInvoice";
-import { calculateInvoice } from "../src/components/utils/calculateInvoice";
+import { calculateInvoice, isM1MahsupCapPeriod } from "../src/components/utils/calculateInvoice";
 import {
   calculateInvoiceMethod2,
   calculateInvoiceMethod3,
+  calculateInvoiceMethod5,
   calculateYekFarki,
   resolveYekFarkiWithOverride,
   type InvoiceMethodInputs,
@@ -101,6 +102,16 @@ console.log("\n── Metod 3 (Tredaş) · Tesis 52503 · 2026-06 ──");
   // Override'ın formülü ezdiği NET görünsün: bariz farklı bir değer (2,5) → uygulanan = 2,5.
   const bOv2 = calculateInvoiceMethod3(input, { mahsuplasma: { isExcluded: false, unitPriceOverride: 2.5, amountOverride: null, payload: null, note: null } }, mi);
   assertClose("Override formülü ezer (birim=2,5)", bOv2.mahsuplasmaUnitPriceApplied!, 2.5, 0.0001);
+
+  // m3 sigortası: 'yek' override'ı SATIRI değiştirir ama m3 BTV matrahı DOĞAL
+  // yek ile hesaplanır → BTV bit-identik kalır (metod 5 farkı m3'e sıçramasın).
+  const bYekOv = calculateInvoiceMethod3(
+    input,
+    { yek: { isExcluded: false, unitPriceOverride: 0.9, amountOverride: null, payload: null, note: null } },
+    mi
+  );
+  assertClose("m3 yek override → satır override'lı", bYekOv.yekTahminiCharge!, mi.sumPos * 0.9, 0.01);
+  assertClose("m3 yek override → BTV değişmez", bYekOv.btvCharge, b.btvCharge, 1e-9);
 }
 
 // ── FIXTURE 2: Tesis 99980910 — Metod 2 (Uedaş), 2026-06 ─────────
@@ -137,8 +148,95 @@ console.log("\n── Metod 2 (Uedaş) · Tesis 99980910 · 2026-06 ──");
   assertClose("YEK Bedeli (net taban)", b.yekTahminiCharge!, 557059, 5);
   assertClose("YEK Farkı (veri yok→0)", b.yekFarkiCharge!, 0, 0.0001);
   // 2G sigortası: m2 BTV YALNIZ enerji bedelinden kesilir (YEKDEM matraha GİRMEZ) —
-  // m3 matrah değişikliği yanlışlıkla m2'ye sıçramasın. Enerji × %1 ≈ 9.485,67.
+  // m3/m5 matrah farkları yanlışlıkla m2'ye sıçramasın. Enerji × %1 ≈ 9.485,67.
   assertClose("BTV (yalnız enerji, m2 sigortası)", b.btvCharge, 9485.67, 1);
+
+  // m2 sigortası (metod 5 eklentisi): 'yek' override'ı satırı değiştirir ama
+  // m2 BTV matrahında yek zaten yok → BTV bit-identik kalır.
+  const yekExcludedOv = { yek: { isExcluded: true, unitPriceOverride: null, amountOverride: null, payload: null, note: null } };
+  const bYekEx = calculateInvoiceMethod2(input, yekExcludedOv, mi);
+  assertClose("m2 yek exclude → satır 0", bYekEx.yekTahminiCharge!, 0, 1e-9);
+  assertClose("m2 yek exclude → BTV değişmez", bYekEx.btvCharge, b.btvCharge, 1e-9);
+}
+
+// ── FIXTURE 2B: Metod 5 (İpragaz) — m2 kopyası, BTV matrahında YEK ──────────
+// Kullanıcı doğrulama örneği (2026-08): 517.762 kWh net · 1.016.800 kWh brüt ·
+// 499.038 kWh GES mahsubu (kimlik: sumCn − sumPos = 499.038 ✓).
+// Birim fiyatlar hedef tutarlardan türetilir (kbk=1):
+//   wPos = 1.750.847,13/517.762 · tahminiYekdem = 223.587,24/517.762
+//   D    = 1.323.283,11/1.016.800 (KDV-hariç kimliğinden: 3.317.461,82 −
+//          1.750.847,13 − 223.587,24 − 19.744,34)
+// ⚠ Örnekteki "Ödenecek 4.130.325,38" motor DIŞI +149.371,20 içerir (diğer
+// değerler / toplam-sonrası kalemler). Motor assert'i KDV dahil totalInvoice'tır:
+//   4.130.325,38 − 149.371,20 = 3.980.954,18 = 3.317.461,82 × 1,20.
+console.log("\n── Metod 5 (İpragaz) · BTV matrahında YEK ──");
+{
+  const mi: InvoiceMethodInputs = {
+    sumCn: 1016800,
+    sumGn: 499038,
+    sumPos: 517762,
+    sumMahsup: 499038,
+    sumExcess: 0,
+    wPos: 1750847.13 / 517762,
+    wMahsup: null,
+    kbk: 1,
+    tahminiYekdem: 223587.24 / 517762,
+    prevSumPos: null,
+    prevTahminiYekdem: null,
+    prevGerceklesenYekdem: null,
+    mahsuplasmaUnitPrice: null,
+  };
+  const input: MethodInvoiceInput = baseInput({
+    onYil: false,
+    perakendeEnerjiBedeli: 2.909691,
+    unitPriceDistribution: 1323283.11 / 1016800,
+  });
+
+  const b = calculateInvoiceMethod5(input, null, mi);
+  assertClose("Enerji (net taban)", b.energyCharge, 1750847.13, 0.01);
+  assertClose("YEK Bedeli (net taban)", b.yekTahminiCharge!, 223587.24, 0.01);
+  assertClose("BTV = (Enerji + YEK) × %1", b.btvCharge, 19744.34, 0.01);
+  assertClose("KDV Hariç Toplam", b.subtotalBeforeVat, 3317461.82, 0.05);
+  assertClose("KDV (%20)", b.vatCharge, 663492.36, 0.02);
+  assertClose("Genel Toplam (KDV Dahil)", b.totalInvoice, 3980954.18, 0.05);
+
+  // m5 ↔ m2 aynı girdiyle: TEK fark BTV (ve KDV'ye yansıması) — kalemler bit-identik.
+  const b2 = calculateInvoiceMethod2(input, null, mi);
+  assertClose("m5 enerji ≡ m2 enerji", b.energyCharge, b2.energyCharge, 1e-9);
+  assertClose("m5 YEK ≡ m2 YEK", b.yekTahminiCharge!, b2.yekTahminiCharge!, 1e-9);
+  assertClose("m5 dağıtım ≡ m2 dağıtım (brüt taban)", b.distributionCharge, b2.distributionCharge, 1e-9);
+  assertClose("m5 BTV − m2 BTV = YEK × %1", b.btvCharge - b2.btvCharge, (b.yekTahminiCharge ?? 0) * 0.01, 1e-6);
+
+  // 'yek' override etkileşimi — m5'te BTV matrahı EFEKTİF yek kullanır.
+  const bEx = calculateInvoiceMethod5(
+    input,
+    { yek: { isExcluded: true, unitPriceOverride: null, amountOverride: null, payload: null, note: null } },
+    mi
+  );
+  assertClose("m5 yek exclude → satır 0", bEx.yekTahminiCharge!, 0, 1e-9);
+  assertClose("m5 yek exclude → BTV = Enerji × %1", bEx.btvCharge, b.energyCharge * 0.01, 0.01);
+  {
+    const list = bEx.appliedOverrides?.excludedItems ?? [];
+    const ok = list.includes("yek");
+    if (!ok) failures++;
+    console.log(`  ${ok ? "✅" : "❌"} m5 yek exclude → appliedOverrides.excludedItems = ${JSON.stringify(list)}`);
+  }
+
+  const bOv = calculateInvoiceMethod5(
+    input,
+    { yek: { isExcluded: false, unitPriceOverride: 0.5, amountOverride: null, payload: null, note: null } },
+    mi
+  );
+  assertClose("m5 yek birim override → satır", bOv.yekTahminiCharge!, 517762 * 0.5, 0.01);
+  assertClose("m5 yek birim override → BTV matraha girer", bOv.btvCharge, (b.energyCharge + 517762 * 0.5) * 0.01, 0.01);
+
+  const bAmt = calculateInvoiceMethod5(
+    input,
+    { yek: { isExcluded: false, unitPriceOverride: null, amountOverride: 100000, payload: null, note: null } },
+    mi
+  );
+  assertClose("m5 yek tutar override → satır", bAmt.yekTahminiCharge!, 100000, 1e-9);
+  assertClose("m5 yek tutar override → BTV matraha girer", bAmt.btvCharge, (b.energyCharge + 100000) * 0.01, 0.01);
 }
 
 // ── FIXTURE 3 (SENTETİK): Önceki YEKDEM Mahsup / YEK Farkı aritmetiği ─────
@@ -507,6 +605,93 @@ console.log("\n── Sentetik · Alternatif Terim dış-mahsup taşıma (2H) �
   assertClose("Ana yekFarki (override, matrah-içi)", V, 1099065.83, 1);
   // İnvaryant: post-total taşıma, matrah-içi sonucu birebir üretir (delta = yekFarki×(1+KDV)).
   assertClose("Taşınan yekFarki + karş-olgusal = ana toplam", bAlt.totalInvoice + carried, bMain.totalInvoice, 0.5);
+}
+
+// ── FIXTURE 10 (2K): Metod 1 Veriş Mahsup perakende tavanı (Sepaş 2026-07) ──
+// Kural: dönem ≥ 2026-07 && m1 && !vhs_kayseri → mahsupBirim = min(U, perakende).
+// Kapı çağıranda çözülür (bayrak); motor dönem bilmez. Bayraksız çağrı = eski davranış
+// → mevcut tüm fixture'lar tanım gereği etkilenmez.
+console.log("\n── 2K · Metod 1 Veriş Mahsup perakende tavanı ──");
+{
+  // Kapı helper'ı — sınır dönemler (y×12+m ordinal aritmetiği).
+  const gateCases: ReadonlyArray<readonly [string, boolean, boolean]> = [
+    ["kapı 2025-12 → tavan yok", isM1MahsupCapPeriod(2025, 12), false],
+    ["kapı 2026-06 → tavan yok", isM1MahsupCapPeriod(2026, 6), false],
+    ["kapı 2026-07 → tavan var", isM1MahsupCapPeriod(2026, 7), true],
+    ["kapı 2027-01 → tavan var", isM1MahsupCapPeriod(2027, 1), true],
+    ["kapı NaN dönem → tavan yok (fail-safe)", isM1MahsupCapPeriod(NaN, 7), false],
+  ];
+  for (const [label, actual, expected] of gateCases) {
+    const ok = actual === expected;
+    if (!ok) failures++;
+    console.log(`  ${ok ? "✅" : "❌"} ${label}`);
+  }
+
+  // Aylık yol: veriş 100.000 < tüketim 200.000 → mahsup = 100.000 kWh.
+  const mk = (over: Partial<InvoiceInput>): InvoiceInput =>
+    baseInput({ totalConsumptionKwh: 200000, totalProductionKwh: 100000, ...over });
+
+  // (a) U < P, dönem 2026-07 (bayrak açık) → bayraksızla TAM AYNI breakdown (tavan pasif).
+  {
+    const inp = mk({ unitPriceEnergy: 2.5, perakendeEnerjiBedeli: 2.909691 });
+    const off = calculateInvoice(inp);
+    const on = calculateInvoice({ ...inp, applyVerisMahsupPerakendeCap: true });
+    const same = JSON.stringify(on) === JSON.stringify(off);
+    if (!same) failures++;
+    console.log(`  ${same ? "✅" : "❌"} (a) U ≤ P → breakdown bit-identik (tavan pasif)`);
+    assertClose("(a) uygulanan birim = U", on.verisMahsupBirimFiyat!, 2.5, 1e-12);
+  }
+
+  // (b) U=3,4 > P=2,909691 → kredi 290.969,10 (eski 340.000); BTV matrahı büyür.
+  {
+    const inp = mk({ unitPriceEnergy: 3.4, perakendeEnerjiBedeli: 2.909691 });
+    const off = calculateInvoice(inp);
+    const on = calculateInvoice({ ...inp, applyVerisMahsupPerakendeCap: true });
+    assertClose("(b) eski kredi (sanity)", off.verisMahsupBedeli, 340000, 0.01);
+    assertClose("(b) tavanlı kredi = kWh × P", on.verisMahsupBedeli, 290969.1, 0.01);
+    assertClose("(b) uygulanan birim = P", on.verisMahsupBirimFiyat!, 2.909691, 1e-9);
+    const capped = on.verisMahsupCapUygulandi === true;
+    if (!capped) failures++;
+    console.log(`  ${capped ? "✅" : "❌"} (b) verisMahsupCapUygulandi === true`);
+    // BTV artışı = Δkredi × oran = 100.000 × (3,4 − 2,909691) × 0,01 = 490,309.
+    assertClose("(b) BTV artışı = Δkredi × btv", on.btvCharge - off.btvCharge, 490.309, 0.001);
+    assertClose("(b) enerji kalemi DEĞİŞMEZ", on.energyCharge, off.energyCharge, 1e-9);
+    assertClose("(b) dağıtım (gn/2) DEĞİŞMEZ", on.distributionCharge, off.distributionCharge, 1e-9);
+    // Ara toplam farkı = kredi azalması (49.030,90) + BTV artışı (490,309).
+    assertClose("(b) ara toplam farkı", on.subtotalBeforeVat - off.subtotalBeforeVat, 49030.9 + 490.309, 0.01);
+  }
+
+  // (c) U > P ama dönem 2026-06 → kapı kapalı (çağıran bayrağı AÇMAZ) → eski sonuç birebir.
+  {
+    const inp = mk({ unitPriceEnergy: 3.4, perakendeEnerjiBedeli: 2.909691 });
+    const capPeriod = isM1MahsupCapPeriod(2026, 6); // false — geçmiş koruması
+    const b = calculateInvoice(capPeriod ? { ...inp, applyVerisMahsupPerakendeCap: true } : inp);
+    assertClose("(c) 2026-06 kredi tavansız (eski)", b.verisMahsupBedeli, 340000, 0.01);
+  }
+
+  // (d) Perakende yok (num(x,0) gerçeği: 0 gelir) + bayrak açık → tavansız devam + warn.
+  {
+    const warns: string[] = [];
+    const origWarn = console.warn;
+    let b: ReturnType<typeof calculateInvoice> | null = null;
+    try {
+      console.warn = (...a: unknown[]) => { warns.push(a.map(String).join(" ")); };
+      b = calculateInvoice(mk({
+        unitPriceEnergy: 3.4,
+        perakendeEnerjiBedeli: 0,
+        applyVerisMahsupPerakendeCap: true,
+      }));
+    } finally {
+      console.warn = origWarn;
+    }
+    assertClose("(d) perakende yok → kredi tavansız", b!.verisMahsupBedeli, 340000, 0.01);
+    const warned = warns.some((w) => w.includes("perakende"));
+    if (!warned) failures++;
+    console.log(`  ${warned ? "✅" : "❌"} (d) console.warn basıldı (${warns.length} adet)`);
+    const sparse = !("verisMahsupCapUygulandi" in b!);
+    if (!sparse) failures++;
+    console.log(`  ${sparse ? "✅" : "❌"} (d) capUygulandi anahtarı eklenmedi (sparse)`);
+  }
 }
 
 console.log(

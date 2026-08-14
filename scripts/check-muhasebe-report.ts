@@ -19,6 +19,7 @@ import {
   type MethodInvoiceInput,
 } from "../src/components/utils/calculateInvoiceNetMethods";
 import type { GesOlmasaydiResult } from "../src/components/utils/calculateGesOlmasaydi";
+import { buildPenguenTahakkukView } from "../src/components/dashboard/reports/penguenTahakkukView";
 
 // ── Test harness ────────────────────────────────────────────────
 let failures = 0;
@@ -436,7 +437,8 @@ const scenarios: Scenario[] = [];
 //    parametreleri) + saatlik SQL (w_cn = cn-ağırlıklı çıplak PTF) + subscription_yekdem
 //    (diger_degerler = 2730). Billed ve karşı-olgu breakdown'ları calculateInvoiceMethod2
 //    üretir — calculateGesOlmasaydi'nin arazi dalı birebir taklit edilir (motor aynı).
-{
+//    Senaryo 8 (Penguen Tahakkuk adaptörü) da AYNI payload'ı kullanır → fonksiyon.
+function buildPenguenS6() {
   const vat = 0.2, btv = 0.01, kbk = 1.0375, yekdem = 1.0945, unitDist = 1.182457;
   const sumCn = 972913.8000000006;            // total_consumption_kwh
   const sumPos = 490581.8850000028;           // net_positive_draw_kwh
@@ -492,15 +494,7 @@ const scenarios: Scenario[] = [];
   const yekUP = billed.yekTahminiCharge! / sumPos;
   const expectS2 = -(residual + sumMahsup * yekUP + residual * btv);
 
-  scenarios.push({
-    ad: "6) Metot 2 PENGUEN 99980910 (canlı DB, motor-türevli) → C=3.201.399,78",
-    totalWithMahsup: twm,
-    method2: true,
-    cfChecked: true,
-    cfOk: true, // KİMLİK KANITI: A + F ≡ gesOlmasaydiFatura — tutmazsa test KIRIK kalır
-    expectS2,
-    expects: { C: 3201399.78, A: 4202308.41, D1: satisNet },
-    payload: basePayload({
+  const payload = basePayload({
       breakdown: billed, vatRate: vat, btvRate: btv, invoiceMethodId: 2,
       totalConsumptionKwh: sumCn,
       unitPriceEnergy: 2.4042739367056853, naturalUnitPriceEnergy: 2.4042739367056853,
@@ -518,7 +512,115 @@ const scenarios: Scenario[] = [];
         tasarruf: gesOlmasaydi - twm + satisNet,
         gesOlmasaydiBreakdown: cf as unknown as InvoiceBreakdown,
       }),
-    }),
+  });
+  return { payload, twm, expectS2, satisNet };
+}
+
+{
+  const s6 = buildPenguenS6();
+  scenarios.push({
+    ad: "6) Metot 2 PENGUEN 99980910 (canlı DB, motor-türevli) → C=3.201.399,78",
+    totalWithMahsup: s6.twm,
+    method2: true,
+    cfChecked: true,
+    cfOk: true, // KİMLİK KANITI: A + F ≡ gesOlmasaydiFatura — tutmazsa test KIRIK kalır
+    expectS2: s6.expectS2,
+    expects: { C: 3201399.78, A: 4202308.41, D1: s6.satisNet },
+    payload: s6.payload,
+  });
+}
+
+// 6b) METOT 2 — PENGUEN Temmuz 2026 (canlı DB, motor-türevli): yekFarkiCharge ≠ 0
+//     (prev = Haziran: 490.581,885 × (1,083629 − 1,0945) × 1,0375 ≈ −5.533,12).
+//     Tahakkuk kabul rakamlarının kaynağı (bölüm 9): Fiş1 4.736.352,72 · Fiş2
+//     2.047.107,21 · Fiş3 5.274.201,83 · Diğer Satıcılar 3.227.094,61 = C.
+function buildPenguenTemmuz() {
+  const vat = 0.2, btv = 0.01, kbk = 1.0375, yekdem = 0.51789, unitDist = 1.182457;
+  const sumCn = 966509.5310000011;            // total_consumption_kwh (2026-07)
+  const sumPos = 381282.99000000436;          // net_positive_draw_kwh
+  const sumMahsup = sumCn - sumPos;
+  const sumGn = 1414493.1000000008;           // veris_kwh
+  const sumExcess = 829266.5590000051;        // net_excess_feed_kwh
+  const wPos = 3.3715411885822735;            // snapshot w_pos
+  const wCn = 2.59321141818204;               // canlı SQL: cn-ağırlıklı çıplak PTF (Temmuz)
+  const perakende = 2.909687, satisKesinti = 0.656008;
+  const diger = 0;                            // subscription_yekdem 2026-07: boş
+
+  const input: MethodInvoiceInput = {
+    totalConsumptionKwh: sumCn,
+    unitPriceEnergy: 3.2277677213638682, // motor m2'de YOK SAYAR (snapshot, görüntü)
+    unitPriceDistribution: unitDist,
+    btvRate: btv,
+    vatRate: vat,
+    tariffType: "single",
+    contractPowerKw: 3360,
+    monthFinalDemandKw: 0,
+    powerPrice: 0,
+    powerExcessPrice: 0,
+    reactivePenaltyCharge: 0,
+    trafoDegeri: 0,
+    totalProductionKwh: sumGn,
+    onYil: false,
+    usdKur: 0,
+    perakendeEnerjiBedeli: perakende,
+  };
+  const prevs = {
+    prevSumPos: 490581.8850000028, // Haziran sumPos — yekFarki ≠ 0 kaynağı
+    prevTahminiYekdem: 1.0945,
+    prevGerceklesenYekdem: 1.083629,
+  };
+  const miBilled: InvoiceMethodInputs = {
+    sumCn, sumGn, sumPos, sumMahsup, sumExcess,
+    wPos, kbk, tahminiYekdem: yekdem, ...prevs, mahsuplasmaUnitPrice: null,
+  };
+  const miCf: InvoiceMethodInputs = {
+    sumCn, sumGn: 0, sumPos: sumCn, sumMahsup: 0, sumExcess: 0,
+    wPos: wCn, kbk, tahminiYekdem: yekdem, ...prevs, mahsuplasmaUnitPrice: null,
+  };
+  const billed = calculateInvoiceMethod2(input, null, miBilled);
+  const cf = calculateInvoiceMethod2({ ...input, totalProductionKwh: 0 }, null, miCf);
+  const twm = billed.totalInvoice + diger; // 3.227.094,61
+  const gesOlmasaydi = cf.totalInvoice + diger;
+  const satisNet = sumExcess * (perakende - satisKesinti);
+  const grossUP = cf.energyUnitPriceApplied!;
+  const residual = (sumPos + sumMahsup) * grossUP - billed.energyCharge;
+  const yekUP = billed.yekTahminiCharge! / sumPos;
+  const expectS2 = -(residual + sumMahsup * yekUP + residual * btv);
+
+  const payload = basePayload({
+      breakdown: billed, vatRate: vat, btvRate: btv, invoiceMethodId: 2,
+      totalConsumptionKwh: sumCn,
+      unitPriceEnergy: 3.2277677213638682, naturalUnitPriceEnergy: 3.2277677213638682,
+      unitPriceDistribution: unitDist, effectiveDistributionUnitPrice: unitDist,
+      yekdemMahsup: 0, digerDegerler: diger, totalWithMahsup: twm,
+      onYil: false, usdKur: 0, perakendeEnerjiBedeli: perakende, dagitimUreticiBedeli: satisKesinti,
+      kbk, monthlyPTF: wCn, monthlyYekdem: yekdem,
+      tariffType: "single", anlikUretimKullanimi: false,
+      facilityLabel: "PENGUEN GIDA SANAYİ A.Ş.", serno: 99980910, monthLabel: "July 2026",
+      periodMonth: 7,
+      gesResult: makeGesResult({
+        mode: "producer", anlikUretimKullanimi: false,
+        mevcutFatura: twm, mevcutTuketimKwh: sumCn, hamTuketimKwh: sumCn,
+        gesOlmasaydiFatura: gesOlmasaydi,
+        satis: { satisKwh: sumExcess, satisNetGelir: satisNet },
+        tasarruf: gesOlmasaydi - twm + satisNet,
+        gesOlmasaydiBreakdown: cf as unknown as InvoiceBreakdown,
+      }),
+  });
+  return { payload, twm, expectS2, satisNet };
+}
+
+{
+  const t = buildPenguenTemmuz();
+  scenarios.push({
+    ad: "6b) Metot 2 PENGUEN Temmuz 2026 (yekFarki ≠ 0) → C=3.227.094,61",
+    totalWithMahsup: t.twm,
+    method2: true,
+    cfChecked: true,
+    cfOk: true,
+    expectS2: t.expectS2,
+    expects: { C: 3227094.61, D1: t.satisNet },
+    payload: t.payload,
   });
 }
 
@@ -663,6 +765,123 @@ for (const sc of scenarios) {
     if (sc.expects.E1 != null) assertClose("E1 (beklenen)", s.E1, sc.expects.E1);
     if (sc.expects.E2 != null) assertClose("E2 (beklenen)", s.E2, sc.expects.E2);
     if (sc.expects.D1 != null) assertClose("D1 (beklenen)", s.D1, sc.expects.D1);
+  }
+}
+
+// ── 8) PENGUEN TAHAKKUK görünümü (saf adaptör) ──────────────────
+// Aynı motor-türevli S6 payload'ı; hesap TEK KAYNAK, adaptör yalnız yeniden sınıflandırır.
+console.log("\n── 8) Penguen Tahakkuk görünümü (saf adaptör) ──");
+{
+  const s6 = buildPenguenS6();
+  const rep = buildMuhasebeReport(s6.payload);
+  const view = buildPenguenTahakkukView(rep, s6.payload);
+  assertTrue("Metot 2 → view üretildi (null değil)", view != null);
+  if (view) {
+    const d = view.degerler;
+    assertClose("eUP", d.eUP, 1.933554, 0.000001);
+    assertClose("elektrikGideri", d.elektrikGideri, 2447744.21, 0.05);
+    assertClose("dagitimBedeli", d.dagitimBedeli, 1150428.73, 0.01);
+    assertClose("indirilecekKdv", d.indirilecekKdv, 533111.63, 0.01);
+    assertClose("digerDuzeltme", d.digerDuzeltme, 2730, 0.001);
+    assertClose("mahsupTutari", d.mahsupTutari, 932614.79, 0.05);
+    // KAPANIŞIN KANITI — fixture ayarlaması YASAK; tutmazsa kırık bırakılır:
+    assertClose("digerSaticilar == C (rapor)", d.digerSaticilar, rep.sonuc.C, 0.01);
+    assertClose("digerSaticilar (beklenen 3.201.399,78)", d.digerSaticilar, 3201399.78, 0.01);
+    assertClose("borcToplam (beklenen 4.134.014,57)", d.borcToplam, 4134014.57, 0.05);
+    assertClose("borcToplam == mahsup + digerSaticilar", d.borcToplam, d.mahsupTutari + d.digerSaticilar, 0.005);
+    assertTrue("kapanis.ok === true", view.kapanis.ok === true);
+    assertTrue("view.warnings boş", view.warnings.length === 0);
+
+    for (const fis of view.fisler) {
+      assertClose(`${fis.baslik}: Borç == Alacak`, fis.toplamBorc, fis.toplamAlacak, 0.01);
+    }
+    const fis3 = view.fisler[2];
+    const satici = fis3.satirlar.find((r) => r.hesapKodu === "320");
+    assertClose("Fiş 3: Diğer Satıcılar (320) alacak == digerSaticilar", satici?.alacak ?? NaN, d.digerSaticilar, 0.001);
+    assertTrue("Fiş 3: düzeltme satırı borçta (2.730)", fis3.satirlar.some((r) => r.aciklama.includes("Düzeltmeler") && Math.abs((r.borc ?? 0) - 2730) < 0.001));
+    assertTrue("Fiş 3: doldurulabilir fatura alanları işaretli", fis3.editableFaturaAlanlari === true);
+    assertTrue("Özet mahsup etiketi dönem ayı (Haziran)", view.ozet[2].kalem.includes("Haziran"));
+    // Dayanak bileşen kimliği (Excel'den dayanak bloğu kalktı → denetim kodda)
+    const bb = s6.payload.breakdown;
+    const bilesenToplam =
+      bb.energyCharge + (bb.yekTahminiCharge ?? 0) + (bb.yekFarkiCharge ?? 0) +
+      bb.trafoCharge + bb.powerTotalCharge + bb.reactivePenaltyCharge + bb.btvCharge + d.mahsupTutari;
+    assertClose("Σbileşen == elektrikGideri", bilesenToplam, d.elektrikGideri, 0.01);
+  }
+
+  // Metot 1 payload → null (varyant devre dışı)
+  const m1 = scenarios[0];
+  const m1rep = buildMuhasebeReport(m1.payload);
+  assertTrue("Metot 1 → null", buildPenguenTahakkukView(m1rep, m1.payload) === null);
+
+  // sumPos = 0 guard (tüm ay mahsuba giderse) → null, sıfıra bölme yok
+  const zeroBd = makeMethod2Breakdown(
+    { sumPos: 0, sumMahsup: 5000, energyCharge: 0, yekTahminiCharge: 0, yekFarkiCharge: 0, distributionCharge: 6000, btvCharge: 0, verisFazlaKwh: 0 },
+    0.2,
+  );
+  const zeroPayload = basePayload({
+    breakdown: zeroBd, invoiceMethodId: 2, totalWithMahsup: zeroBd.totalInvoice,
+    gesResult: makeGesResult({
+      mode: "producer", mevcutFatura: zeroBd.totalInvoice,
+      mevcutTuketimKwh: 5000, hamTuketimKwh: 6000, gesOlmasaydiFatura: zeroBd.totalInvoice,
+    }),
+  });
+  const zeroRep = buildMuhasebeReport(zeroPayload);
+  assertTrue("sumPos=0 guard → null", buildPenguenTahakkukView(zeroRep, zeroPayload) === null);
+}
+
+// ── 9) PENGUEN TAHAKKUK — Temmuz 2026 (yekFarki ≠ 0, kabul rakamları) ────────
+console.log("\n── 9) Penguen Tahakkuk — Temmuz 2026 (yekFarki ≠ 0) ──");
+{
+  const t = buildPenguenTemmuz();
+  const rep = buildMuhasebeReport(t.payload);
+  const view = buildPenguenTahakkukView(rep, t.payload);
+  assertTrue("view != null", view != null);
+  if (view) {
+    const d = view.degerler;
+    assertClose("yekFarkiCharge ≈ −5.533,12", t.payload.breakdown.yekFarkiCharge ?? NaN, -5533.12, 0.05);
+    assertClose("Fiş 1 toplamı (beklenen 4.736.352,72)", view.fisler[0].toplamBorc, 4736352.72, 0.05);
+    assertClose("Fiş 2 toplamı (beklenen 2.047.107,21)", view.fisler[1].toplamBorc, 2047107.21, 0.05);
+    assertClose("Fiş 3 toplamı (beklenen 5.274.201,83)", view.fisler[2].toplamBorc, 5274201.83, 0.05);
+    for (const fis of view.fisler) {
+      assertClose(`${fis.baslik}: Borç == Alacak`, fis.toplamBorc, fis.toplamAlacak, 0.01);
+    }
+    assertClose("digerSaticilar == C (rapor)", d.digerSaticilar, rep.sonuc.C, 0.01);
+    assertClose("digerSaticilar (beklenen 3.227.094,61)", d.digerSaticilar, 3227094.61, 0.01);
+    assertTrue("kapanis.ok === true", view.kapanis.ok === true);
+    assertTrue("bileşen kontrolü sessiz (warnings boş)", view.warnings.length === 0);
+    assertTrue("Özet mahsup etiketi dönem ayı (Temmuz)", view.ozet[2].kalem.includes("Temmuz"));
+  }
+}
+
+// ── 10) KASITLI BOZUK FIXTURE — bileşen kontrolü uyarı üretmeli ──────────────
+// subtotal'a bileşenlerde karşılığı olmayan +500 eklenir (vat/total tutarlı
+// büyütülür, kapanış bozulmaz) → yalnız "Dayanak kontrolü" uyarısı beklenir.
+console.log("\n── 10) Kasıtlı bozuk fixture → bileşen kontrolü uyarısı ──");
+{
+  const s6 = buildPenguenS6();
+  const orijinalBd = s6.payload.breakdown;
+  const bozukBd = {
+    ...orijinalBd,
+    subtotalBeforeVat: orijinalBd.subtotalBeforeVat + 500,
+    vatCharge: orijinalBd.vatCharge + 100,
+    totalInvoice: orijinalBd.totalInvoice + 600,
+  };
+  const bozukPayload: MuhasebePayload = {
+    ...s6.payload,
+    breakdown: bozukBd,
+    totalWithMahsup: s6.payload.totalWithMahsup + 600,
+  };
+  const bozukRep = buildMuhasebeReport(bozukPayload);
+  const bozukView = buildPenguenTahakkukView(bozukRep, bozukPayload);
+  assertTrue("view != null (bloklama yok, Excel üretilir)", bozukView != null);
+  if (bozukView) {
+    assertTrue(
+      '"Dayanak kontrolü" uyarısı üretildi',
+      bozukView.warnings.some((w) => w.includes("Dayanak kontrolü")),
+    );
+    assertTrue("yalnız 1 uyarı (kapanış bozulmadı)", bozukView.warnings.length === 1);
+    assertTrue("kapanis.ok === true (tutarlı büyütme)", bozukView.kapanis.ok === true);
   }
 }
 

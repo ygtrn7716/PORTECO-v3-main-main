@@ -21,7 +21,7 @@ import {
   calculateGesUretimSatisi,
   type GesUretimSatisiResult,
 } from "@/lib/ges/gesUretimSatisi";
-import type { InvoiceMethodId } from "@/lib/invoiceMethods";
+import { isNetInvoiceMethod, type InvoiceMethodId } from "@/lib/invoiceMethods";
 import type { MethodInvoiceBreakdown } from "@/components/utils/calculateInvoiceNetMethods";
 
 /** Mahsup kartının metod-bazlı sunum şekli. */
@@ -30,10 +30,13 @@ export type GesMahsupPresentation =
       /** Metod 1 (ve M1'e düşen replay'ler): faturadaki "Veriş Mahsup" satırı. */
       kind: "unit-price";
       kwh: number;
-      /** Efektif (override uygulanmış) enerji birim fiyatı — TL/kWh. */
+      /** Mahsup satırında UYGULANAN birim fiyat — TL/kWh (2K: tavan kırptıysa
+       *  perakende; aksi halde efektif enerji fiyatı). */
       unitPrice: number;
       /** kwh × unitPrice — InvoiceDetail'deki satırla aynı çarpım. */
       tutar: number;
+      /** Aşama 2K: perakende tavanı kırptı (satırdaki "(perakende tavanı)" notu). */
+      capUygulandi?: boolean;
     }
   | {
       /** Metod 2: mahsup örtük (net enerji bazı) — faturada TL satırı yok. */
@@ -92,11 +95,10 @@ export function deriveGesSatisMahsup(args: {
 }): GesSatisMahsupResult {
   const { invoiceMethodId, breakdown } = args;
 
-  // M2/3 breakdown'ı gerçekten net motordan mı geldi? (lisanslı ve w_pos'suz
+  // M2/3/5 breakdown'ı gerçekten net motordan mı geldi? (lisanslı ve w_pos'suz
   // eski snapshot'lar M1 çekirdeğine düşer; wPosApplied yalnız net motorda var.)
   const effectiveMethodId: InvoiceMethodId =
-    (invoiceMethodId === 2 || invoiceMethodId === 3) &&
-    breakdown.wPosApplied === undefined
+    isNetInvoiceMethod(invoiceMethodId) && breakdown.wPosApplied === undefined
       ? 1
       : invoiceMethodId;
 
@@ -127,7 +129,8 @@ export function deriveGesSatisMahsup(args: {
     mahsup = { kind: "none", reason: "lisansli" };
   } else if (!(mahsupKwh > 0)) {
     mahsup = { kind: "none", reason: "zero" };
-  } else if (effectiveMethodId === 2) {
+  } else if (effectiveMethodId === 2 || effectiveMethodId === 5) {
+    // m5 = m2 kopyası: mahsup net faturalamada örtük, ayrı kredi satırı yok.
     mahsup = { kind: "implicit-net", kwh: mahsupKwh };
   } else if (effectiveMethodId === 3) {
     mahsup = {
@@ -139,11 +142,15 @@ export function deriveGesSatisMahsup(args: {
       net: breakdown.muhtelif2Net ?? 0,
     };
   } else {
+    // 2K: motorun UYGULADIĞI fiyat/tutar esas — fatura satırıyla birebir
+    // (tavansızken kwh × birim aynı operandlarla bit-identik çarpımdır).
+    const unitPrice = breakdown.verisMahsupBirimFiyat ?? args.unitPriceEnergy;
     mahsup = {
       kind: "unit-price",
       kwh: mahsupKwh,
-      unitPrice: args.unitPriceEnergy,
-      tutar: mahsupKwh * args.unitPriceEnergy,
+      unitPrice,
+      tutar: breakdown.verisMahsupBedeli ?? mahsupKwh * unitPrice,
+      ...(breakdown.verisMahsupCapUygulandi ? { capUygulandi: true } : {}),
     };
   }
 

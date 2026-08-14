@@ -22,6 +22,7 @@ import {
   upsertInvoiceSnapshot,
 } from "@/components/utils/invoiceSnapshots";
 import {
+  isNetInvoiceMethod,
   resolveInvoiceMethods,
   methodForProvider,
   type InvoiceMethodId,
@@ -309,7 +310,7 @@ export async function precheckBackdatedPeriod(p: {
   // Hangi alan sorulacak: yalnız DB'de OLMAYANLAR ve methodun ihtiyaç duydukları.
   // Metod 4 (GES'siz düz fatura): mahsup/YEK Farkı ve satış yok → prev+usd sorulmaz.
   const needsPrev =
-    (methodId === 1 || methodId === 2 || methodId === 3) &&
+    (methodId === 1 || isNetInvoiceMethod(methodId)) &&
     !lisansliSatis &&
     consPrev;
   const ask: Record<BackdatedYekdemField, boolean> = {

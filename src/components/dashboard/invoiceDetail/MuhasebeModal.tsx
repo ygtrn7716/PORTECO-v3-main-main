@@ -11,6 +11,7 @@ import type {
   MuhasebeBlock,
   MuhasebeRow,
 } from "@/components/dashboard/reports/muhasebeReport";
+import type { PenguenTahakkukView } from "@/components/dashboard/reports/penguenTahakkukView";
 
 const fmtMoney = (n: number) =>
   n.toLocaleString("tr-TR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -33,9 +34,11 @@ interface Props {
   open: boolean;
   onClose: () => void;
   report: MuhasebeReport | null;
+  /** Penguen Tahakkuk varyantı — non-null ise Excel'e özel sheet'ler eklenir + rozet. */
+  tahakkukView?: PenguenTahakkukView | null;
 }
 
-export default function MuhasebeModal({ open, onClose, report }: Props) {
+export default function MuhasebeModal({ open, onClose, report, tahakkukView = null }: Props) {
   const [downloading, setDownloading] = useState(false);
 
   if (!open || !report) return null;
@@ -46,7 +49,7 @@ export default function MuhasebeModal({ open, onClose, report }: Props) {
       const { exportMuhasebeXlsx } = await import(
         "@/components/dashboard/reports/exportMuhasebeXlsx"
       );
-      await exportMuhasebeXlsx(report);
+      await exportMuhasebeXlsx(report, tahakkukView);
     } catch (e) {
       console.error("Muhasebe Excel indirme hatası:", e);
     } finally {
@@ -60,7 +63,14 @@ export default function MuhasebeModal({ open, onClose, report }: Props) {
         {/* Başlık */}
         <div className="sticky top-0 z-10 flex items-center justify-between gap-3 rounded-t-2xl border-b border-neutral-200 bg-white px-5 py-4">
           <div className="min-w-0">
-            <h2 className="truncate text-base font-semibold text-neutral-800">{report.meta.baslik}</h2>
+            <div className="flex items-center gap-2">
+              <h2 className="truncate text-base font-semibold text-neutral-800">{report.meta.baslik}</h2>
+              {tahakkukView && (
+                <span className="shrink-0 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
+                  Tahakkuk formatı
+                </span>
+              )}
+            </div>
             <p className="truncate text-xs text-neutral-500">
               {report.meta.tesis} · {report.meta.donem} · Serno {report.meta.serno}
             </p>

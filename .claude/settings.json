@@ -21,7 +21,10 @@
       "Bash(node -e \"const p=require\\('./package.json'\\);console.log\\(JSON.stringify\\(p.scripts,null,1\\)\\)\")",
       "PowerShell(npm run check:invoice-methods)",
       "PowerShell(npm run build)",
-      "PowerShell(npx tsc --noEmit 2>&1)"
+      "PowerShell(npx tsc --noEmit 2>&1)",
+      "Bash(npx tsc *)",
+      "Bash(echo \"EXIT_FILTER=$?\")",
+      "PowerShell(npm run check:muhasebe 2>$null; Write-Host \"EXIT: $LASTEXITCODE\")"
     ]
   }
 }

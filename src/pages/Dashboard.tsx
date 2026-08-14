@@ -15,10 +15,12 @@ import {
 
 import {
   calculateYekdemMahsup,
+  isM1MahsupCapPeriod,
   type TariffType,
 } from "@/components/utils/calculateInvoice";
 import {
   calculateInvoiceForMethod,
+  isNetInvoiceMethod,
   methodForProvider,
   resolveInvoiceMethods,
 } from "@/lib/invoiceMethods";
@@ -1095,13 +1097,17 @@ export default function Dashboard() {
           netPositiveDrawKwh: prevMonthNetPos ?? undefined,
           netExcessFeedKwh: prevMonthNetExcess ?? undefined,
           methodInputs: methodInputs ?? undefined,
+          // 2K: mahsup tavanı kapısı (dönem + provider ≠ vhs_kayseri)
+          applyVerisMahsupPerakendeCap:
+            isM1MahsupCapPeriod(periodYear, periodMonth) &&
+            subRow?.provider !== "vhs_kayseri",
         }, lineOverrides);
 
         // ✅ YEKDEM mahsup (M-1)
         // Lisanslı Satış tesisleri için YEKDEM mahsup uygulanmaz.
-        // D4: Metod 2/3'te fark KDV matrahındaki kalem (yekFarkiCharge) → toplam
+        // D4: Metod 2/3/5'te fark KDV matrahındaki kalem (yekFarkiCharge) → toplam
         // sonrası mahsup 0'a zorlanır (çift sayım önlenir).
-        const isNetMethod = invoiceMethodId === 2 || invoiceMethodId === 3;
+        const isNetMethod = isNetInvoiceMethod(invoiceMethodId);
         let yekdemMahsupValue = 0;
         let has = false;
         let missing: "none" | "value" | "final" | "both" =
@@ -1500,10 +1506,10 @@ export default function Dashboard() {
           // Tesis x ay için USD kur (subscription_yekdem.usd_kur'dan, subYek satırında zaten geldi)
           const subUsdKur = subYek?.usd_kur != null ? Number(subYek.usd_kur) : 0;
 
-          // Metod 2/3 saatlik-net girdileri (yalnız ilgili metotta).
+          // Metod 2/3/5 saatlik-net girdileri (yalnız ilgili metotta).
           // Metod 4 düz fatura (metod-1 motoru) → net-girdi montajını atlar (metod 1 gibi).
           let subMethodInputs: InvoiceMethodInputs | null = null;
-          if (subInvoiceMethodId === 2 || subInvoiceMethodId === 3) {
+          if (isNetInvoiceMethod(subInvoiceMethodId)) {
             subMethodInputs = await assembleMethodInputs({
               supabase,
               userId: uid,
@@ -1537,11 +1543,15 @@ export default function Dashboard() {
             netPositiveDrawKwh: subNetPos,
             netExcessFeedKwh: subNetExcess,
             methodInputs: subMethodInputs ?? undefined,
+            // 2K: mahsup tavanı kapısı (dönem + provider ≠ vhs_kayseri)
+            applyVerisMahsupPerakendeCap:
+              isM1MahsupCapPeriod(pYear, pMonth) &&
+              subRow?.provider !== "vhs_kayseri",
           }, subLineOverrides);
 
           // YEKDEM Mahsup (M-1) — Lisanslı Satış tesisleri için atlanır.
-          // D4: Metod 2/3'te fark KDV matrahındaki kalem → toplam sonrası mahsup 0.
-          const subIsNetMethod = subInvoiceMethodId === 2 || subInvoiceMethodId === 3;
+          // D4: Metod 2/3/5'te fark KDV matrahındaki kalem → toplam sonrası mahsup 0.
+          const subIsNetMethod = isNetInvoiceMethod(subInvoiceMethodId);
           let yekdemMahsupVal = 0;
           if (!subLisansliSatis && !subIsNetMethod) try {
             const billingMonth = dayjsTR().year(pYear).month(pMonth - 1);

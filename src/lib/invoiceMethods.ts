@@ -6,6 +6,7 @@ import type { InvoiceOverrides } from "@/components/utils/invoiceOverrides";
 import {
   calculateInvoiceMethod2,
   calculateInvoiceMethod3,
+  calculateInvoiceMethod5,
   type InvoiceMethodInputs,
   type MethodInvoiceBreakdown,
   type MethodInvoiceInput,
@@ -30,8 +31,14 @@ export type {
  * bkz. billedInvoiceInputs.ts başındaki not) → admin bağlamında doğrudan sorgu.
  */
 
-export type InvoiceMethodId = 1 | 2 | 3 | 4;
+export type InvoiceMethodId = 1 | 2 | 3 | 4 | 5;
 export const DEFAULT_INVOICE_METHOD: InvoiceMethodId = 1;
+
+/** Saatlik-net motorundan geçen metodlar (2=Uedaş, 3=Tredaş, 5=İpragaz).
+ *  Metod 5, Metod 2 kopyasıdır; tek fark BTV matrahına YEK bedelinin girmesi. */
+export function isNetInvoiceMethod(id: InvoiceMethodId): boolean {
+  return id === 2 || id === 3 || id === 5;
+}
 
 export type BillingIntegrationMethod = {
   invoiceFrom: string;
@@ -46,7 +53,7 @@ export type ResolveInvoiceMethodsParams =
   | { context: "admin"; userId: string; supabase: SupabaseClient };
 
 export function isInvoiceMethodId(v: unknown): v is InvoiceMethodId {
-  return v === 1 || v === 2 || v === 3 || v === 4;
+  return v === 1 || v === 2 || v === 3 || v === 4 || v === 5;
 }
 
 /** Snapshot/DB'den gelen metod değerini güvenle daraltır.
@@ -187,7 +194,7 @@ export function methodForProvider(
  * Metod dispatcher'ı (Aşama 2B).
  *
  * Metod 1 → değişmemiş calculateInvoice (bit-identik).
- * Metod 2/3 → saatlik-net motorları. Bu motorlar `input.methodInputs` (veya
+ * Metod 2/3/5 → saatlik-net motorları. Bu motorlar `input.methodInputs` (veya
  * açık `methodInputs` argümanı) olmadan çalışamaz; gelmemişse UYARI basıp
  * Metod 1'e düşülür. Böylece boru hattı henüz bağlanmamış bir yüzey (örn.
  * bir what-if simülasyonu) çökmez, yalnızca eski davranışı sürdürür.
@@ -200,7 +207,7 @@ export function calculateInvoiceForMethod(
 ): MethodInvoiceBreakdown {
   const mi = methodInputs ?? input.methodInputs;
 
-  if (methodId === 2 || methodId === 3) {
+  if (isNetInvoiceMethod(methodId)) {
     // Lisanslı satış: net motor (saatlik mahsuplaşma) bu senaryoyu desteklemiyor.
     // Metod 1 lisanslı semantiğini tam onurlandırıyor (mahsuplaşma kapalı, gross
     // dağıtım, verisMahsup=0, tüm üretim → fazla/satış) → Metod 1'e yönlendir.
@@ -216,7 +223,9 @@ export function calculateInvoiceForMethod(
     }
     return methodId === 2
       ? calculateInvoiceMethod2(input, overrides, mi)
-      : calculateInvoiceMethod3(input, overrides, mi);
+      : methodId === 3
+        ? calculateInvoiceMethod3(input, overrides, mi)
+        : calculateInvoiceMethod5(input, overrides, mi);
   }
 
   if (methodId === 4) {

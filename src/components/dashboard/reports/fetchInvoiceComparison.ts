@@ -50,7 +50,8 @@ export async function fetchInvoiceComparison(args: {
   const { data, error } = await supabase
     .from("invoice_snapshots")
     .select(
-      `subscription_serno, period_year, period_month, ${INVOICE_SNAPSHOT_RECOMPUTE_FIELDS}`,
+      // period_year/period_month artık RECOMPUTE_FIELDS içinde (2K) — çift kolon olmasın.
+      `subscription_serno, ${INVOICE_SNAPSHOT_RECOMPUTE_FIELDS}`,
     )
     .eq("user_id", uid)
     .eq("invoice_type", "billed")

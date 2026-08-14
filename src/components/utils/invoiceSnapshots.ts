@@ -1,9 +1,14 @@
 //src/components/utils/invoiceSnapshots.ts
 import { supabase } from "@/lib/supabase";
-import { type InvoiceBreakdown, type TariffType } from "@/components/utils/calculateInvoice";
+import {
+  isM1MahsupCapPeriod,
+  type InvoiceBreakdown,
+  type TariffType,
+} from "@/components/utils/calculateInvoice";
 import {
   calculateInvoiceForMethod,
   coerceInvoiceMethodId,
+  isNetInvoiceMethod,
   type InvoiceMethodId,
 } from "@/lib/invoiceMethods";
 import type {
@@ -44,7 +49,7 @@ type RecomputeRow = Partial<InvoiceSnapshotRow> & {
   diger_degerler?: number | null;
 };
 
-/** Metod 2/3 snapshot satırından saatlik-net girdilerini yeniden kurar.
+/** Metod 2/3/5 snapshot satırından saatlik-net girdilerini yeniden kurar.
  *  sumMahsup = sumCn − sumPos (min(cn,gn) kimliği). Metod 1/null → undefined.
  *  Kolonlar eksikse (teoride yok) 0'lı girdiler döner → motor 0 kalem üretir. */
 export function methodInputsFromSnapshotRow(
@@ -53,7 +58,7 @@ export function methodInputsFromSnapshotRow(
   const methodId = coerceInvoiceMethodId(row.invoice_method);
   // Metod 1 ve Metod 4 (GES'siz düz fatura) saatlik-net girdisi taşımaz (w_pos yok) →
   // undefined; dispatcher metod-1 çekirdeğinden hesaplar (m4 dalı üretimi sıfırlar).
-  if (methodId !== 2 && methodId !== 3) return undefined;
+  if (!isNetInvoiceMethod(methodId)) return undefined;
   // Aşama 2A geçiş dönemi: invoice_method=2/3 damgalı ama w_pos'suz satırlar
   // (2B öncesi yazım) METOD 1 MOTORUYLA hesaplanmıştı. Replay de m1 ile yapılmalı
   // — yoksa wPos=0 ile enerji kalemi çöker. undefined → dispatcher m1'e düşer.
@@ -128,6 +133,13 @@ export function buildSnapshotBreakdown(
       netPositiveDrawKwh: row.net_positive_draw_kwh != null ? Number(row.net_positive_draw_kwh) : undefined,
       netExcessFeedKwh: row.net_excess_feed_kwh != null ? Number(row.net_excess_feed_kwh) : undefined,
       methodInputs,
+      // Aşama 2K: mahsup tavanı kapısı — dönem saklı damgadan, Kayseri
+      // invoice_from'dan ('kayseri_osb', 20260718_002; NOT NULL 20260718_003).
+      // Dönem alanları select'te yoksa Number(undefined)=NaN → kapı kapalı,
+      // fail-safe eski davranış. ≤ 2026-06 replay'i böylece koşulsuz tavansız.
+      applyVerisMahsupPerakendeCap:
+        isM1MahsupCapPeriod(Number(row.period_year), Number(row.period_month)) &&
+        row.invoice_from !== "kayseri_osb",
     },
     overrides
   );
@@ -150,7 +162,7 @@ export function recomputeSnapshotTotalWithMahsup(
 /** Tek noktadan import edilen "snapshot select" listesi — recompute yapacak
  * çağıran tarafların kullanması beklenir. */
 export const INVOICE_SNAPSHOT_RECOMPUTE_FIELDS =
-  "total_consumption_kwh, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, total_with_mahsup, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price";
+  "period_year, period_month, total_consumption_kwh, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, total_with_mahsup, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price";
 
 export type InvoiceType = "billed" | "backdated";
 

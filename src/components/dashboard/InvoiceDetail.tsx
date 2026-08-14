@@ -21,6 +21,10 @@ import {
   buildMuhasebeReport,
   MUHASEBE_SUPPORTED_METHODS,
 } from "@/components/dashboard/reports/muhasebeReport";
+import {
+  buildPenguenTahakkukView,
+  type PenguenTahakkukView,
+} from "@/components/dashboard/reports/penguenTahakkukView";
 import type {
   MuhasebePayload,
   MuhasebeReport,
@@ -31,12 +35,14 @@ import TalepBirlestirmeBanner from "@/components/dashboard/shared/TalepBirlestir
 import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
 import { deriveGesSatisMahsup } from "@/lib/ges/gesSatisMahsup";
 
-import type {
-  InvoiceBreakdown,
-  TariffType,
+import {
+  isM1MahsupCapPeriod,
+  type InvoiceBreakdown,
+  type TariffType,
 } from "@/components/utils/calculateInvoice";
 import {
   calculateInvoiceForMethod,
+  isNetInvoiceMethod,
   methodForProvider,
   resolveInvoiceMethods,
   type InvoiceMethodId,
@@ -145,6 +151,9 @@ interface InvoiceViewData {
    // Kayseri OSB (owner_subscriptions.provider = 'vhs_kayseri'): Dağıtım Bedeli
    // kalemi kaldırılır; katsayı kaydı varsa "Ek Bedeller" kartı gösterilir.
    isKayseriOsb: boolean;
+   // Aşama 2K: mahsup tavanı kapısı (dönem ≥ 2026-07 && !Kayseri) — AlternateTariff
+   // simülasyonu ana faturayla aynı kapıyı kullansın diye taşınır.
+   applyVerisMahsupPerakendeCap: boolean;
    // Tedarik firmasından çözülen fatura metodu.
    invoiceMethodId: InvoiceMethodId;
    // Metod 2/3 saatlik-net girdileri (AlternateTariff + GES Olmasaydı da kullanır).
@@ -548,7 +557,7 @@ export default function InvoiceDetail() {
         // 4) tesis ayarları (KBK + tarife + güç limit) -> SADECE subscription_settings
         const settingsRes = await supabase
           .from("subscription_settings")
-          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi, muhasebe_excel_enabled")
+          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi, muhasebe_excel_enabled, muhasebe_excel_format")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -584,6 +593,9 @@ export default function InvoiceDetail() {
         // Muhasebe Excel opt-in flag (kolon yoksa → false, sayfa patlamaz).
         const muhasebeExcelEnabled =
           (settingsRes.data as any).muhasebe_excel_enabled ?? false;
+        // Muhasebe Excel çıktı formatı (kolon okunamazsa → 'standard').
+        const muhasebeExcelFormat =
+          ((settingsRes.data as any).muhasebe_excel_format as string) ?? "standard";
 
         const missing: string[] = [];
         if (!terim) missing.push("terim");
@@ -646,6 +658,10 @@ export default function InvoiceDetail() {
 
         // Kayseri OSB tespiti: dağıtım bedeli kaldırılır, Ek Bedeller kartı gösterilir.
         const isKayseriOsb = provider === "vhs_kayseri";
+
+        // Aşama 2K: mahsup tavanı kapısı (dönem + provider; motor saf kalır).
+        const applyVerisMahsupPerakendeCap =
+          isM1MahsupCapPeriod(periodYear, periodMonth) && !isKayseriOsb;
 
         // Fatura metodu: kullanıcının entegrasyonlarından provider ile çözülür.
         const methodMap = await resolveInvoiceMethods({ context: "self", userId: uid });
@@ -830,6 +846,7 @@ export default function InvoiceDetail() {
             netPositiveDrawKwh,
             netExcessFeedKwh,
             methodInputs: methodInputs ?? undefined,
+            applyVerisMahsupPerakendeCap, // 2K: mahsup tavanı (Temmuz 2026+)
           }, invoiceLineOverrides);
 
        //ara taşak madde ekliyom  buraya
@@ -845,7 +862,7 @@ export default function InvoiceDetail() {
         // Lisanslı Satış tesisleri için YEKDEM mahsup uygulanmaz.
         // D4: Metod 2/3'te YEKDEM farkı zaten KDV matrahındaki bir KALEM
         // (yekFarkiCharge) → toplam-sonrası mahsup 0'a zorlanır (çift sayım önlenir).
-        const isNetMethod = invoiceMethodId === 2 || invoiceMethodId === 3;
+        const isNetMethod = isNetInvoiceMethod(invoiceMethodId);
         let yekdemMahsupValue = 0;
         let hasYekdemMahsup = false;
         let yekdemMissing: "none" | "value" | "final" | "both" =
@@ -1037,6 +1054,7 @@ try {
           setData({
             breakdown,
             isKayseriOsb,
+            applyVerisMahsupPerakendeCap,
             invoiceMethodId,
             methodInputs,
             kayseriEkBedeller,
@@ -1160,6 +1178,7 @@ try {
           // değerler bu effect'te zaten hesaplanmış locallerden; SIFIR yeni sorgu.
           muhasebeBaseRef.current = {
             muhasebeExcelEnabled,
+            muhasebeExcelFormat,
             serno: selectedSub,
             monthLabel,
             periodYear,
@@ -1295,7 +1314,12 @@ try {
 
   // Muhasebe raporu — flag açık VE metot destekli VE gesResult hazır olduğunda kurulur.
   // Aksi halde null → panelde buton yok, modal mount edilmez (sessiz gizleme).
-  const muhasebeReport = useMemo<MuhasebeReport | null>(() => {
+  // Penguen Tahakkuk varyantı: format 'penguen_tahakkuk' ise saf adaptörle view kurulur;
+  // adaptör null dönerse (Metot ≠ 2 / net çekiş 0) standart formata düşülür + not.
+  const muhasebe = useMemo<{
+    report: MuhasebeReport;
+    tahakkukView: PenguenTahakkukView | null;
+  } | null>(() => {
     const base = muhasebeBaseRef.current;
     if (!base || !base.muhasebeExcelEnabled) return null;
     if (!(MUHASEBE_SUPPORTED_METHODS as readonly number[]).includes(base.invoiceMethodId ?? 1)) {
@@ -1310,8 +1334,24 @@ try {
       generatedAtIso: dayjsTR().format(),
       gesResult: gesOlmasaydiResult,
     };
-    return buildMuhasebeReport(payload);
+    const report = buildMuhasebeReport(payload);
+    let tahakkukView: PenguenTahakkukView | null = null;
+    if (base.muhasebeExcelFormat === "penguen_tahakkuk") {
+      tahakkukView = buildPenguenTahakkukView(report, payload);
+      if (!tahakkukView) {
+        // Caller-side not — builder gövdesi değişmez, rapor nesnesi zenginleştirilir.
+        report.warnings.push(
+          "Tahakkuk formatı bu faturada uygulanamadı (Metot 2 değil veya net çekiş 0) — standart format kullanıldı.",
+        );
+      } else if (tahakkukView.warnings.length > 0) {
+        // Adaptör uyarıları (bileşen/kapanış kontrolü) modalda da görünsün — sessiz geçmesin.
+        report.warnings.push(...tahakkukView.warnings);
+      }
+    }
+    return { report, tahakkukView };
   }, [gesOlmasaydiResult, selectedSub, subs]);
+  const muhasebeReport = muhasebe?.report ?? null;
+  const muhasebeTahakkukView = muhasebe?.tahakkukView ?? null;
 
 const isDualTerm = data?.tariffType === "dual";
 
@@ -1403,7 +1443,7 @@ const excludedItems = new Set<string>(
                 {fmtKwh(data.totalConsumptionKwh)}
               </p>
               {/* Metod 2/3: fatura NET (mahsuplu) çekiş üzerinden kesilir */}
-              {(data.invoiceMethodId === 2 || data.invoiceMethodId === 3) && (
+              {(isNetInvoiceMethod(data.invoiceMethodId)) && (
                 <p className="mt-1 text-xs text-neutral-500">
                   Faturalanan (mahsuplu):{" "}
                   {fmtKwh(data.methodInputs?.sumPos ?? data.breakdown.netEnergyKwh)} kWh
@@ -1418,7 +1458,7 @@ const excludedItems = new Set<string>(
                 {/* Metod 2/3: T-0 = wPos × KBK (data.breakdown.energyUnitPriceApplied);
                     Metod 1: efektif birim fiyat (PTF+YEKDEM)×KBK. */}
                 {fmtUnit(
-                  data.invoiceMethodId === 2 || data.invoiceMethodId === 3
+                  isNetInvoiceMethod(data.invoiceMethodId)
                     ? data.breakdown.energyUnitPriceApplied ?? data.unitPriceEnergy
                     : data.unitPriceEnergy
                 )}{" "}
@@ -1564,6 +1604,7 @@ const excludedItems = new Set<string>(
             netExcessFeedKwh={data.netExcessFeedKwh}
             invoiceMethodId={data.invoiceMethodId}
             methodInputs={data.methodInputs}
+            applyVerisMahsupPerakendeCap={data.applyVerisMahsupPerakendeCap}
           />
           )}
 
@@ -1591,7 +1632,7 @@ const excludedItems = new Set<string>(
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Enerji Bedeli</td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {data.invoiceMethodId === 2 || data.invoiceMethodId === 3 ? (
+                        {isNetInvoiceMethod(data.invoiceMethodId) ? (
                           // Metod 2/3: taban NET pozitif çekiş, fiyat = wPos × KBK (T-0).
                           <>
                             {fmtUnit(data.breakdown.energyUnitPriceApplied ?? 0)} TL/kWh ×{" "}
@@ -1610,11 +1651,11 @@ const excludedItems = new Set<string>(
                     </tr>
                   )}
 
-                  {/* Metod 2: YEK Bedeli · Metod 3: Tahmini YEKDEM — her ikisinin tabanı NET (netEnergyKwh) */}
-                  {(data.invoiceMethodId === 2 || data.invoiceMethodId === 3) && (
+                  {/* Metod 2/5: YEK Bedeli · Metod 3: Tahmini YEKDEM — hepsinin tabanı NET (netEnergyKwh) */}
+                  {isNetInvoiceMethod(data.invoiceMethodId) && !excludedItems.has("yek") && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">
-                        {data.invoiceMethodId === 2 ? "YEK Bedeli" : "Tahmini YEKDEM"}
+                        {data.invoiceMethodId === 3 ? "Tahmini YEKDEM" : "YEK Bedeli"}
                       </td>
                       <td className="py-2 pr-4 text-neutral-600">
                         Tahmini YEKDEM × KBK × {fmtKwh(data.breakdown.netEnergyKwh)} kWh
@@ -1626,11 +1667,11 @@ const excludedItems = new Set<string>(
                   )}
 
                   {/* Önceki dönem YEKDEM farkı — veri yoksa 0 ve satır gizli */}
-                  {(data.invoiceMethodId === 2 || data.invoiceMethodId === 3) &&
+                  {(isNetInvoiceMethod(data.invoiceMethodId)) &&
                     (data.breakdown.yekFarkiCharge ?? 0) !== 0 && (
                       <tr className="border-b border-neutral-100">
                         <td className="py-2 pr-4">
-                          {data.invoiceMethodId === 2 ? "YEK Farkı" : "Önceki YEKDEM Mahsup"}
+                          {data.invoiceMethodId === 3 ? "Önceki YEKDEM Mahsup" : "YEK Farkı"}
                         </td>
                         <td className="py-2 pr-4 text-neutral-600">
                           Önceki dönem net çekiş × (Gerçekleşen − Tahmini) × KBK
@@ -1648,7 +1689,7 @@ const excludedItems = new Set<string>(
                             <td className="py-2 pr-4 text-neutral-600">
                               {/* Metod 2/3: trafo tutarı da wPos × KBK (energyUnitPriceApplied) ile hesaplanır — açıklama tutarla uzlaşsın */}
                               {fmtUnit(
-                                data.invoiceMethodId === 2 || data.invoiceMethodId === 3
+                                isNetInvoiceMethod(data.invoiceMethodId)
                                   ? data.breakdown.energyUnitPriceApplied ?? 0
                                   : data.unitPriceEnergy
                               )}{" "}
@@ -1714,6 +1755,8 @@ const excludedItems = new Set<string>(
                           ? "Enerji bedeli × BTV oranı"
                           : data.invoiceMethodId === 3
                           ? "(Enerji + Tahmini YEKDEM − mahsuplaşma kredisi) × BTV oranı"
+                          : data.invoiceMethodId === 5
+                          ? "(Enerji bedeli + YEK bedeli) × BTV oranı"
                           : "Net enerji bedeli × BTV oranı"}
                       </td>
                       <td className="py-2 pr-4 text-right">
@@ -1757,17 +1800,20 @@ const excludedItems = new Set<string>(
                   )}
 
                   {/* Veriş Mahsup — çekişi geçmeyen kısım (birim fiyatla).
-                      Metod 2/3'te faturadan DÜŞÜLMEZ (m3: kredi Muhtelif-2'de) → satır yok. */}
-                  {data.invoiceMethodId !== 2 &&
-                    data.invoiceMethodId !== 3 &&
+                      Metod 2/3/5'te faturadan DÜŞÜLMEZ (m3: kredi Muhtelif-2'de) → satır yok. */}
+                  {!isNetInvoiceMethod(data.invoiceMethodId) &&
                     data.breakdown.verisMahsupKwh > 0 && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4 text-emerald-700">Veriş Mahsup (Birim Fiyat)</td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {fmtUnit(data.unitPriceEnergy)} TL/kWh × {fmtKwh(data.breakdown.verisMahsupKwh)} kWh
+                        {/* 2K: motorun UYGULADIĞI fiyat/tutar esas — tavansızken bit-identik. */}
+                        {fmtUnit(data.breakdown.verisMahsupBirimFiyat ?? data.unitPriceEnergy)} TL/kWh × {fmtKwh(data.breakdown.verisMahsupKwh)} kWh
+                        {data.breakdown.verisMahsupCapUygulandi && (
+                          <span className="ml-1 text-xs text-amber-600">(perakende tavanı)</span>
+                        )}
                       </td>
                       <td className="py-2 pr-4 text-right text-emerald-700">
-                        −{fmtMoney2(data.breakdown.verisMahsupKwh * data.unitPriceEnergy)}
+                        −{fmtMoney2(data.breakdown.verisMahsupBedeli)}
                       </td>
                     </tr>
                   )}
@@ -1810,7 +1856,7 @@ const excludedItems = new Set<string>(
                   </tr>
 
                   {/* Metod 2/3'te fark KDV matrahındaki kalem (yukarıda) — bu satır gizli (D4). */}
-                  {data.invoiceMethodId !== 2 && data.invoiceMethodId !== 3 && (
+                  {!isNetInvoiceMethod(data.invoiceMethodId) && (
                   <tr className="border-b border-neutral-200">
                     <td className="py-2 pr-4 font-semibold">
                       Önceki Dönem YEKDEM Mahsubu
@@ -1858,7 +1904,7 @@ const excludedItems = new Set<string>(
                   
                   <tr>
                     <td className="py-3 pr-4 font-semibold text-neutral-900">
-                      {data.invoiceMethodId === 2 || data.invoiceMethodId === 3
+                      {isNetInvoiceMethod(data.invoiceMethodId)
                         ? "Genel Toplam (Ödenecek)"
                         : "Genel Toplam (YEKDEM Mahsubu Dahil)"}
                     </td>
@@ -1944,6 +1990,7 @@ const excludedItems = new Set<string>(
           open={muhasebeModalOpen}
           onClose={() => setMuhasebeModalOpen(false)}
           report={muhasebeReport}
+          tahakkukView={muhasebeTahakkukView}
         />
       )}
     </DashboardShell>

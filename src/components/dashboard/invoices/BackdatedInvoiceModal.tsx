@@ -21,6 +21,7 @@ import {
   type BackdatedPrecheck,
   type BackdatedYekdemField,
 } from "@/components/utils/backdatedInvoice";
+import { isNetInvoiceMethod } from "@/lib/invoiceMethods";
 import type { YekdemFallback } from "@/components/utils/billedInvoiceInputs";
 
 type Props = {
@@ -184,7 +185,7 @@ export default function BackdatedInvoiceModal({ uid, onClose, onCreated }: Props
   const relevance = useMemo(() => {
     if (!form) return null;
     const needsPrev =
-      (form.methodId === 1 || form.methodId === 2 || form.methodId === 3) &&
+      (form.methodId === 1 || isNetInvoiceMethod(form.methodId)) &&
       !form.lisansliSatis &&
       form.prevConsumptionExists;
     return {
@@ -492,7 +493,7 @@ export default function BackdatedInvoiceModal({ uid, onClose, onCreated }: Props
                   )
                 ))}
 
-              {(form.methodId === 1 || form.methodId === 2 || form.methodId === 3) &&
+              {(form.methodId === 1 || isNetInvoiceMethod(form.methodId)) &&
                 !form.lisansliSatis &&
                 !form.prevConsumptionExists && (
                   <p className="text-xs text-neutral-500">

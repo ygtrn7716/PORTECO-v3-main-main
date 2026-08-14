@@ -75,7 +75,8 @@ export async function fetchGesTasarrufAnalizi(args: {
   const { data: snapData, error: snapError } = await supabase
     .from("invoice_snapshots")
     .select(
-      `subscription_serno, period_year, period_month, invoice_type, unit_price_adjustment, allocated_ges_kwh, monthly_yekdem, ges_satis_dagitim_bedeli, ${INVOICE_SNAPSHOT_RECOMPUTE_FIELDS}`,
+      // period_year/period_month artık RECOMPUTE_FIELDS içinde (2K) — çift kolon olmasın.
+      `subscription_serno, invoice_type, unit_price_adjustment, allocated_ges_kwh, monthly_yekdem, ges_satis_dagitim_bedeli, ${INVOICE_SNAPSHOT_RECOMPUTE_FIELDS}`,
     )
     .eq("user_id", uid)
     .in("invoice_type", ["billed", "backdated"])

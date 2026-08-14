@@ -24,6 +24,7 @@ import { type InvoiceBreakdown, type TariffType } from "./calculateInvoice";
 import {
   calculateInvoiceForMethod,
   DEFAULT_INVOICE_METHOD,
+  isNetInvoiceMethod,
   type InvoiceMethodId,
 } from "@/lib/invoiceMethods";
 import type { InvoiceMethodInputs } from "@/components/utils/calculateInvoiceNetMethods";
@@ -368,7 +369,7 @@ export async function calculateGesOlmasaydi(
     // Saatlik tüketim + PTF'den gerçek metod 2/3 girdileri kurulur; veri yoksa
     // Metod 1 yaklaşımı korunur ve kart "yaklaşık" rozeti gösterir.
     const cfMi =
-      methodId === 2 || methodId === 3
+      isNetInvoiceMethod(methodId)
         ? await buildNoGesCounterfactualMi({
             supabase,
             userId,
@@ -406,7 +407,7 @@ export async function calculateGesOlmasaydi(
       hamTuketimKwh: params.mevcutTuketimKwh,
       gesUretimKwh: 0,
       hamBirimFiyat: params.mevcutBirimFiyat,
-      approximate: (methodId === 2 || methodId === 3) && cfMi == null,
+      approximate: (isNetInvoiceMethod(methodId)) && cfMi == null,
     });
   }
 
@@ -459,7 +460,7 @@ export async function calculateGesOlmasaydi(
       hamTuketimKwh: params.mevcutTuketimKwh,
       gesUretimKwh: totalGesKwh,
       hamBirimFiyat: params.mevcutBirimFiyat,
-      approximate: (methodId === 2 || methodId === 3) && params.methodInputs == null,
+      approximate: (isNetInvoiceMethod(methodId)) && params.methodInputs == null,
     });
   }
 
@@ -495,7 +496,7 @@ export async function calculateGesOlmasaydi(
     // efektif gn=0 (tesis tahsis alıcısı olsa bile mahsup kalkar). Receiver
     // dalıyla aynı yardımcı; veri yoksa Metod 1 yaklaşımı + "yaklaşık" rozeti.
     const cfMi =
-      methodId === 2 || methodId === 3
+      isNetInvoiceMethod(methodId)
         ? await buildNoGesCounterfactualMi({
             supabase,
             userId,
@@ -534,7 +535,7 @@ export async function calculateGesOlmasaydi(
       gesUretimKwh: totalGesKwh,
       hamBirimFiyat: params.mevcutBirimFiyat,
       anlikUretimKullanimi: false,
-      approximate: (methodId === 2 || methodId === 3) && cfMi == null,
+      approximate: (isNetInvoiceMethod(methodId)) && cfMi == null,
     });
   }
 
@@ -675,7 +676,7 @@ export async function calculateGesOlmasaydi(
   // mahsup/excess=0, wPos = ham-ağırlıklı ÇIPLAK PTF (zaten hesaplandı).
   // Önceki dönem alanları mevcut dünyadan aynen taşınır (gerçekleşmiş veri).
   const counterfactualMi: InvoiceMethodInputs | undefined =
-    methodId === 2 || methodId === 3
+    isNetInvoiceMethod(methodId)
       ? {
           sumCn: totalHamKwh,
           sumGn: 0,

@@ -560,6 +560,9 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
                       <span className="text-sm text-neutral-600">Birim Fiyat</span>
                       <span className="text-sm font-medium text-neutral-700">
                         {fmtUnit(derived.mahsup.unitPrice)} TL/kWh
+                        {derived.mahsup.capUygulandi && (
+                          <span className="ml-1 text-xs text-amber-600">(perakende tavanı)</span>
+                        )}
                       </span>
                     </div>
 

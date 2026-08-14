@@ -30,7 +30,14 @@ export type InvoiceOverrideItemKey =
    * kredisinin birim fiyatı (TL/kWh). Girilmezse T-0 enerji fiyatı kullanılır.
    * Metod 1/2 bu anahtarı görmezden gelir.
    */
-  | "mahsuplasma";
+  | "mahsuplasma"
+  /**
+   * Metod 2/3/5'teki "YEK Bedeli / Tahmini YEKDEM" satırı. unitPriceOverride
+   * TL/kWh'dir (doğal birim = tahminiYekdem × KBK). YALNIZ Metod 5'te BTV
+   * matrahına efektif değeriyle akar; m2/m3'te satırı değiştirir ama BTV'yi
+   * ETKİLEMEZ. Metod 1/4 bu anahtarı görmezden gelir.
+   */
+  | "yek";
 
 /**
  * Kalem payload'ı. Alanlar kaleme göre anlamlıdır:
@@ -47,7 +54,7 @@ export type InvoiceOverridePayload = {
 
 export type InvoiceLineOverride = {
   isExcluded: boolean;
-  /** Yalnız enerji/dagitim için anlamlı (TL/kWh, mutlak değer). */
+  /** Yalnız enerji/dagitim/mahsuplasma/yek için anlamlı (TL/kWh, mutlak değer). */
   unitPriceOverride: number | null;
   /** Kalem tutarını sabitler (TL, KDV öncesi). */
   amountOverride: number | null;
@@ -68,6 +75,8 @@ export type AppliedInvoiceOverrides = {
   unitPriceDistributionOverridden: boolean;
   /** Aşama 2B / Metod 3: muhtelif-2 mahsuplaşma birim fiyatı override'landı mı? */
   unitPriceMahsuplasmaOverridden?: boolean;
+  /** Metod 2/3/5: YEK Bedeli birim fiyatı override'landı mı? */
+  unitPriceYekOverridden?: boolean;
 };
 
 const ITEM_KEYS: InvoiceOverrideItemKey[] = [
@@ -79,6 +88,7 @@ const ITEM_KEYS: InvoiceOverrideItemKey[] = [
   "trafo",
   "yekdem_mahsup",
   "mahsuplasma",
+  "yek",
 ];
 
 // Caller'lardaki reaktif eşiklerin aynısı (Dashboard/InvoiceDetail/calculateInvoiceToDate).

@@ -1,11 +1,17 @@
 // src/components/utils/calculateInvoiceToDate.ts
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { dayjsTR, TR_TZ } from "@/lib/dayjs";
-import type { InvoiceBreakdown, TariffType } from "@/components/utils/calculateInvoice";
+import {
+  isM1MahsupCapPeriod,
+  type InvoiceBreakdown,
+  type TariffType,
+} from "@/components/utils/calculateInvoice";
 import {
   calculateInvoiceForMethod,
+  isNetInvoiceMethod,
   methodForProvider,
   resolveInvoiceMethods,
+  type InvoiceMethodId,
 } from "@/lib/invoiceMethods";
 import { assembleMethodInputs } from "@/components/utils/hourlyNetAggregates";
 import type { InvoiceMethodInputs } from "@/components/utils/calculateInvoiceNetMethods";
@@ -223,6 +229,8 @@ async function fetchPtfMapToDate(params: {
 export type MonthInvoiceToDateResult = {
   periodYear: number;
   periodMonth: number;
+  /** Hesapta kullanılan fatura metodu (BTV açıklama metni vb. metoda göre dallanır). */
+  invoiceMethodId: InvoiceMethodId;
 
   rangeStart: string; // TR text
   rangeEnd: string;   // TR text
@@ -645,13 +653,17 @@ export async function computeMonthInvoiceToDate(params: {
     netPositiveDrawKwh: netPositiveDrawForCalc,
     netExcessFeedKwh: netExcessFeedForCalc,
     methodInputs: methodInputs ?? undefined,
+    // 2K: ay-içi projeksiyon da fatura ile aynı mahsup tavanını uygular
+    // (dönem = projeksiyonun hedef ayı; vhs_kayseri kapsam dışı).
+    applyVerisMahsupPerakendeCap:
+      isM1MahsupCapPeriod(year, month) && provider !== "vhs_kayseri",
   }, lineOverrides);
 
   // YEKDEM mahsup: M-1 (tam ay)  — InvoiceDetail ile aynı mantık
   // Lisanslı Satış tesisleri mahsup akışına hiç girmez.
-  // D4: Metod 2/3'te fark KDV matrahındaki kalem (yekFarkiCharge) → toplam
+  // D4: Metod 2/3/5'te fark KDV matrahındaki kalem (yekFarkiCharge) → toplam
   // sonrası mahsup 0'a zorlanır.
-  const isNetMethod = invoiceMethodId === 2 || invoiceMethodId === 3;
+  const isNetMethod = isNetInvoiceMethod(invoiceMethodId);
   let yekdemMahsup = 0;
   let hasYekdemMahsup = false;
   let yekdemMissing: "none" | "value" | "final" | "both" = "both";
@@ -738,6 +750,7 @@ export async function computeMonthInvoiceToDate(params: {
   return {
     periodYear: year,
     periodMonth: month,
+    invoiceMethodId,
 
     rangeStart: monthStart.format("DD.MM.YYYY HH:mm"),
     rangeEnd: dayjsTR(cutoffIso).format("DD.MM.YYYY HH:mm"),

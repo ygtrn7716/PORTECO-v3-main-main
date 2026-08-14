@@ -10,9 +10,10 @@
 // hesaplanmadan açılsa da modal ile birebir aynı görünür. Kalem hücreleri 6
 // basamağa yuvarlanır (formül sonuçları yuvarlanmaz — kapanış bozulmaz).
 
-import type { Workbook, Worksheet } from "exceljs";
+import type { Cell, Workbook, Worksheet } from "exceljs";
 import { dayjsTR } from "@/lib/dayjs";
 import type { MuhasebeReport, MuhasebeRow } from "./muhasebeReport";
+import type { PenguenTahakkukView } from "./penguenTahakkukView";
 
 // PortEco marka kiti (ARGB = "FF" + hex)
 const C = {
@@ -31,6 +32,10 @@ const FONT = "Calibri";
 const DASH = "—";
 const FMT_TUTAR = '#,##0.00" ₺";[Red]-#,##0.00" ₺"';
 const FMT_BIRIM = "#,##0.000000";
+// Tahakkuk sheet'leri: ₺ sembolü YOK (Logo vb. muhasebe programı importunu bozar).
+const FMT_TL_PLAIN = "#,##0.00";
+// Kullanıcının dolduracağı hücre (Mizan Bakiyesi, Fatura Tarihi/No, boş hesap kodu).
+const YELLOW = "FFFFF2CC";
 const LOGO_EXT = { width: 132, height: 40 };
 const miktarFmt = (birim: string) => (birim ? `#,##0.00" ${birim}"` : "#,##0.00");
 
@@ -63,6 +68,10 @@ type BlockAddrs = {
 export async function buildMuhasebeWorkbook(
   report: MuhasebeReport,
   logoBase64: string | null,
+  // Penguen Tahakkuk varyantı: view verilirse standart sheet'lerin ÖNÜNE
+  // "Muhasebe Özeti" + "Yevmiye Kayıtları" eklenir; verilmezse (default)
+  // kod yolu bugünküyle birebir aynıdır (kural 3).
+  tahakkukView: PenguenTahakkukView | null = null,
 ): Promise<Workbook> {
   const mod = (await import("exceljs")) as ExcelJSModule & { default?: ExcelJSModule };
   const ExcelJS = mod.default ?? mod;
@@ -80,13 +89,26 @@ export async function buildMuhasebeWorkbook(
     }
   }
 
+  if (tahakkukView) {
+    // Penguen kararı (2026-08-11): TEK sayfa, yalnız üç yevmiye fişi. Standart
+    // sheet'ler ve özet/dayanak blokları bu varyantta YOK; dayanak denetimi
+    // buildPenguenTahakkukView içindeki bileşen kontrolüne taşındı.
+    buildYevmiyeSheet(wb, report, tahakkukView, logoId);
+    return wb;
+  }
   buildMainSheet(wb, report, logoId);
   buildParamSheet(wb, report, logoId);
   return wb;
 }
 
 // ── Başlık bloğu (logo + rapor adı + meta) → sonraki satır no ──────────────────
-function writeHeader(sheet: Worksheet, report: MuhasebeReport, logoId: number | null, span: number): number {
+function writeHeader(
+  sheet: Worksheet,
+  report: MuhasebeReport,
+  logoId: number | null,
+  span: number,
+  titleOverride?: string,
+): number {
   sheet.getRow(1).height = 22.5;
   sheet.getRow(2).height = 15;
   if (logoId !== null) {
@@ -94,7 +116,7 @@ function writeHeader(sheet: Worksheet, report: MuhasebeReport, logoId: number | 
   }
 
   const title = sheet.getCell(3, 1);
-  title.value = report.meta.baslik;
+  title.value = titleOverride ?? report.meta.baslik;
   title.font = { name: FONT, size: 14, bold: true, color: { argb: C.navy } };
   sheet.mergeCells(3, 1, 3, span);
 
@@ -375,4 +397,161 @@ function buildParamSheet(wb: Workbook, report: MuhasebeReport, logoId: number | 
     });
     r++;
   });
+}
+
+/* ══════════════════════════════════════════════════════════════════ */
+/*  PENGUEN TAHAKKUK sheet'leri (yalnız tahakkukView verildiğinde)     */
+/* ══════════════════════════════════════════════════════════════════ */
+
+const thinBorder = {
+  top: { style: "thin", color: { argb: C.border } },
+  left: { style: "thin", color: { argb: C.border } },
+  bottom: { style: "thin", color: { argb: C.border } },
+  right: { style: "thin", color: { argb: C.border } },
+} as const;
+
+/** Kullanıcının dolduracağı sarı boş hücre. */
+function fillable(cell: Cell): void {
+  cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: YELLOW } };
+  cell.border = thinBorder;
+  cell.numFmt = FMT_TL_PLAIN;
+  cell.alignment = { horizontal: "right" };
+}
+
+/** Koyu mavi bölüm bandı (merge'li). */
+function band(sheet: Worksheet, r: number, span: number, text: string): void {
+  const cell = sheet.getCell(r, 1);
+  cell.value = text;
+  cell.font = { name: FONT, size: 12, bold: true, color: { argb: C.white } };
+  cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: C.darkBlue } };
+  cell.alignment = { vertical: "middle" };
+  sheet.getRow(r).height = 20;
+  sheet.mergeCells(r, 1, r, span);
+}
+
+/** Brand mavi kolon başlığı hücresi. */
+function headCell(sheet: Worksheet, r: number, c: number, text: string, right: boolean): void {
+  const cell = sheet.getCell(r, c);
+  cell.value = text;
+  cell.font = { name: FONT, size: 10, bold: true, color: { argb: C.white } };
+  cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: C.blue } };
+  cell.alignment = { horizontal: right ? "right" : "left", vertical: "middle", wrapText: true };
+}
+
+/** Gri italik not satırı (merge'li). */
+function noteRow(sheet: Worksheet, r: number, span: number, text: string, height?: number): void {
+  const cell = sheet.getCell(r, 1);
+  cell.value = text;
+  cell.font = { name: FONT, size: 9, italic: true, color: { argb: C.gray } };
+  cell.alignment = { wrapText: true, vertical: "top" };
+  if (height) sheet.getRow(r).height = height;
+  sheet.mergeCells(r, 1, r, span);
+}
+
+/** Kapanış tutmadıysa kırmızı kontrol satırı (sessiz yuvarlama yok). */
+function kapanisWarnRow(sheet: Worksheet, r: number, span: number, view: PenguenTahakkukView): void {
+  const cell = sheet.getCell(r, 1);
+  cell.value = `⚠ FARK (kontrol): ${view.kapanis.fark.toFixed(2)} TL — Diğer Satıcılar, fatura genel toplamıyla eşleşmiyor.`;
+  cell.font = { name: FONT, size: 11, bold: true, color: { argb: C.red } };
+  sheet.mergeCells(r, 1, r, span);
+}
+
+// ── Sheet: Muhasebe Özeti — TEK sayfa: yalnız üç yevmiye fişi ────────────────
+// (Penguen kararı 2026-08-11: özet tablosu + dayanak bloğu kaldırıldı; dayanak
+// denetimi buildPenguenTahakkukView'daki bileşen kontrolünde yaşıyor.)
+function buildYevmiyeSheet(
+  wb: Workbook,
+  report: MuhasebeReport,
+  view: PenguenTahakkukView,
+  logoId: number | null,
+): void {
+  const sheet = wb.addWorksheet("Muhasebe Özeti");
+  [22, 48, 18, 18].forEach((w, c) => (sheet.getColumn(c + 1).width = w));
+  sheet.views = [{ state: "frozen", ySplit: 6 }];
+
+  let r = writeHeader(sheet, report, logoId, 4, "Fatura Muhasebe — Muhasebe Özeti");
+
+  for (const fis of view.fisler) {
+    band(sheet, r, 4, `${fis.baslik} — ${view.meta.donem}`);
+    r++;
+    noteRow(sheet, r, 4, fis.tarihNotu);
+    r++;
+
+    // Fiş 3: fatura tarihi/no sistemde yok → doldurulabilir sarı hücreler.
+    if (fis.editableFaturaAlanlari) {
+      const lt = sheet.getCell(r, 1);
+      lt.value = "Fatura Tarihi:";
+      lt.font = { name: FONT, size: 10, color: { argb: C.gray } };
+      lt.alignment = { horizontal: "right" };
+      const tarih = sheet.getCell(r, 2);
+      fillable(tarih);
+      tarih.numFmt = "DD.MM.YYYY";
+      tarih.alignment = { horizontal: "left" };
+      const ln = sheet.getCell(r, 3);
+      ln.value = "Fatura No:";
+      ln.font = { name: FONT, size: 10, color: { argb: C.gray } };
+      ln.alignment = { horizontal: "right" };
+      const no = sheet.getCell(r, 4);
+      fillable(no);
+      no.numFmt = "@"; // metin — uzun fatura no bilimsel gösterime düşmesin
+      no.alignment = { horizontal: "left" };
+      r++;
+    }
+
+    headCell(sheet, r, 1, "Hesap Kodu", false);
+    headCell(sheet, r, 2, "Açıklama", false);
+    headCell(sheet, r, 3, "Borç", true);
+    headCell(sheet, r, 4, "Alacak", true);
+    r++;
+
+    const first = r;
+    for (const satir of fis.satirlar) {
+      const kod = sheet.getCell(r, 1);
+      if (satir.hesapKodu === "") {
+        fillable(kod); // kodsuz kalem (Diğer Düzeltmeler) — muhasebeci kendi hesabını yazar
+        kod.numFmt = "@";
+        kod.alignment = { horizontal: "left" };
+      } else {
+        kod.value = satir.hesapKodu;
+        kod.font = { name: FONT, size: 10, color: { argb: C.navy } };
+        kod.border = thinBorder;
+      }
+      const acik = sheet.getCell(r, 2);
+      acik.value = satir.aciklama;
+      acik.font = { name: FONT, size: 10, color: { argb: C.navy } };
+      acik.border = thinBorder;
+      const borc = sheet.getCell(r, 3);
+      const alacak = sheet.getCell(r, 4);
+      for (const [cell, val] of [[borc, satir.borc], [alacak, satir.alacak]] as const) {
+        cell.font = { name: FONT, size: 10, color: { argb: C.navy } };
+        cell.border = thinBorder;
+        cell.numFmt = FMT_TL_PLAIN;
+        cell.alignment = { horizontal: "right" };
+        if (val != null) cell.value = r6(val); // null → hücre BOŞ (Logo importu için "—" yazılmaz)
+      }
+      r++;
+    }
+    const last = r - 1;
+
+    // TOPLAM — gerçek SUM formülü + rapor tam-hassasiyet result
+    const lbl = sheet.getCell(r, 2);
+    lbl.value = "TOPLAM";
+    const tBorc = sheet.getCell(r, 3);
+    tBorc.value = { formula: `SUM(C${first}:C${last})`, result: fis.toplamBorc };
+    const tAlacak = sheet.getCell(r, 4);
+    tAlacak.value = { formula: `SUM(D${first}:D${last})`, result: fis.toplamAlacak };
+    for (let col = 1; col <= 4; col++) {
+      const cell = sheet.getCell(r, col);
+      cell.font = { name: FONT, size: 10, bold: true, color: { argb: C.navy } };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: C.totalFill } };
+      cell.border = { top: { style: "medium", color: { argb: C.darkBlue } } };
+      if (col >= 3) {
+        cell.numFmt = FMT_TL_PLAIN;
+        cell.alignment = { horizontal: "right" };
+      }
+    }
+    r += 2; // toplam + fişler arası boş satır
+  }
+
+  if (!view.kapanis.ok) kapanisWarnRow(sheet, r, 4, view);
 }

@@ -27,10 +27,12 @@ import {
   applyAllocationToHourlyRows,
 } from "@/components/utils/gesAllocation";
 import {
+  isM1MahsupCapPeriod,
   type TariffType,
 } from "@/components/utils/calculateInvoice";
 import {
   calculateInvoiceForMethod,
+  isNetInvoiceMethod,
   methodForProvider,
   resolveInvoiceMethods,
   type InvoiceMethodId,
@@ -752,15 +754,20 @@ export function buildBreakdownFromInputs(
       netPositiveDrawKwh: inputs.netPositiveDrawKwh,
       netExcessFeedKwh: inputs.netExcessFeedKwh,
       methodInputs: inputs.methodInputs ?? undefined,
+      // Aşama 2K: mahsup tavanı kapısı burada çözülür → admin önizleme,
+      // backdated, EnergySoldCard/GesSavingsSection canlı yolları kapsanır.
+      applyVerisMahsupPerakendeCap:
+        isM1MahsupCapPeriod(inputs.periodYear, inputs.periodMonth) &&
+        !inputs.isKayseriOsb,
     },
     overrides
   );
 
   // YEKDEM mahsubu: override YOKSA doğal değer AYNEN kullanılır (bit-identiklik).
   // Lisanslı satış tesisinde mahsup hiç uygulanmaz — override diriltemez.
-  // D4: Metod 2/3'te YEKDEM farkı zaten KDV matrahındaki bir KALEM (yekFarkiCharge)
+  // D4: Metod 2/3/5'te YEKDEM farkı zaten KDV matrahındaki bir KALEM (yekFarkiCharge)
   // olarak var → toplam-sonrası mahsup 0'a zorlanır (çift sayım önlenir).
-  const isNetMethod = inputs.invoiceMethodId === 2 || inputs.invoiceMethodId === 3;
+  const isNetMethod = isNetInvoiceMethod(inputs.invoiceMethodId);
   const mahsupOv = overrides?.yekdem_mahsup;
   let yekdemMahsup = isNetMethod ? 0 : inputs.yekdemMahsup;
   let hasYekdemMahsup = isNetMethod ? false : inputs.hasYekdemMahsup;

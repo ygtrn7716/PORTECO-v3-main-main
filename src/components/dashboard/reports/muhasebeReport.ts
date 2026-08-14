@@ -26,9 +26,9 @@ import type { GesOlmasaydiResult } from "@/components/utils/calculateGesOlmasayd
 import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
 
 // buildMuhasebeReport'un desteklediği fatura metotları. null → 1 muamelesi (çağıran).
-// Metot 2 (Uedaş net) dahil; Metot 3 (Tredaş muhtelif-2) kalem yapısı ayrı → henüz yok.
-// Metot 4 zaten GES panelinde gizli.
-export const MUHASEBE_SUPPORTED_METHODS = [1, 2] as const;
+// Metot 2 (Uedaş net) ve Metot 5 (İpragaz — m2 kopyası, BTV matrahında YEK var) dahil;
+// Metot 3 (Tredaş muhtelif-2) kalem yapısı ayrı → henüz yok. Metot 4 zaten GES panelinde gizli.
+export const MUHASEBE_SUPPORTED_METHODS = [1, 2, 5] as const;
 
 // ── Girdi (payload) ─────────────────────────────────────────────────────────
 export interface MuhasebePayload {
@@ -298,9 +298,12 @@ export function buildMuhasebeReport(p: MuhasebePayload): MuhasebeReport {
   // BLOK 6 için metot-2 birim fiyatları (Metot 1'de null → mevcut satırlar).
   let m2ParamInfo: { eUP: number; yekUP: number; grossUP: number } | null = null;
 
-  if (p.invoiceMethodId === 2) {
-    // ── METOT 2 (Uedaş net) ── enerji + YEK tabanı NET; brüte tamamlanır,
-    // mahsup BLOK 2'de gider azaltıcı olarak yüzeye çıkar. Dağıtım zaten brüt (sumCn).
+  const isM5 = p.invoiceMethodId === 5;
+  if (p.invoiceMethodId === 2 || isM5) {
+    // ── METOT 2 (Uedaş net) / METOT 5 (İpragaz — m2 kopyası) ── enerji + YEK tabanı
+    // NET; brüte tamamlanır, mahsup BLOK 2'de gider azaltıcı olarak yüzeye çıkar.
+    // Dağıtım zaten brüt (sumCn). TEK FARK (m5): BTV matrahında YEK de var → BTV
+    // mahsup etkisi YEK mahsubunu da içerir.
     //
     // REBASE (2026-07-28): Brüt enerji tabanı, GES Olmasaydı motorunun uyguladığı
     // brüt-tüketim-ağırlıklı fiyatla kurulur (gesOlmasaydiBreakdown.energyUnitPriceApplied
@@ -338,7 +341,11 @@ export function buildMuhasebeReport(p: MuhasebePayload): MuhasebeReport {
     const grossEnergy = grossKwh * grossUP;
     const enerjiMahsupTutar = grossEnergy - b.energyCharge; // residual — mahsup saatlerinin gerçek değeri
     const yekMahsupTutar = mahsupKwh * yekUP; // YEKDEM saat bağımsız → grossup değişmez
-    const btvMahsupEffect = enerjiMahsupTutar * btvRate; // m2 BTV matrahı yalnız enerji
+    // m2 BTV matrahı yalnız enerji; m5 matrahında YEK de var → mahsup etkisi YEK'i içerir.
+    // Çapa inşaen korunur: btvMahsupsuz − btvMahsupEffect ≡ b.btvCharge.
+    const btvMahsupEffect = isM5
+      ? (enerjiMahsupTutar + yekMahsupTutar) * btvRate
+      : enerjiMahsupTutar * btvRate;
     if (enerjiMahsupTutar < 0) {
       warnings.push(
         `Metot 2: enerji mahsup residual'ı negatif (${enerjiMahsupTutar.toFixed(2)} TL) — brüt taban fiyatı ile fatura verisi tutarsız olabilir; değer aynen yazıldı, kapanış korunur.`,
@@ -355,12 +362,12 @@ export function buildMuhasebeReport(p: MuhasebePayload): MuhasebeReport {
       item("Gider", "YEK Bedeli (mahsupsuz)", "Brüt çekiş YEKDEM bedeli", grossKwh, "kWh", yekUP, yekTahminiCharge + yekMahsupTutar),
       item("Gider", "YEK Farkı (M-1)", "Önceki dönem YEKDEM düzeltmesi", null, "", null, yekFarkiCharge, "Önceki döneme ait YEKDEM düzeltmesidir; negatif olabilir. Mahsup değildir."),
       item("Gider", "Dağıtım Bedeli", "Brüt çekiş dağıtımı (mahsup yok)", b.distributionBaseKwh, "kWh", p.unitPriceDistribution, b.distributionCharge),
-      item("Gider", "BTV (mahsupsuz)", "Brüt enerji BTV'si", null, "", btvRate, b.btvCharge + btvMahsupEffect),
+      item("Gider", "BTV (mahsupsuz)", isM5 ? "Brüt enerji+YEK BTV'si" : "Brüt enerji BTV'si", null, "", btvRate, b.btvCharge + btvMahsupEffect),
     ];
     blok2Core = [
       item("Gider Azaltıcı", "Veriş Mahsubu – Enerji", "Üretimin tüketimle netleşen kısmı", mahsupKwh, "kWh", mahsupUP, -enerjiMahsupTutar, mahsupNot),
       item("Gider Azaltıcı", "YEK Mahsubu", "YEKDEM bedelinin mahsup kısmı", mahsupKwh, "kWh", yekUP, -yekMahsupTutar),
-      item("Gider Azaltıcı", "BTV Mahsup Etkisi", "Enerji mahsubunun BTV etkisi", null, "", btvRate, -btvMahsupEffect),
+      item("Gider Azaltıcı", "BTV Mahsup Etkisi", isM5 ? "Enerji ve YEK mahsubunun BTV etkisi" : "Enerji mahsubunun BTV etkisi", null, "", btvRate, -btvMahsupEffect),
     ];
     // Fatura köprüsü: faturanın gerçek (net) enerji/YEK kalemleri — muhasebeci Excel'i
     // fatura sayfasıyla eşleştirebilsin. "Bilgi" sınıfı → S2'ye ve kapanışa GİRMEZ.
@@ -388,7 +395,9 @@ export function buildMuhasebeReport(p: MuhasebePayload): MuhasebeReport {
       item("Gider", "BTV (mahsupsuz)", "Belediye Tüketim Vergisi — mahsup öncesi", null, "", btvRate, b.btvCharge + btvMahsupEffect),
     ];
     blok2Core = [
-      item("Gider Azaltıcı", "Veriş Mahsubu – Enerji", "Üretimin tüketimle netleşen kısmı", b.verisMahsupKwh, "kWh", p.unitPriceEnergy, -b.verisMahsupBedeli),
+      // 2K: birim fiyat motorun UYGULADIĞI fiyat (tavan kırptıysa perakende);
+      // eski breakdown fixture'larında alan yok → p.unitPriceEnergy fallback.
+      item("Gider Azaltıcı", "Veriş Mahsubu – Enerji", "Üretimin tüketimle netleşen kısmı", b.verisMahsupKwh, "kWh", b.verisMahsupBirimFiyat ?? p.unitPriceEnergy, -b.verisMahsupBedeli),
       item("Gider Azaltıcı", "Dağıtım Mahsubu", "Veriş kaynaklı dağıtım indirimi", distMahsupKwh, "kWh", p.unitPriceDistribution, -b.distributionAdjustment),
       item("Gider Azaltıcı", "BTV Mahsup Etkisi", "Mahsup edilen enerjinin BTV etkisi", null, "", btvRate, -btvMahsupEffect),
     ];
@@ -596,7 +605,13 @@ export function buildMuhasebeReport(p: MuhasebePayload): MuhasebeReport {
   // ── BLOK 6 — PARAMETRELER ──────────────────────────────────────────────────
   const evetHayir = (x: boolean | null): string => (x == null ? "—" : x ? "Evet" : "Hayır");
   const methodAdi =
-    p.invoiceMethodId === 2 ? "Uedaş (saatlik net)" : p.invoiceMethodId === 1 ? "Aylık netleşme" : "Diğer";
+    p.invoiceMethodId === 2
+      ? "Uedaş (saatlik net)"
+      : p.invoiceMethodId === 5
+        ? "İpragaz (saatlik net, BTV matrahında YEK)"
+        : p.invoiceMethodId === 1
+          ? "Aylık netleşme"
+          : "Diğer";
   const hesapDali =
     g.mode === "receiver"
       ? "Alıcı (Talep Birleştirme mahsup alan)"
@@ -612,13 +627,13 @@ export function buildMuhasebeReport(p: MuhasebePayload): MuhasebeReport {
         ? `Alıcı (öncelik ${p.gesAlloc.priority}, tahsis ${p.gesAlloc.allocatedKwh.toLocaleString("tr-TR", { maximumFractionDigits: 0 })} kWh)`
         : "Kaynak (üretim sayacı)";
 
-  // Metot 2'de tek "efektif" harman fiyat (Metot 1 formülü) raporun hiçbir yerinde
+  // Metot 2/5'te tek "efektif" harman fiyat (Metot 1 formülü) raporun hiçbir yerinde
   // kullanılmaz → yanıltıcı; yerine faturanın gerçek birim fiyatları gösterilir.
   const enerjiFiyatParams: MuhasebeParam[] =
-    p.invoiceMethodId === 2 && m2ParamInfo
+    (p.invoiceMethodId === 2 || p.invoiceMethodId === 5) && m2ParamInfo
       ? [
-          { kalem: "Enerji Birim Fiyatı (net çekiş)", deger: m2ParamInfo.eUP, birim: "TL/kWh", not: "Fatura enerji kaleminin birim fiyatı (Metot 2)" },
-          { kalem: "YEK Birim Fiyatı", deger: m2ParamInfo.yekUP, birim: "TL/kWh", not: "Fatura YEK kaleminin birim fiyatı (Metot 2)" },
+          { kalem: "Enerji Birim Fiyatı (net çekiş)", deger: m2ParamInfo.eUP, birim: "TL/kWh", not: "Fatura enerji kaleminin birim fiyatı" },
+          { kalem: "YEK Birim Fiyatı", deger: m2ParamInfo.yekUP, birim: "TL/kWh", not: "Fatura YEK kaleminin birim fiyatı" },
           { kalem: "Enerji Birim Fiyatı (brüt taban)", deger: m2ParamInfo.grossUP, birim: "TL/kWh", not: "BLOK 1 brüt enerji tabanı (karşı-olgu fiyatı)" },
         ]
       : [
@@ -633,7 +648,7 @@ export function buildMuhasebeReport(p: MuhasebePayload): MuhasebeReport {
     { kalem: "Birim Fiyat Düzeltmesi", deger: p.unitPriceAdjustment, birim: "TL/kWh", not: "unit_price_adjustment" },
     ...enerjiFiyatParams,
     { kalem: "Dağıtım Birim Fiyatı", deger: p.unitPriceDistribution, birim: "TL/kWh", not: "" },
-    { kalem: "Efektif Dağıtım Birim Fiyatı", deger: p.effectiveDistributionUnitPrice, birim: "TL/kWh", not: p.invoiceMethodId === 2 ? "brüt taban; mahsup düzeltmesi yok" : "mahsup sonrası" },
+    { kalem: "Efektif Dağıtım Birim Fiyatı", deger: p.effectiveDistributionUnitPrice, birim: "TL/kWh", not: p.invoiceMethodId === 2 || p.invoiceMethodId === 5 ? "brüt taban; mahsup düzeltmesi yok" : "mahsup sonrası" },
     { kalem: "KDV Oranı", deger: `%${pct(p.vatRate)}`, birim: "", not: "" },
     { kalem: "BTV Oranı", deger: `%${pct(p.btvRate)}`, birim: "", not: "" },
     { kalem: "Tarife", deger: p.tarife ?? "—", birim: "", not: "" },

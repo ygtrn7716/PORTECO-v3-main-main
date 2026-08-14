@@ -66,11 +66,34 @@ export interface InvoiceInput {
   // fallback yapılır. Birim fiyat (D/2) ve enerji tarafı her durumda aynı kalır.
   netPositiveDrawKwh?: number; // Σ max(0, cn_saat − gn_saat)
   netExcessFeedKwh?: number;   // Σ max(0, gn_saat − cn_saat)
+
+  // Aşama 2K — Sepaş Temmuz 2026: Metod 1 "Veriş Mahsup" birim fiyatı perakende
+  // tek zamanlı aktif enerji bedelini aşamaz. KAPI ÇAĞIRANDA çözülür
+  // (isM1MahsupCapPeriod(dönem) && provider !== 'vhs_kayseri'); motor dönem ve
+  // provider bilmez. Perakende yoksa (≤0) tavan uygulanmaz + console.warn
+  // (hesap sürer). Bayrak kapalıyken çıktı bit-identiktir.
+  applyVerisMahsupPerakendeCap?: boolean;
 }
 
 // 10 yıl üstü tesislerin veriş fazlası satışında kullanılan sabit USD birim fiyatı.
 // Toplam birim fiyat (TL/kWh) = VERIS_USD_BIRIM_FIYAT × usd_kur.
 const VERIS_USD_BIRIM_FIYAT = 0.133;
+
+// Sepaş Temmuz 2026 uygulaması; aksi bildirilene dek geçerli.
+// Bu dönemden itibaren Metod 1 "Veriş Mahsup" birim fiyatı tesisin perakende
+// tek zamanlı aktif enerji bedelini AŞAMAZ (mahsupBirim = min(U, perakende)).
+// vhs_kayseri kapsam dışı; ≤ 2026-06 dönemleri koşulsuz eski davranış. TEK kaynak.
+export const M1_MAHSUP_CAP_EFFECTIVE = { year: 2026, month: 7 } as const;
+
+/** Dönem tavan yürürlüğünde mi? (y×12+m ordinal karşılaştırması —
+ *  InvoiceOverridesAdmin deseni. Geçersiz/eksik girdi → false, fail-safe.) */
+export function isM1MahsupCapPeriod(periodYear: number, periodMonth: number): boolean {
+  if (!Number.isFinite(periodYear) || !Number.isFinite(periodMonth)) return false;
+  return (
+    periodYear * 12 + periodMonth >=
+    M1_MAHSUP_CAP_EFFECTIVE.year * 12 + M1_MAHSUP_CAP_EFFECTIVE.month
+  );
+}
 
 export interface InvoiceBreakdown {
   energyCharge: number;
@@ -94,9 +117,17 @@ export interface InvoiceBreakdown {
   // Veriş satış bedeli (ulusal tarife mahsubu)
   verisMahsupKwh: number;   // min(verisKwh, totalConsumptionKwh) — birim fiyatla mahsup edilen
   verisFazlaKwh: number;    // max(0, verisKwh - totalConsumptionKwh) — perakende ile satılan
-  verisMahsupBedeli: number; // mahsup×unitPrice — FATURADAN DÜŞÜLEN kısım
+  verisMahsupBedeli: number; // mahsup×birim — FATURADAN DÜŞÜLEN kısım (2K: birim tavanlı olabilir)
   verisFazlaBedeli: number;  // fazla×birim — faturadan DÜŞÜLMEZ; ayrı "GES Üretim Satışı" kartında
   verisSatisBedeli: number; // toplam (mahsup+fazla) — geriye-uyum/audit; subtotal'a GİRMEZ
+
+  // Aşama 2K — mahsup satırında UYGULANAN birim fiyat (tavan bağlayıcıysa
+  // perakende, değilse efektif enerji fiyatı). m1 motoru her zaman set eder;
+  // net-metod motorları set etmez.
+  verisMahsupBirimFiyat?: number;
+  // Yalnız tavan gerçekten kırptıysa true; aksi halde anahtar HİÇ eklenmez
+  // (appliedOverrides sparse deseni — tavansız çıktı bit-identik kalır).
+  verisMahsupCapUygulandi?: boolean;
 
   subtotalBeforeVat: number;
   vatCharge: number;
@@ -336,7 +367,33 @@ export function calculateInvoice(
     ? VERIS_USD_BIRIM_FIYAT * usdKur          // 10 yıl üstü + kur var: 0.133 × kur
     : perakendeEnerjiBedeli;                   // 10 yıl altı VEYA kur tanımsız: TL perakende
 
-  const verisMahsupBedeli = verisMahsupKwh * unitPriceEnergy;
+  let verisMahsupBedeli = verisMahsupKwh * unitPriceEnergy;
+
+  // Aşama 2K — mahsup tavanı (Sepaş Temmuz 2026). Bayrak kapalı veya tavan
+  // bağlamıyorsa HİÇBİR yeni aritmetik çalışmaz → eski çıktı bit-identik.
+  // U === perakende sınırı tavansız sayılır (strict <; min zaten aynı değer).
+  // Bayrak mahsupsuz tesiste (lisanslı/m4/üretimsiz) zararsız: verisMahsupKwh=0.
+  let verisMahsupBirimFiyat = unitPriceEnergy;
+  let verisMahsupCapUygulandi = false;
+  if (input.applyVerisMahsupPerakendeCap && verisMahsupKwh > 0) {
+    if (Number.isFinite(perakendeEnerjiBedeli) && perakendeEnerjiBedeli > 0) {
+      if (perakendeEnerjiBedeli < unitPriceEnergy) {
+        verisMahsupBirimFiyat = perakendeEnerjiBedeli;
+        verisMahsupCapUygulandi = true;
+        verisMahsupBedeli = verisMahsupKwh * perakendeEnerjiBedeli;
+        // Kredi küçüldü → BTV matrahı (enerji − mahsup) tam Δkredi kadar büyür.
+        // 4.6'daki mutlak btv override'ı bu satırdan SONRA uygulanır (applyItem
+        // değeri YERİNE koyar) → admin override'ı yine kazanır.
+        btvCharge +=
+          verisMahsupKwh * (unitPriceEnergy - perakendeEnerjiBedeli) * btvRate;
+      }
+    } else {
+      console.warn(
+        "calculateInvoice: perakende enerji bedeli bulunamadı — veriş mahsup tavanı uygulanmadı."
+      );
+    }
+  }
+
   const verisFazlaBedeli  = verisFazlaKwh * verisFazlaBirim;
   const verisSatisBedeli  = verisKwh > 0
     ? (verisMahsupBedeli + verisFazlaBedeli)
@@ -448,6 +505,9 @@ export function calculateInvoice(
     verisMahsupBedeli,
     verisFazlaBedeli,
     verisSatisBedeli,
+    verisMahsupBirimFiyat,
+    // Tavan kırpmadıysa anahtar hiç eklenmez → tavansız çıktı bit-identik.
+    ...(verisMahsupCapUygulandi ? { verisMahsupCapUygulandi: true } : {}),
     subtotalBeforeVat,
     vatCharge,
     totalInvoice,

@@ -148,6 +148,9 @@ const yekdemCell = useMemo(() => {
   // w_pos'suz eski 2A damgalı satırlar m1'e düşer → burada da metod 1 görünümü.)
   const snapIsNetMethod = liveBreakdown?.wPosApplied !== undefined;
   const snapIsM3 = snapIsNetMethod && liveBreakdown?.muhtelif2Net !== undefined;
+  // m5 (İpragaz): m2 kopyası, tek fark BTV matrahına YEK'in girmesi. Damgadan okunur;
+  // w_pos'suz eski satır m1'e düştüyse (snapIsNetMethod=false) m1 metni gösterilir.
+  const snapIsM5 = snapIsNetMethod && Number(row?.invoice_method) === 5;
 
   // Efektif (override'lı) enerji birim fiyatı — kart + satır açıklamaları.
   const effUnitPriceEnergyDisplay = useMemo(() => {
@@ -335,8 +338,8 @@ const yekdemCell = useMemo(() => {
                     </tr>
                   )}
 
-                  {/* Metod 2: YEK Bedeli · Metod 3: Tahmini YEKDEM — her ikisinin tabanı NET */}
-                  {snapIsNetMethod && (
+                  {/* Metod 2/5: YEK Bedeli · Metod 3: Tahmini YEKDEM — hepsinin tabanı NET */}
+                  {snapIsNetMethod && !excludedItems.has("yek") && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">{snapIsM3 ? "Tahmini YEKDEM" : "YEK Bedeli"}</td>
                       <td className="py-2 pr-4 text-neutral-600">Tahmini YEKDEM × KBK</td>
@@ -395,7 +398,9 @@ const yekdemCell = useMemo(() => {
                         {snapIsNetMethod
                           ? snapIsM3
                             ? "(Enerji + Tahmini YEKDEM − mahsuplaşma kredisi) × BTV oranı"
-                            : "Enerji bedeli × BTV oranı"
+                            : snapIsM5
+                              ? "(Enerji bedeli + YEK bedeli) × BTV oranı"
+                              : "Enerji bedeli × BTV oranı"
                           : "Net enerji bedeli × BTV oranı"}
                       </td>
                       <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.btvCharge ?? row.btv_charge)}</td>
@@ -449,7 +454,11 @@ const yekdemCell = useMemo(() => {
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4 text-emerald-700">Veriş Mahsup (Birim Fiyat)</td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {fmtUnit(effUnitPriceEnergyDisplay)} TL/kWh × {fmtKwh(Number(liveBreakdown?.verisMahsupKwh ?? 0))} kWh
+                        {/* 2K: replay motorunun UYGULADIĞI fiyat (tavanlıysa perakende). */}
+                        {fmtUnit(liveBreakdown?.verisMahsupBirimFiyat ?? effUnitPriceEnergyDisplay)} TL/kWh × {fmtKwh(Number(liveBreakdown?.verisMahsupKwh ?? 0))} kWh
+                        {liveBreakdown?.verisMahsupCapUygulandi && (
+                          <span className="ml-1 text-xs text-amber-600">(perakende tavanı)</span>
+                        )}
                       </td>
                       <td className="py-2 pr-4 text-right text-emerald-700">
                         −{fmtMoney2(liveBreakdown?.verisMahsupBedeli)}

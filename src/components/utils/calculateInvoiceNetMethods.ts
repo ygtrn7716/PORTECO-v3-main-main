@@ -11,9 +11,12 @@ import type {
 } from "@/components/utils/invoiceOverrides";
 
 /**
- * Metod 2 (Uedaş) ve Metod 3 (Tredaş) fatura motorları — Aşama 2B.
+ * Metod 2 (Uedaş), Metod 3 (Tredaş) ve Metod 5 (İpragaz) fatura motorları — Aşama 2B.
  *
- * Metod 1 (calculateInvoice.ts) AYLIK netleşmeye dayanır; bu iki metod ise
+ * Metod 5, Metod 2'nin birebir kopyasıdır; TEK FARK BTV matrahı:
+ *   m2: enerji (+ trafo) · m5: enerji + YEK bedeli (+ trafo) — tümü NET taban.
+ *
+ * Metod 1 (calculateInvoice.ts) AYLIK netleşmeye dayanır; bu metodlar ise
  * SAATLİK net agregalara dayanır:
  *   pos_h = max(cn−gn, 0) · mahsup_h = min(cn, gn) · excess_h = max(gn−cn, 0)
  *   wPos  = Σ(pos_h × PTF_h) / Σ pos_h     (ÇIPLAK, pos-ağırlıklı PTF)
@@ -68,11 +71,11 @@ export type MethodInvoiceInput = InvoiceInput & {
   methodInputs?: InvoiceMethodInputs;
 };
 
-/** Metod 2/3'e özgü OPSİYONEL kalemler. Metod 1 çıktısında bu anahtarlar hiç bulunmaz. */
+/** Metod 2/3/5'e özgü OPSİYONEL kalemler. Metod 1 çıktısında bu anahtarlar hiç bulunmaz. */
 export type MethodInvoiceBreakdown = InvoiceBreakdown & {
-  /** m3: "Tahmini YEKDEM" · m2: "YEK Bedeli" */
+  /** m3: "Tahmini YEKDEM" · m2/m5: "YEK Bedeli" */
   yekTahminiCharge?: number;
-  /** m3: "Önceki YEKDEM Mahsup" · m2: "YEK Farkı" (önceki dönem verisi yoksa 0) */
+  /** m3: "Önceki YEKDEM Mahsup" · m2/m5: "YEK Farkı" (önceki dönem verisi yoksa 0) */
   yekFarkiCharge?: number;
   /** m3 muhtelif-2, dağıtım bileşeni (+) */
   muhtelif2Dagitim?: number;
@@ -165,7 +168,7 @@ export function resolveYekFarkiWithOverride(p: {
   return { amount: base * diff * kbk, overridden: true, excluded: false };
 }
 
-type NetMethodId = 2 | 3;
+type NetMethodId = 2 | 3 | 5;
 
 function calculateNetMethod(
   method: NetMethodId,
@@ -202,12 +205,28 @@ function calculateNetMethod(
     : 0;
   let trafoCharge = energyUnitPrice * trafoKwh;
 
-  // ── 2) m3 "Tahmini YEKDEM" · m2 "YEK Bedeli" — her ikisinin tabanı NET (sumPos).
+  // ── 2) m3 "Tahmini YEKDEM" · m2/m5 "YEK Bedeli" — hepsinin tabanı NET (sumPos).
   // Uludağ YEK'i net (mahsuplu) tüketimden alır; tahmini ≈ gerçekleşen olduğundan
-  // YEK FARKI küçüktür (2026-06 faturasıyla doğrulandı). Yalnız DAĞITIM tabanı m2'de
-  // brüt kalır (satır 218).
+  // YEK FARKI küçüktür (2026-06 faturasıyla doğrulandı). Yalnız DAĞITIM tabanı
+  // m2/m5'te brüt kalır (aşağıda, dağıtım bloğu).
+  //
+  // 'yek' override'ı: DOĞAL ve EFEKTİF ayrı tutulur. Satır kalemi (ve KDV matrahı)
+  // her metodda EFEKTİF değeri gösterir; BTV matrahında ise yalnız m5 efektifi
+  // kullanır — m3 matrahı DOĞAL yek'le hesaplanır ki 'yek' override'ı doğrulanmış
+  // m3 BTV çıktısını asla değiştirmesin (m2 matrahında yek zaten yok).
   const yekBase = sumPos;
-  let yekTahminiCharge = yekBase * (num(m.tahminiYekdem) * kbk);
+  const yekOv = ov?.yek;
+  const yekUnitOv = yekOv?.unitPriceOverride;
+  const yekTahminiNatural = yekBase * (num(m.tahminiYekdem) * kbk);
+  // Öncelik: isExcluded > amountOverride > unitPriceOverride > doğal.
+  const yekTahminiEffective = yekOv?.isExcluded
+    ? 0
+    : isFin(yekOv?.amountOverride)
+      ? Number(yekOv!.amountOverride)
+      : isFin(yekUnitOv)
+        ? yekBase * Number(yekUnitOv)
+        : yekTahminiNatural;
+  let yekTahminiCharge = yekTahminiNatural;
 
   // ── 3) Önceki dönem farkı — iki metodda da taban NET (ortak fonksiyon).
   // 2C: manuel YEKDEM override'ı ("yekdem_mahsup") bu kaleme köprülenir; MANUEL KAZANIR.
@@ -220,8 +239,8 @@ function calculateNetMethod(
   });
   const yekFarkiCharge = yekFarkiResolved.amount;
 
-  // ── 4) Dağıtım — m3 taban NET, m2 taban BRÜT (m2'de muhtelif yok, tek satır)
-  const distributionBaseKwh = method === 2 ? sumCn : sumPos;
+  // ── 4) Dağıtım — m3 taban NET, m2/m5 taban BRÜT (muhtelif yok, tek satır)
+  const distributionBaseKwh = method === 3 ? sumPos : sumCn;
   let distributionCharge = distributionBaseKwh * unitPriceDistribution;
 
   // ── 5) Muhtelif-2 (YALNIZ m3): +mahsup×dağıtım ve −mahsup×mahsuplaşmaFiyatı
@@ -257,17 +276,26 @@ function calculateNetMethod(
     ? Number(input.reactivePenaltyCharge)
     : 0;
 
-  // ── 7) BTV — m3: %1 × (Enerji + Tahmini YEKDEM − mahsuplaşma kredisi) · m2: %1 × Enerji.
+  // ── 7) BTV — m3: %1 × (Enerji + Tahmini YEKDEM − mahsuplaşma kredisi) · m2: %1 × Enerji
+  //           · m5: %1 × (Enerji + YEK Bedeli).
   // Trepaş enerji ve YEKDEM'i faturada ayrı satır gösterse de BTV ikisinin TOPLAMINDAN
   // kesilir; Önceki YEKDEM Mahsup satırı ve Muhtelif-2'nin DAĞITIM bileşeni matraha GİRMEZ.
   // Trafo, metod 1'deki gibi tabana dahil.
   // m2: Uludağ BTV'yi yalnız enerji bedelinden keser (2026-06 faturası: 9.513,56 =
-  // 951.356,23 × %1); YEKDEM matraha dahil EDİLMEZ.
+  // 951.356,23 × %1); YEKDEM matraha dahil EDİLMEZ. Bu davranış gerçek faturayla
+  // doğrulandı — m5 eklenirken BİLEREK korunmuştur.
+  // m5 (İpragaz): m2 kopyası, tek fark YEK bedelinin matraha girmesi. m5 matrahı
+  // yek'in EFEKTİF (override sonrası) değerini kullanır; m3 matrahı DOĞAL değeri
+  // kullanır ('yek' override'ı m3 BTV'sini değiştirmez — doğrulanmış çıktı korunur).
+  // Enerji/trafo için mevcut kural sürer: yalnız birim fiyat zinciri matraha akar,
+  // exclude/tutar override'ları akmaz (admin isterse BTV'yi ayrıca override eder).
   const btvRate = num(input.btvRate);
   const btvEnergyBase =
     method === 3
-      ? energyCharge + yekTahminiCharge - muhtelif2MahsupKredisi
-      : energyCharge;
+      ? energyCharge + yekTahminiNatural - muhtelif2MahsupKredisi
+      : method === 5
+        ? energyCharge + yekTahminiEffective
+        : energyCharge;
   let btvCharge = (btvEnergyBase + trafoCharge) * btvRate;
 
   // ── Güç — kural setinde geçmiyor; metod 1 semantiği (yalnız çift terim). VARSAYIM.
@@ -322,6 +350,12 @@ function calculateNetMethod(
   if (yekFarkiResolved.excluded) excludedItems.push("yekdem_mahsup");
   else if (yekFarkiResolved.overridden) amountOverriddenItems.push("yekdem_mahsup");
 
+  // yekTahminiCharge da applyItem'dan geçmez: efektif değer BTV'den ÖNCE çözüldü
+  // (m5 matrahı ona bağlı). Satır kalemi + KDV matrahı her metodda efektifi kullanır.
+  yekTahminiCharge = yekTahminiEffective;
+  if (yekOv?.isExcluded) excludedItems.push("yek");
+  else if (isFin(yekOv?.amountOverride)) amountOverriddenItems.push("yek");
+
   const muhtelif2Net = muhtelif2Dagitim - muhtelif2MahsupKredisi;
 
   // ── Veriş blokları: GES Üretim Satışı kartı TÜM metodlarda aynı kalsın diye
@@ -356,13 +390,15 @@ function calculateNetMethod(
     amountOverriddenItems.length > 0 ||
     isFin(enerjiUnitOv) ||
     isFin(dagitimUnitOv) ||
-    isFin(mahsuplasmaUnitOv)
+    isFin(mahsuplasmaUnitOv) ||
+    isFin(yekUnitOv)
       ? {
           excludedItems,
           amountOverriddenItems,
           unitPriceEnergyOverridden: isFin(enerjiUnitOv),
           unitPriceDistributionOverridden: isFin(dagitimUnitOv),
           unitPriceMahsuplasmaOverridden: isFin(mahsuplasmaUnitOv),
+          unitPriceYekOverridden: isFin(yekUnitOv),
         }
       : null;
 
@@ -427,4 +463,14 @@ export function calculateInvoiceMethod3(
   methodInputs?: InvoiceMethodInputs
 ): MethodInvoiceBreakdown {
   return calculateNetMethod(3, input, overrides, methodInputs);
+}
+
+/** Metod 5 — İpragaz. Metod 2'nin birebir kopyası; TEK FARK BTV matrahına
+ *  YEK bedeli de girer: %oran × (Enerji + YEK Bedeli + trafo), tümü NET taban. */
+export function calculateInvoiceMethod5(
+  input: MethodInvoiceInput,
+  overrides?: InvoiceOverrides | null,
+  methodInputs?: InvoiceMethodInputs
+): MethodInvoiceBreakdown {
+  return calculateNetMethod(5, input, overrides, methodInputs);
 }

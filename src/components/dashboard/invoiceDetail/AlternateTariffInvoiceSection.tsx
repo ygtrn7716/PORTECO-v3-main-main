@@ -6,6 +6,7 @@ import {
 import {
   calculateInvoiceForMethod,
   DEFAULT_INVOICE_METHOD,
+  isNetInvoiceMethod,
   type InvoiceMethodId,
 } from "@/lib/invoiceMethods";
 import type {
@@ -83,6 +84,9 @@ export default function AlternateTariffInvoiceSection(props: {
   invoiceMethodId?: InvoiceMethodId;
   /** Metod 2/3 saatlik-net girdileri (InvoiceDetail'den). Metod 1'de null. */
   methodInputs?: InvoiceMethodInputs | null;
+  /** Aşama 2K: ana faturayla aynı çözülmüş mahsup tavanı kapısı (InvoiceDetail
+   *  hesaplar: dönem ≥ 2026-07 && !Kayseri). Perakende kaynağı mevcut prop. */
+  applyVerisMahsupPerakendeCap?: boolean;
 }) {
   const {
     uid,
@@ -109,6 +113,7 @@ export default function AlternateTariffInvoiceSection(props: {
     netExcessFeedKwh,
     invoiceMethodId = DEFAULT_INVOICE_METHOD,
     methodInputs = null,
+    applyVerisMahsupPerakendeCap,
   } = props;
 
   const [loading, setLoading] = useState(false);
@@ -289,6 +294,7 @@ export default function AlternateTariffInvoiceSection(props: {
           netPositiveDrawKwh,
           netExcessFeedKwh,
           methodInputs: methodInputs ?? undefined,
+          applyVerisMahsupPerakendeCap, // 2K: ana faturayla aynı kapı
         });
 
         if (cancel) return;
@@ -332,6 +338,7 @@ export default function AlternateTariffInvoiceSection(props: {
     // (2A'da bilinçli ertelenmişti; artık stale-prop riski gerçek).
     invoiceMethodId,
     methodInputs,
+    applyVerisMahsupPerakendeCap, // 2K
   ]);
 
   // 2H — Ana faturanın dış mahsup kalemleri karş-olgusala AYNEN taşınır (yeniden hesap YOK):
@@ -342,7 +349,7 @@ export default function AlternateTariffInvoiceSection(props: {
   // Böylece (ana Ödenecek − alt Ödenecek) yalnız dağıtım+güç ekseninden gelir.
   const carried = useMemo(() => {
     if (!altBreakdown) return null;
-    const isNetMethod = invoiceMethodId === 2 || invoiceMethodId === 3;
+    const isNetMethod = isNetInvoiceMethod(invoiceMethodId);
     const vat = altMeta ? Number(altMeta.altVatRate) : 0;
 
     const yekFarkiCarried = isNetMethod
@@ -508,7 +515,7 @@ export default function AlternateTariffInvoiceSection(props: {
                   <td className="py-2 pr-4">Enerji Bedeli</td>
                   <td className="py-2 pr-4 text-neutral-600">
                     {/* Metod 2/3: taban NET pozitif çekiş, fiyat = wPos × KBK (T-0) */}
-                    {invoiceMethodId === 2 || invoiceMethodId === 3 ? (
+                    {isNetInvoiceMethod(invoiceMethodId) ? (
                       <>
                         {fmtUnit(altBreakdown.energyUnitPriceApplied ?? 0)} TL/kWh ×{" "}
                         {fmtKwh(altBreakdown.netEnergyKwh)} kWh
@@ -523,10 +530,10 @@ export default function AlternateTariffInvoiceSection(props: {
                 </tr>
 
                 {/* Metod 2: YEK Bedeli · Metod 3: Tahmini YEKDEM — taban NET (netEnergyKwh) */}
-                {(invoiceMethodId === 2 || invoiceMethodId === 3) && (
+                {(isNetInvoiceMethod(invoiceMethodId)) && (
                   <tr className="border-b border-neutral-100">
                     <td className="py-2 pr-4">
-                      {invoiceMethodId === 2 ? "YEK Bedeli" : "Tahmini YEKDEM"}
+                      {invoiceMethodId === 3 ? "Tahmini YEKDEM" : "YEK Bedeli"}
                     </td>
                     <td className="py-2 pr-4 text-neutral-600">
                       Tahmini YEKDEM × KBK × {fmtKwh(altBreakdown.netEnergyKwh)} kWh
@@ -538,11 +545,11 @@ export default function AlternateTariffInvoiceSection(props: {
                 )}
 
                 {/* Önceki dönem YEKDEM farkı — veri yoksa 0 ve satır gizli */}
-                {(invoiceMethodId === 2 || invoiceMethodId === 3) &&
+                {(isNetInvoiceMethod(invoiceMethodId)) &&
                   (altBreakdown.yekFarkiCharge ?? 0) !== 0 && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">
-                        {invoiceMethodId === 2 ? "YEK Farkı" : "Önceki YEKDEM Mahsup"}
+                        {invoiceMethodId === 3 ? "Önceki YEKDEM Mahsup" : "YEK Farkı"}
                       </td>
                       <td className="py-2 pr-4 text-neutral-600">
                         Önceki dönem net çekiş × (Gerçekleşen − Tahmini) × KBK
@@ -559,7 +566,7 @@ export default function AlternateTariffInvoiceSection(props: {
                     <td className="py-2 pr-4 text-neutral-600">
                       {/* Metod 2/3: trafo da wPos × KBK ile fiyatlanır */}
                       {fmtUnit(
-                        invoiceMethodId === 2 || invoiceMethodId === 3
+                        isNetInvoiceMethod(invoiceMethodId)
                           ? altBreakdown.energyUnitPriceApplied ?? 0
                           : unitPriceEnergy
                       )}{" "}
@@ -613,7 +620,9 @@ export default function AlternateTariffInvoiceSection(props: {
                   <td className="py-2 pr-4 text-neutral-600">
                     {invoiceMethodId === 3
                       ? "(Enerji + Tahmini YEKDEM − mahsuplaşma kredisi) × BTV"
-                      : "Enerji bedeli × BTV"}
+                      : invoiceMethodId === 5
+                        ? "(Enerji bedeli + YEK bedeli) × BTV"
+                        : "Enerji bedeli × BTV"}
                   </td>
                   <td className="py-2 pr-4 text-right">{fmtMoney2(altBreakdown.btvCharge)}</td>
                 </tr>
@@ -680,11 +689,11 @@ export default function AlternateTariffInvoiceSection(props: {
                 {/* 2H — Ana faturadan taşınan dış mahsup kalemleri (post-total, yeniden hesap YOK).
                     Böylece Ödenecek ana faturayla aynı dış kalem setini içerir; fark yalnız
                     dağıtım+güç ekseninden gelir. */}
-                {(invoiceMethodId === 2 || invoiceMethodId === 3) &&
+                {(isNetInvoiceMethod(invoiceMethodId)) &&
                   (carried?.yekFarkiCarried ?? 0) !== 0 && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">
-                        {invoiceMethodId === 2 ? "YEK Farkı" : "Önceki YEKDEM Mahsup"}
+                        {invoiceMethodId === 3 ? "Önceki YEKDEM Mahsup" : "YEK Farkı"}
                       </td>
                       <td className="py-2 pr-4 text-neutral-600">
                         Ana faturadan taşındı (KDV dahil)
@@ -696,8 +705,7 @@ export default function AlternateTariffInvoiceSection(props: {
                     </tr>
                   )}
 
-                {invoiceMethodId !== 2 &&
-                  invoiceMethodId !== 3 &&
+                {!isNetInvoiceMethod(invoiceMethodId) &&
                   hasYekdemMahsup &&
                   (carried?.m1Mahsup ?? 0) !== 0 && (
                     <tr className="border-b border-neutral-100">

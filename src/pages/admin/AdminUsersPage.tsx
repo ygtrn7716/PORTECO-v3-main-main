@@ -36,6 +36,8 @@ type SettingsForm = {
   anlik_uretim_kullanimi: boolean | null;
   // Fatura Detay > GES Olmasaydı panelinde Muhasebe Excel butonunu açar (tesis bazlı opt-in).
   muhasebe_excel_enabled: boolean;
+  // Muhasebe Excel çıktı formatı: 'standard' | 'penguen_tahakkuk' (müşteri bazlı sunum varyantı).
+  muhasebe_excel_format: string;
 };
 
 type YekdemMonth = {
@@ -75,6 +77,7 @@ const EMPTY_SETTINGS: SettingsForm = {
   unit_price_adjustment: null,
   anlik_uretim_kullanimi: null,
   muhasebe_excel_enabled: false,
+  muhasebe_excel_format: "standard",
 };
 
 const MONTH_NAMES = [
@@ -233,7 +236,7 @@ export default function AdminUsersPage() {
     (async () => {
       const { data } = await supabase
         .from("subscription_settings")
-        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil, satis_hakki, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi, muhasebe_excel_enabled")
+        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil, satis_hakki, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi, muhasebe_excel_enabled, muhasebe_excel_format")
         .eq("user_id", selectedUserId)
         .eq("subscription_serno", selectedSerno)
         .maybeSingle();
@@ -784,6 +787,28 @@ export default function AdminUsersPage() {
                         Fatura Detay sayfasındaki GES Olmasaydı panelinde muhasebe raporu butonunu açar.
                         Varsayılan kapalı, tesis bazlıdır.
                       </span>
+
+                      {/* Muhasebe Excel çıktı formatı — müşteri bazlı sunum varyantı */}
+                      <label className="block mt-2">
+                        <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                          Muhasebe Excel Formatı
+                        </span>
+                        <select
+                          value={settings.muhasebe_excel_format ?? "standard"}
+                          disabled={!settings.muhasebe_excel_enabled}
+                          onChange={(e) =>
+                            setSettings((p) => ({ ...p, muhasebe_excel_format: e.target.value }))
+                          }
+                          className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200 disabled:bg-neutral-100 disabled:text-neutral-400"
+                        >
+                          <option value="standard">Standart (Girdi/Çıktı)</option>
+                          <option value="penguen_tahakkuk">Penguen Tahakkuk (özel)</option>
+                        </select>
+                        <span className="mt-1 block text-[10px] text-neutral-400">
+                          Muhasebe Excel çıktısının formatını belirler. Özel formatlar yalnız ilgili
+                          müşteri için kullanılır; hesaplama değişmez.
+                        </span>
+                      </label>
                     </div>
 
                     {/* GES Anlık Üretim Kullanımı (üç durumlu: NULL / true / false) */}
