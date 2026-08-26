@@ -44,6 +44,12 @@ export type GesMahsupPresentation =
       kwh: number;
     }
   | {
+      /** Metod 6 (Kepsaş): veriş faturaya YANSIMAZ (mahsup/kredi yok). Veriş kWh
+       *  yalnız BİLGİ olarak gösterilir; TL kredi yoktur. */
+      kind: "info-only";
+      kwh: number;
+    }
+  | {
       /** Metod 3: Muhtelif-2 kalemi. */
       kind: "muhtelif2";
       kwh: number;
@@ -125,6 +131,11 @@ export function deriveGesSatisMahsup(args: {
   let mahsup: GesMahsupPresentation;
   if (invoiceMethodId === 4) {
     mahsup = { kind: "none", reason: "method4" };
+  } else if (invoiceMethodId === 6) {
+    // Kepsaş (Aşama 2L-R): fatura tabanında üretim etkileri sıfırlanır → breakdown'da
+    // veriş mahsup/fazla 0'dır. GES sayfası veriş kWh'ını (dönem toplam üretimi)
+    // yalnız BİLGİ olarak gösterir; TL kredi yok, fatura toplamına yansımaz.
+    mahsup = { kind: "info-only", kwh: Math.max(0, args.totalProductionKwh) };
   } else if (args.lisansliSatis) {
     mahsup = { kind: "none", reason: "lisansli" };
   } else if (!(mahsupKwh > 0)) {

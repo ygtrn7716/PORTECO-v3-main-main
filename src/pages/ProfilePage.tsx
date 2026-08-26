@@ -16,9 +16,12 @@ import {
   Zap,
   Sun,
   Activity,
+  Bell,
+  BellOff,
 } from "lucide-react";
 import { setSubscriptionHidden } from "@/lib/subscriptionVisibility";
 import { setBtvEnabled } from "@/lib/btvToggle";
+import { setSubscriptionAlertsEnabled } from "@/lib/subscriptionAlerts";
 
 type FacilityRow = {
   subscriptionSerNo: number;
@@ -27,6 +30,7 @@ type FacilityRow = {
   nickname: string | null;
   isHidden: boolean;
   btvEnabled: boolean;
+  alertsEnabled: boolean;
 };
 
 export default function ProfilePage() {
@@ -44,6 +48,7 @@ export default function ProfilePage() {
   const [nickMsg, setNickMsg] = useState<Record<number, string | null>>({});
   const [hiddenSaving, setHiddenSaving] = useState<Record<number, boolean>>({});
   const [btvSaving, setBtvSaving] = useState<Record<number, boolean>>({});
+  const [alertsSaving, setAlertsSaving] = useState<Record<number, boolean>>({});
 
   // Reaktif görünüm tercihi
   const [reactiveDisplayMode, setReactiveDisplayMode] = useState<"toggle" | "pill">(() => {
@@ -100,6 +105,37 @@ export default function ProfilePage() {
     }
   };
 
+  const toggleAlerts = async (serno: number) => {
+    if (!uid) return;
+    const facility = facilities.find((f) => f.subscriptionSerNo === serno);
+    if (!facility) return;
+
+    const prevVal = facility.alertsEnabled;
+    const newVal = !prevVal;
+    setAlertsSaving((p) => ({ ...p, [serno]: true }));
+
+    // optimistic — once ekranda degistir
+    setFacilities((prev) =>
+      prev.map((f) =>
+        f.subscriptionSerNo === serno ? { ...f, alertsEnabled: newVal } : f
+      )
+    );
+
+    try {
+      await setSubscriptionAlertsEnabled(uid, serno, newVal);
+    } catch (e: any) {
+      console.error("toggle alerts error:", e);
+      // hata — eski degere geri don
+      setFacilities((prev) =>
+        prev.map((f) =>
+          f.subscriptionSerNo === serno ? { ...f, alertsEnabled: prevVal } : f
+        )
+      );
+    } finally {
+      setAlertsSaving((p) => ({ ...p, [serno]: false }));
+    }
+  };
+
   const effectiveLabel = useMemo(() => {
     const map = new Map<number, string>();
     for (const f of facilities) {
@@ -137,12 +173,12 @@ export default function ProfilePage() {
             .map((r: any) => Number(r.subscription_serno))
             .filter((n: any) => Number.isFinite(n));
 
-          let ssMap = new Map<number, { title: string | null; nickname: string | null; isHidden: boolean }>();
+          let ssMap = new Map<number, { title: string | null; nickname: string | null; isHidden: boolean; alertsEnabled: boolean }>();
 
           if (sernos.length > 0) {
             const { data: ssData, error: ssErr } = await supabase
               .from("subscription_settings")
-              .select("subscription_serno, title, nickname, is_hidden")
+              .select("subscription_serno, title, nickname, is_hidden, alerts_enabled")
               .eq("user_id", uid)
               .in("subscription_serno", sernos);
 
@@ -153,7 +189,7 @@ export default function ProfilePage() {
             for (const r of (ssData ?? []) as any[]) {
               const k = Number(r.subscription_serno);
               if (Number.isFinite(k)) {
-                ssMap.set(k, { title: r.title ?? null, nickname: r.nickname ?? null, isHidden: r.is_hidden ?? false });
+                ssMap.set(k, { title: r.title ?? null, nickname: r.nickname ?? null, isHidden: r.is_hidden ?? false, alertsEnabled: r.alerts_enabled ?? true });
               }
             }
           }
@@ -169,12 +205,13 @@ export default function ProfilePage() {
               nickname: ss?.nickname ?? null,
               isHidden: ss?.isHidden ?? false,
               btvEnabled: r.btv_enabled ?? true,
+              alertsEnabled: ss?.alertsEnabled ?? true,
             };
           });
         } else {
           const { data: ssData, error: ssErr } = await supabase
             .from("subscription_settings")
-            .select("subscription_serno, title, nickname, is_hidden")
+            .select("subscription_serno, title, nickname, is_hidden, alerts_enabled")
             .eq("user_id", uid)
             .order("subscription_serno", { ascending: true });
 
@@ -188,6 +225,7 @@ export default function ProfilePage() {
             nickname: r.nickname ?? null,
             isHidden: r.is_hidden ?? false,
             btvEnabled: true,
+            alertsEnabled: r.alerts_enabled ?? true,
           }));
         }
 
@@ -642,7 +680,34 @@ export default function ProfilePage() {
                           )}
                           {f.btvEnabled ? "BTV Açık" : "BTV Kapalı"}
                         </button>
+
+                        <button
+                          type="button"
+                          onClick={() => toggleAlerts(f.subscriptionSerNo)}
+                          disabled={!!alertsSaving[f.subscriptionSerNo]}
+                          className={`inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium border transition-all duration-200 active:scale-[0.97] disabled:opacity-60 ${
+                            f.alertsEnabled
+                              ? "border-[#0A66FF]/20 bg-[#0A66FF]/5 text-[#0A66FF] hover:bg-[#0A66FF]/10"
+                              : "border-neutral-300 bg-neutral-100 text-neutral-500 hover:bg-neutral-200"
+                          }`}
+                          title={f.alertsEnabled ? "Reaktif bildirim acik - kapatmak icin tikla" : "Reaktif bildirim kapali - acmak icin tikla"}
+                        >
+                          {alertsSaving[f.subscriptionSerNo] ? (
+                            <div className="h-4 w-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                          ) : f.alertsEnabled ? (
+                            <Bell className="h-3.5 w-3.5" />
+                          ) : (
+                            <BellOff className="h-3.5 w-3.5" />
+                          )}
+                          {f.alertsEnabled ? "Bildirim Açık" : "Bildirim Kapalı"}
+                        </button>
                       </div>
+
+                      {!f.alertsEnabled && (
+                        <div className="mt-2 text-xs text-neutral-400">
+                          Bu tesis için reaktif aşım SMS'i ve e-postası gönderilmez.
+                        </div>
+                      )}
 
                       {/* Preview + message */}
                       <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2">

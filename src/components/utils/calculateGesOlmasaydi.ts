@@ -26,6 +26,7 @@ import {
   DEFAULT_INVOICE_METHOD,
   isNetInvoiceMethod,
   type InvoiceMethodId,
+  type MethodInvoiceBreakdown,
 } from "@/lib/invoiceMethods";
 import type { InvoiceMethodInputs } from "@/components/utils/calculateInvoiceNetMethods";
 import { computeHourlyNetAggregates } from "@/components/utils/hourlyNetAggregates";
@@ -52,6 +53,13 @@ export interface GesOlmasaydiResult {
   tasarrufYuzde: number;      // tasarruf / gesOlmasaydiFatura × 100
   hamBirimFiyat: number;      // receiver: = mevcutBirimFiyat
   mevcutBirimFiyat: number;
+  /** Karşı-olgusal ENERJİ birim fiyatı — YALNIZ metod 2/3/5'te dolu (ÇIPLAK: wPos × KBK).
+   *  Metod 1/4'te undefined: o motorlarda YEKDEM zaten hamBirimFiyat'ın içinde. */
+  gesOlmasaydiEnerjiBirim?: number;
+  /** Karşı-olgusal YEK birim fiyatı (YEKDEM × KBK) — metod 2/3/5'te YEKDEM ayrı kalem
+   *  olduğu için birim fiyattan görünmez; DETAY'da açıkça gösterilsin diye türetilir.
+   *  gesOlmasaydiEnerjiBirim ile İKİSİ BİRLİKTE set edilir; toplamları hamBirimFiyat'tır. */
+  gesOlmasaydiYekBirim?: number;
   gesOlmasaydiBreakdown: InvoiceBreakdown;
   /** Metod 2/3 tesiste karşı-olgusal saatlik girdiler kurulamadı (o dönem için
    *  saatlik tüketim/PTF yok) → Metod 1 yaklaşımıyla hesaplandı. UI "yaklaşık" der. */
@@ -145,6 +153,19 @@ function assembleResult(args: {
   const tasarrufYuzde =
     gesOlmasaydiFatura > 0 ? (tasarruf / gesOlmasaydiFatura) * 100 : 0;
 
+  // Karşı-olgusal birim fiyatın ayrışımı — YALNIZ net metodlarda (m2/m3/m5) anlamlı:
+  // o motorlarda enerji ÇIPLAK fiyatlanır (wPos × KBK) ve YEKDEM ayrı KALEMdir, yani
+  // hamBirimFiyat'ın YEKDEM bileşeni tek satırda görünmez. Değerler motorun ÜRETTİĞİ
+  // çıktıdan okunur (override dahil) — yeni aritmetik veya ikinci bir fiyat yolu YOK.
+  // Metod 1/4 çıktısında energyUnitPriceApplied anahtarı hiç bulunmaz → ikisi de
+  // undefined kalır ve UI bugünkü tek satırı korur.
+  const mb = breakdown as MethodInvoiceBreakdown;
+  const splitOk = mb.energyUnitPriceApplied != null && mb.netEnergyKwh > 0;
+  const gesOlmasaydiEnerjiBirim = splitOk ? mb.energyUnitPriceApplied : undefined;
+  const gesOlmasaydiYekBirim = splitOk
+    ? (mb.yekTahminiCharge ?? 0) / mb.netEnergyKwh
+    : undefined;
+
   return {
     mode,
     anlikUretimKullanimi: args.anlikUretimKullanimi ?? true,
@@ -160,6 +181,8 @@ function assembleResult(args: {
     tasarrufYuzde,
     hamBirimFiyat: args.hamBirimFiyat,
     mevcutBirimFiyat: params.mevcutBirimFiyat,
+    gesOlmasaydiEnerjiBirim,
+    gesOlmasaydiYekBirim,
     gesOlmasaydiBreakdown: breakdown,
     counterfactualApproximate: args.approximate ?? false,
   };

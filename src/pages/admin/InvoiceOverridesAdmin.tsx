@@ -18,7 +18,7 @@ import {
   type BilledInvoiceInputs,
   type BilledInvoiceResult,
 } from "@/components/utils/billedInvoiceInputs";
-import { isNetInvoiceMethod } from "@/lib/invoiceMethods";
+import { isNetInvoiceMethod, isEmbeddedYekdemMethod } from "@/lib/invoiceMethods";
 import {
   fetchInvoiceOverrides,
   upsertInvoiceOverride,
@@ -516,6 +516,10 @@ export default function InvoiceOverridesAdmin() {
   // KALEMdir (yekFarkiCharge) → manuel kart etiketleri ve önizleme buna göre değişir.
   const isNetMethod =
     inputs != null && isNetInvoiceMethod(inputs.invoiceMethodId);
+  // Metod 6 (Kepsaş): mahsup enerji birim fiyatına GÖMÜLÜ → ayrı satır yok.
+  // Manuel panel çalışır (yekdem_mahsup override'ı) ama önizleme gömülü gösterir.
+  const isEmbedded =
+    inputs != null && isEmbeddedYekdemMethod(inputs.invoiceMethodId);
 
   const showVerisWarning =
     draft.enerji.isExcluded && (naturalResult?.breakdown.verisMahsupKwh ?? 0) > 0;
@@ -730,9 +734,10 @@ export default function InvoiceOverridesAdmin() {
     rows.push({ label: "KDV Hariç Toplam", natural: nb.subtotalBeforeVat, edited: eb.subtotalBeforeVat, excluded: false, strong: true });
     rows.push({ label: "KDV", natural: nb.vatCharge, edited: eb.vatCharge, excluded: false });
     rows.push({ label: "Genel Toplam (KDV Dahil)", natural: nb.totalInvoice, edited: eb.totalInvoice, excluded: false, strong: true });
-    // Metod 2/3'te fark yukarıda KDV matrahındaki KALEM olarak gösteriliyor;
-    // toplam-sonrası mahsup 0'a zorlandığı için burada yanıltıcı 0/0 satırı çizilmez.
-    if (!isNetMethod) {
+    // Metod 2/3'te fark KDV matrahındaki KALEM, Metod 6'da enerji birim fiyatına
+    // GÖMÜLÜ → toplam-sonrası mahsup 0'a zorlandığı için yanıltıcı 0/0 satırı çizilmez
+    // (Metod 6'da enerji satırındaki tutar zaten mahsubu içerir).
+    if (!isNetMethod && !isEmbedded) {
       rows.push({
         label: "YEKDEM Mahsubu",
         natural: naturalResult.yekdemMahsup,
@@ -748,7 +753,7 @@ export default function InvoiceOverridesAdmin() {
       strong: true,
     });
     return rows;
-  }, [naturalResult, editedResult, inputs, isNetMethod, draft.yekdem_mahsup.isExcluded]);
+  }, [naturalResult, editedResult, inputs, isNetMethod, isEmbedded, draft.yekdem_mahsup.isExcluded]);
 
   const diff =
     naturalResult && editedResult
@@ -1241,6 +1246,17 @@ export default function InvoiceOverridesAdmin() {
                               — KDV matrahına girer
                             </span>
                           </>
+                        ) : isEmbedded ? (
+                          <>
+                            Enerji fiyatına gömülen mahsup (çıplak):{" "}
+                            <span className="font-semibold">
+                              {fmtMoney2(editedResult.embeddedYekdemAdder)} ₺
+                            </span>{" "}
+                            <span className="text-neutral-400">
+                              (doğal: {fmtMoney2(naturalResult?.embeddedYekdemAdder ?? 0)} ₺)
+                              — enerji birim fiyatına dahil
+                            </span>
+                          </>
                         ) : (
                           <>
                             Hesaplanan mahsup:{" "}
@@ -1258,6 +1274,8 @@ export default function InvoiceOverridesAdmin() {
                     <div className="mt-1 text-[10px] text-neutral-400">
                       {isNetMethod
                         ? "Bu değerler sadece YEK Farkı / Önceki YEKDEM Mahsup kalemini etkiler; KDV matrahına girer, diğer kalemlere dokunmaz."
+                        : isEmbedded
+                        ? "Bu değerler enerji birim fiyatına GÖMÜLÜR (ayrı mahsup satırı gösterilmez); trafo/dağıtım/veriş mahsubuna dokunmaz."
                         : "Bu değerler sadece YEKDEM mahsup satırını etkiler; enerji/dağıtım/diğer kalemlere ve veriş mahsubuna dokunmaz."}
                     </div>
                   </>

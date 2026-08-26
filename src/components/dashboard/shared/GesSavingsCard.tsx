@@ -50,25 +50,42 @@ export default function GesSavingsCard(props: Props) {
   // DETAY satırları — panel'de 3 gruba ayrılır (Enerji Akışı / Fiyatlandırma /
   // Mahsup & Satış). Inline (dashboard GesSavingsSection) düz liste AYNEN kalır.
   type DetayRow = { group: "enerji" | "fiyat" | "mahsup"; label: string; value: string; highlight?: boolean };
+
+  // Karşı-olgusal birim fiyatın gösterimi. Metod 2/3/5'te enerji ÇIPLAK fiyatlanır ve
+  // YEKDEM ayrı bir fatura KALEMİdir → tek satırlık "Birim Fiyat" YEKDEM'in fiyata dahil
+  // olduğunu gizliyordu. Bu metodlarda iki bileşen + toplamı ayrı satırlarda gösterilir;
+  // TOPLAM, eskiden gösterilen tek satırla aynı büyüklüktür (tutarlarda değişiklik YOK).
+  // Metod 1/4'te YEKDEM zaten birim fiyata gömülü (alanlar undefined) → tek satır korunur.
+  const eBirim = result.gesOlmasaydiEnerjiBirim;
+  const yBirim = result.gesOlmasaydiYekBirim;
+  const gesSizFiyatRows = (label: string, fallback: number): DetayRow[] =>
+    eBirim != null && yBirim != null
+      ? [
+          { group: "fiyat", label: "Enerji Birim Fiyatı (GES'siz)", value: `${fmtUnit(eBirim)} TL/kWh` },
+          { group: "fiyat", label: "YEK Birim Fiyatı (GES'siz)", value: `${fmtUnit(yBirim)} TL/kWh` },
+          { group: "fiyat", label, value: `${fmtUnit(eBirim + yBirim)} TL/kWh` },
+        ]
+      : [{ group: "fiyat", label, value: `${fmtUnit(fallback)} TL/kWh` }];
+
   const detayRows: DetayRow[] = isReceiver
     ? [
         { group: "enerji", label: "Mevcut Tüketim (Çekiş)", value: `${fmtKwh(result.mevcutTuketimKwh)} kWh` },
         { group: "mahsup", label: "Tahsis Edilen Mahsup", value: `${fmtKwh(result.allocatedKwh ?? result.verisMahsupKwh)} kWh`, highlight: true },
-        { group: "fiyat", label: "Birim Fiyat", value: `${fmtUnit(result.mevcutBirimFiyat)} TL/kWh` },
+        ...gesSizFiyatRows("Birim Fiyat (GES'siz)", result.mevcutBirimFiyat),
       ]
     : noInstantUse
       ? [
           { group: "enerji", label: "Mevcut Tüketim (Çekiş)", value: `${fmtKwh(result.mevcutTuketimKwh)} kWh` },
           { group: "enerji", label: "GES Üretim (Şebekeye Verilen)", value: `${fmtKwh(result.gesUretimKwh)} kWh` },
           { group: "enerji", label: "Ham Tüketim (= Çekiş)", value: `${fmtKwh(result.hamTuketimKwh)} kWh`, highlight: true },
-          { group: "fiyat", label: "Birim Fiyat", value: `${fmtUnit(result.mevcutBirimFiyat)} TL/kWh` },
+          ...gesSizFiyatRows("Birim Fiyat (GES'siz)", result.mevcutBirimFiyat),
         ]
       : [
           { group: "enerji", label: "Mevcut Tüketim (Çekiş)", value: `${fmtKwh(result.mevcutTuketimKwh)} kWh` },
           { group: "enerji", label: "GES Üretim", value: `${fmtKwh(result.gesUretimKwh)} kWh` },
           { group: "enerji", label: "Ham Tüketim (GES'siz)", value: `${fmtKwh(result.hamTuketimKwh)} kWh`, highlight: true },
           { group: "fiyat", label: "Birim Fiyat (GES'li)", value: `${fmtUnit(result.mevcutBirimFiyat)} TL/kWh` },
-          { group: "fiyat", label: "Birim Fiyat (GES'siz)", value: `${fmtUnit(result.hamBirimFiyat)} TL/kWh` },
+          ...gesSizFiyatRows("Birim Fiyat (GES'siz)", result.hamBirimFiyat),
         ];
 
   // Panel'e özgü Mahsup & Satış grubu ek satırları (inline'ı ETKİLEMEZ).

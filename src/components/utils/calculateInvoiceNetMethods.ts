@@ -69,6 +69,10 @@ export type InvoiceMethodInputs = {
 
 export type MethodInvoiceInput = InvoiceInput & {
   methodInputs?: InvoiceMethodInputs;
+  /** Aşama 2L / Metod 6 (Kepsaş): önceki dönem YEKDEM mahsubunun ÇIPLAK (vergi
+   *  öncesi) tutarı, enerji birim fiyatına gömülür. Yalnız Metod 6 okur;
+   *  diğer metodlar YOK SAYAR. Yok/0 → Metod 1 ile bit-identik. */
+  embeddedYekdemAdderTL?: number | null;
 };
 
 /** Metod 2/3/5'e özgü OPSİYONEL kalemler. Metod 1 çıktısında bu anahtarlar hiç bulunmaz. */
@@ -86,6 +90,10 @@ export type MethodInvoiceBreakdown = InvoiceBreakdown & {
   mahsuplasmaUnitPriceApplied?: number;
   energyUnitPriceApplied?: number;
   wPosApplied?: number;
+  /** Metod 6 (Kepsaş): enerji birim fiyatına gömülen çıplak YEKDEM mahsup tutarı (TL). */
+  embeddedYekdemAdderTL?: number;
+  /** Metod 6: enerji satırında gösterilecek birim fiyat = energyCharge / brütKwh. */
+  energyUnitPriceShown?: number;
 };
 
 /**
@@ -112,6 +120,66 @@ export function calculateYekFarki(p: {
   const kbk = Number(p.kbk);
   if (!(base > 0) || !Number.isFinite(kbk)) return 0;
   return base * (Number(p.prevGerceklesenYekdem) - Number(p.prevTahminiYekdem)) * kbk;
+}
+
+/**
+ * Aşama 2L — Metod 6 (Kepsaş): önceki dönem YEKDEM mahsubunun ÇIPLAK tutarını
+ * (adderTL = fark × KBK × mahsupDönemiTüketim) metod-1 breakdown'ının ENERJİ
+ * satırına gömer. SAF: yalnız çıktıyı dönüştürür, calculateInvoice'a dokunmaz.
+ *
+ * Etki YALNIZ enerji + BTV matrahı + KDV'ye (kural 4); trafo, veriş mahsup,
+ * dağıtım, reaktif AYNEN kalır (kural 5 — sızma yok). Artımlı uygulanır (base
+ * değerlerin temsili bozulmasın):
+ *   ΔenergyCharge = adderTL
+ *   ΔbtvCharge    = adderTL × btvRate      (koşulsuz — calculateYekdemMahsup ile birebir)
+ *   Δsubtotal     = adderTL × (1 + btvRate)
+ *   Δvat          = Δsubtotal × vatRate
+ *   ΔtotalInvoice = Δsubtotal + Δvat = adderTL × (1+btv) × (1+vat)
+ *
+ * ⚠️ btvRate KOŞULSUZ uygulanır (btv override ile hariç tutulsa bile), çünkü
+ * metod 1'in post-total mahsubu (`calculateYekdemMahsup`) da btvRate'i koşulsuz
+ * uygular → m6 ödenecek == m1 totalWithMahsup EŞDEĞERLİĞİ garanti kalır.
+ * btvRate zaten efektif orandır (btv_enabled=false → 0 → adder'a BTV binmez).
+ *
+ * adderTL = 0 → çıktı base ile BİT-IDENTİK (yeni alanlar dışında).
+ */
+export function embedYekdemMahsupIntoEnergy(
+  base: MethodInvoiceBreakdown,
+  bareAdderTL: number,
+  btvRate: number,
+  vatRate: number,
+  brutKwh: number
+): MethodInvoiceBreakdown {
+  const adder = num(bareAdderTL);
+  const gross = num(brutKwh);
+
+  // adder yoksa: yalnız gösterim alanlarını doldur, sayılar base ile birebir.
+  if (!(adder !== 0)) {
+    return {
+      ...base,
+      embeddedYekdemAdderTL: 0,
+      energyUnitPriceShown: gross > 0 ? base.energyCharge / gross : 0,
+    };
+  }
+
+  const btv = num(btvRate);
+  const vat = num(vatRate);
+  const dEnergy = adder;
+  const dBtv = adder * btv;
+  const dSubtotal = dEnergy + dBtv;
+  const dVat = dSubtotal * vat;
+
+  const energyCharge = base.energyCharge + dEnergy;
+  return {
+    ...base,
+    energyCharge,
+    btvCharge: base.btvCharge + dBtv,
+    subtotalBeforeVat: base.subtotalBeforeVat + dSubtotal,
+    vatCharge: base.vatCharge + dVat,
+    totalInvoice: base.totalInvoice + dSubtotal + dVat,
+    embeddedYekdemAdderTL: adder,
+    energyUnitPriceShown: gross > 0 ? energyCharge / gross : 0,
+  };
 }
 
 /**

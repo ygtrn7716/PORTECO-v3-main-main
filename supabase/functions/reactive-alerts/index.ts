@@ -205,6 +205,17 @@ serve(async (req) => {
 
     if (subsErr || !subs?.length) continue;
 
+    // Tesis bazinda bildirim aciklik durumu — satir yoksa acik kabul edilir
+    const { data: alertSettings } = await supabase
+      .from("subscription_settings")
+      .select("subscription_serno, alerts_enabled")
+      .eq("user_id", userId);
+
+    const alertsBySerno = new Map<number, boolean>();
+    for (const r of (alertSettings ?? []) as any[]) {
+      alertsBySerno.set(Number(r.subscription_serno), r.alerts_enabled !== false);
+    }
+
     // RPC agregasyon
     const { data: mtdRows, error: mtdErr } = await supabase.rpc("reactive_mtd_totals", {
       p_user_id: userId,
@@ -229,6 +240,9 @@ serve(async (req) => {
       const active = Number(row?.active_kwh ?? 0);
       const ri = Number(row?.ri_kvarh ?? 0);
       const rc = Number(row?.rc_kvarh ?? 0);
+
+      // false ise: state izlenmeye devam eder, SMS/e-posta gonderilmez
+      const alertsEnabled = alertsBySerno.get(subNo) ?? true;
 
       if (!(active > 0)) continue;
 
@@ -264,10 +278,13 @@ serve(async (req) => {
             period_ym: periodYM,
             status: nextLevel,
             last_value_pct: valuePct,
-            last_sent_at: shouldSend ? new Date().toISOString() : undefined,
+            last_sent_at: shouldSend && alertsEnabled ? new Date().toISOString() : undefined,
           },
           { onConflict: "user_id,subscription_serno,kind,period_ym" }
         );
+
+        // Tesis bazinda bildirim kapali: state guncellendi, gonderim yok
+        if (!alertsEnabled) continue;
 
         if (!shouldSend || nextLevel === "ok") continue;
 

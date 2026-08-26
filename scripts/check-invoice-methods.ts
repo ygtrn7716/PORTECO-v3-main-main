@@ -10,13 +10,18 @@
 // import ile sorunsuz yüklenir (@/lib/supabase zincirine girmez).
 
 import type { InvoiceInput } from "../src/components/utils/calculateInvoice";
-import { calculateInvoice, isM1MahsupCapPeriod } from "../src/components/utils/calculateInvoice";
+import {
+  calculateInvoice,
+  calculateYekdemMahsup,
+  isM1MahsupCapPeriod,
+} from "../src/components/utils/calculateInvoice";
 import {
   calculateInvoiceMethod2,
   calculateInvoiceMethod3,
   calculateInvoiceMethod5,
   calculateYekFarki,
   resolveYekFarkiWithOverride,
+  embedYekdemMahsupIntoEnergy,
   type InvoiceMethodInputs,
   type MethodInvoiceInput,
   type MethodInvoiceBreakdown,
@@ -691,6 +696,86 @@ console.log("\n── 2K · Metod 1 Veriş Mahsup perakende tavanı ──");
     const sparse = !("verisMahsupCapUygulandi" in b!);
     if (!sparse) failures++;
     console.log(`  ${sparse ? "✅" : "❌"} (d) capUygulandi anahtarı eklenmedi (sparse)`);
+  }
+}
+
+// ── FIXTURE 11 (2L-R): Metod 6 (Kepsaş) — Metod 4 tabanı + gömülü YEKDEM ──────
+// Metod 6 TABANI = Metod 4 gibi (üretim etkileri sıfır → veriş mahsup yok, dağıtım
+// = D×(brüt+trafo)); önceki dönem YEKDEM mahsubu ÇIPLAK tutar olarak enerji birim
+// fiyatına gömülür. Dispatcher'ın yaptığı input dönüşümü burada birebir taklit edilir.
+console.log("\n── FIXTURE 11 (2L-R): Metod 6 (Kepsaş) — m4 tabanı + gömülü YEKDEM ──");
+{
+  const btvRate = 0.01;
+  const vatRate = 0.2;
+  // invoiceMethods.ts metod-6 dalının input dönüşümü (üretim etkilerini sıfırla).
+  const m6Base = (inp: InvoiceInput) =>
+    calculateInvoice({ ...inp, totalProductionKwh: 0, netPositiveDrawKwh: undefined, netExcessFeedKwh: undefined });
+
+  const prevKwh = 80000;
+  const kbk = 1.02;
+  const yekdemOld = 0.5;
+  const yekdemNew = 0.7;
+  const bareAdder = (yekdemNew - yekdemOld) * kbk * prevKwh; // 16 320
+  const m1Mahsup = calculateYekdemMahsup({ totalKwh: prevKwh, kbk, btvRate, vatRate, yekdemOld, yekdemNew });
+  assertClose("çıplak→vergi-dahil ilişki", bareAdder * (1 + btvRate) * (1 + vatRate), m1Mahsup, 0.001);
+
+  // ── T1: EŞDEĞERLİK (üretimsiz + trafosuz) — m6 ödenecek == m1 "YEKDEM Mahsubu Dahil" ──
+  {
+    const grossKwh = 100000;
+    const inp = baseInput({ totalConsumptionKwh: grossKwh, unitPriceEnergy: 2.5, trafoDegeri: 0, totalProductionKwh: 0, btvRate, vatRate });
+    const m1base = calculateInvoice(inp); // üretim yok → m4 tabanı ile çakışır
+    const base6 = m6Base(inp);
+    const emb = embedYekdemMahsupIntoEnergy(base6, bareAdder, btvRate, vatRate, grossKwh);
+    assertClose("(T1) m6 == m1 totalWithMahsup", emb.totalInvoice, m1base.totalInvoice + m1Mahsup, 0.01);
+    assertClose("(T1) enerji = m1 + çıplak", emb.energyCharge, base6.energyCharge + bareAdder, 0.01);
+    assertClose("(T1) gösterilen birim fiyat", emb.energyUnitPriceShown ?? -1, emb.energyCharge / grossKwh, 1e-9);
+  }
+
+  // ── T2: ÜRETİMLİ — veriş mahsup YOK; dağıtım = D×(brüt+trafo); bileşen çözümü ──
+  {
+    const grossKwh = 100000;
+    const trafo = 5000;
+    const D = 1.182457;
+    const inp = baseInput({ totalConsumptionKwh: grossKwh, unitPriceEnergy: 2.5, unitPriceDistribution: D, trafoDegeri: trafo, totalProductionKwh: 20000, btvRate, vatRate });
+    const m1base = calculateInvoice(inp);  // üretim KORUNUR (veriş mahsup + gn/2 kredisi)
+    const base6 = m6Base(inp);             // üretim SIFIR
+    assertClose("(T2) veriş mahsup bedeli = 0", base6.verisMahsupBedeli, 0, 1e-9);
+    assertClose("(T2) veriş mahsup kWh = 0", base6.verisMahsupKwh, 0, 1e-9);
+    assertClose("(T2) dağıtım = D×(brüt+trafo)", base6.distributionCharge, D * (grossKwh + trafo), 0.01);
+    assertClose("(T2) BTV = (enerji+trafo)×oran", base6.btvCharge, (2.5 * grossKwh + 2.5 * trafo) * btvRate, 0.01);
+    // Cebirsel: m6 KDV-hariç, m1'den (veriş kredisi + dağıtım gn/2 kredisi + BTV farkı) kadar FAZLA.
+    const verisKredi = m1base.verisMahsupBedeli;
+    const gn2Kredi = m1base.distributionAdjustment;
+    const btvFark = base6.btvCharge - m1base.btvCharge;
+    assertClose("(T2) bileşen çözümü", base6.subtotalBeforeVat - m1base.subtotalBeforeVat, verisKredi + gn2Kredi + btvFark, 0.01);
+    console.log(`     bileşenler: verişKredi=${money(verisKredi)} · gn2Kredi=${money(gn2Kredi)} · btvFark=${money(btvFark)}`);
+  }
+
+  // ── T3: M=0 → m6 == "m4 tabanı + trafo" (bit-identik) ──
+  {
+    const grossKwh = 100000;
+    const inp = baseInput({ totalConsumptionKwh: grossKwh, unitPriceEnergy: 2.5, trafoDegeri: 5000, totalProductionKwh: 20000, btvRate, vatRate });
+    const base6 = m6Base(inp);
+    const emb0 = embedYekdemMahsupIntoEnergy(base6, 0, btvRate, vatRate, grossKwh);
+    assertClose("(T3) M=0 → totalInvoice = m6 tabanı", emb0.totalInvoice, base6.totalInvoice, 1e-9);
+    assertClose("(T3) M=0 → enerji = m6 tabanı", emb0.energyCharge, base6.energyCharge, 1e-9);
+    const zeroAdder = (emb0.embeddedYekdemAdderTL ?? -1) === 0;
+    if (!zeroAdder) failures++;
+    console.log(`  ${zeroAdder ? "✅" : "❌"} (T3) M=0 → embeddedYekdemAdderTL = 0`);
+  }
+
+  // ── T4: NEGATİF M → birim fiyat DÜŞER, eşdeğerlik korunur ──
+  {
+    const grossKwh = 100000;
+    const inp = baseInput({ totalConsumptionKwh: grossKwh, unitPriceEnergy: 2.5, totalProductionKwh: 0, btvRate, vatRate });
+    const m1base = calculateInvoice(inp);
+    const base6 = m6Base(inp);
+    const m1MahsupNeg = calculateYekdemMahsup({ totalKwh: prevKwh, kbk, btvRate, vatRate, yekdemOld: yekdemNew, yekdemNew: yekdemOld });
+    const embNeg = embedYekdemMahsupIntoEnergy(base6, -bareAdder, btvRate, vatRate, grossKwh);
+    assertClose("(T4) negatif eşdeğerlik", embNeg.totalInvoice, m1base.totalInvoice + m1MahsupNeg, 0.01);
+    const dropped = (embNeg.energyUnitPriceShown ?? Infinity) < base6.energyCharge / grossKwh;
+    if (!dropped) failures++;
+    console.log(`  ${dropped ? "✅" : "❌"} (T4) negatif mahsupta birim fiyat düştü`);
   }
 }
 

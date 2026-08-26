@@ -7,6 +7,7 @@ import {
   calculateInvoiceMethod2,
   calculateInvoiceMethod3,
   calculateInvoiceMethod5,
+  embedYekdemMahsupIntoEnergy,
   type InvoiceMethodInputs,
   type MethodInvoiceBreakdown,
   type MethodInvoiceInput,
@@ -31,13 +32,27 @@ export type {
  * bkz. billedInvoiceInputs.ts başındaki not) → admin bağlamında doğrudan sorgu.
  */
 
-export type InvoiceMethodId = 1 | 2 | 3 | 4 | 5;
+export type InvoiceMethodId = 1 | 2 | 3 | 4 | 5 | 6;
 export const DEFAULT_INVOICE_METHOD: InvoiceMethodId = 1;
 
 /** Saatlik-net motorundan geçen metodlar (2=Uedaş, 3=Tredaş, 5=İpragaz).
- *  Metod 5, Metod 2 kopyasıdır; tek fark BTV matrahına YEK bedelinin girmesi. */
+ *  Metod 5, Metod 2 kopyasıdır; tek fark BTV matrahına YEK bedelinin girmesi.
+ *  ⚠️ Metod 6 (Kepsaş) NET DEĞİLDİR — metod-1 türevidir, buraya eklenmez. */
 export function isNetInvoiceMethod(id: InvoiceMethodId): boolean {
   return id === 2 || id === 3 || id === 5;
+}
+
+/** Post-total "Önceki Dönem YEKDEM Mahsubu" satırını BASTIRAN metodlar:
+ *  net metodlar (fark KDV matrahındaki kalem) + Metod 6 (fark enerji birim
+ *  fiyatına gömülü). Bu metodlarda caller'lar totalWithMahsup'a post-total
+ *  mahsup EKLEMEZ ve fatura satırını gizler (aksi halde çift sayım). */
+export function hidesPostTotalMahsup(id: InvoiceMethodId): boolean {
+  return isNetInvoiceMethod(id) || id === 6;
+}
+
+/** Metod 6 (Kepsaş): önceki dönem YEKDEM mahsubu enerji birim fiyatına gömülür. */
+export function isEmbeddedYekdemMethod(id: InvoiceMethodId): boolean {
+  return id === 6;
 }
 
 export type BillingIntegrationMethod = {
@@ -53,7 +68,7 @@ export type ResolveInvoiceMethodsParams =
   | { context: "admin"; userId: string; supabase: SupabaseClient };
 
 export function isInvoiceMethodId(v: unknown): v is InvoiceMethodId {
-  return v === 1 || v === 2 || v === 3 || v === 4 || v === 5;
+  return v === 1 || v === 2 || v === 3 || v === 4 || v === 5 || v === 6;
 }
 
 /** Snapshot/DB'den gelen metod değerini güvenle daraltır.
@@ -238,6 +253,27 @@ export function calculateInvoiceForMethod(
     return calculateInvoice(
       { ...input, totalProductionKwh: 0, netPositiveDrawKwh: undefined, netExcessFeedKwh: undefined },
       overrides
+    );
+  }
+
+  if (methodId === 6) {
+    // Metod 6 — Kepsaş (Aşama 2L-R). TABAN = Metod 4 gibi GES'siz düz fatura:
+    // üretim etkileri sıfırlanır → veriş mahsup satırı YOK ve faturaya etkisi yok,
+    // dağıtım = D×(brüt+trafo) (saatlik net gate/gn-2 kredisi yok). Enerji/trafo/
+    // reaktif/KDV metod-1 boru hattı. Sonra önceki dönem YEKDEM mahsubunun ÇIPLAK
+    // tutarı (input.embeddedYekdemAdderTL) enerji birim fiyatına gömülür → BTV
+    // matrahına (enerji+adder+trafo) ve KDV'ye doğal girer. calculateInvoice'a
+    // DOKUNULMAZ. Adder yoksa/0 → "metod 4 + trafo" davranışıyla bit-identik.
+    const b = calculateInvoice(
+      { ...input, totalProductionKwh: 0, netPositiveDrawKwh: undefined, netExcessFeedKwh: undefined },
+      overrides
+    );
+    return embedYekdemMahsupIntoEnergy(
+      b,
+      input.embeddedYekdemAdderTL ?? 0,
+      input.btvRate,
+      input.vatRate,
+      input.totalConsumptionKwh
     );
   }
 

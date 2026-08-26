@@ -33,6 +33,7 @@ import {
 import {
   calculateInvoiceForMethod,
   isNetInvoiceMethod,
+  isEmbeddedYekdemMethod,
   methodForProvider,
   resolveInvoiceMethods,
   type InvoiceMethodId,
@@ -41,13 +42,15 @@ import {
   assembleMethodInputs,
   computeHourlyNetAggregates,
 } from "@/components/utils/hourlyNetAggregates";
-import type {
-  InvoiceMethodInputs,
-  MethodInvoiceBreakdown,
+import {
+  embedYekdemMahsupIntoEnergy,
+  type InvoiceMethodInputs,
+  type MethodInvoiceBreakdown,
 } from "@/components/utils/calculateInvoiceNetMethods";
 import {
   applyReactiveValueOverrides,
   computeYekdemMahsupWithOverride,
+  computeYekdemMahsupDetailed,
   type InvoiceOverrides,
 } from "@/components/utils/invoiceOverrides";
 
@@ -693,10 +696,13 @@ export type BilledInvoiceResult = {
   riPercent: number;
   rcPercent: number;
   reactivePenaltyCharge: number;
-  /** Efektif YEKDEM mahsubu (override uygulanmış). */
+  /** Efektif YEKDEM mahsubu (override uygulanmış). Metod 6'da 0 (gömülü). */
   yekdemMahsup: number;
   hasYekdemMahsup: boolean;
   totalWithMahsup: number;
+  /** Metod 6 (Kepsaş): enerji birim fiyatına gömülen çıplak YEKDEM adder'ı
+   *  (snapshot rewrite damgası için). Diğer metodlarda 0. */
+  embeddedYekdemAdder: number;
 };
 
 /**
@@ -767,12 +773,36 @@ export function buildBreakdownFromInputs(
   // Lisanslı satış tesisinde mahsup hiç uygulanmaz — override diriltemez.
   // D4: Metod 2/3/5'te YEKDEM farkı zaten KDV matrahındaki bir KALEM (yekFarkiCharge)
   // olarak var → toplam-sonrası mahsup 0'a zorlanır (çift sayım önlenir).
+  // Metod 6 (Kepsaş): çıplak adder enerji satırına GÖMÜLÜR → post-total 0.
   const isNetMethod = isNetInvoiceMethod(inputs.invoiceMethodId);
+  const isEmbedded = isEmbeddedYekdemMethod(inputs.invoiceMethodId);
   const mahsupOv = overrides?.yekdem_mahsup;
-  let yekdemMahsup = isNetMethod ? 0 : inputs.yekdemMahsup;
-  let hasYekdemMahsup = isNetMethod ? false : inputs.hasYekdemMahsup;
+  let yekdemMahsup = isNetMethod || isEmbedded ? 0 : inputs.yekdemMahsup;
+  let hasYekdemMahsup = isNetMethod || isEmbedded ? false : inputs.hasYekdemMahsup;
+  let embeddedYekdemAdder = 0;
+  let finalBreakdown = breakdown;
 
-  if (!isNetMethod && mahsupOv && !inputs.lisansliSatis) {
+  if (isEmbedded && !inputs.lisansliSatis) {
+    // Metod 6: doğal veya override'lı mahsubun ÇIPLAK tutarını hesapla + göm.
+    const eff = computeYekdemMahsupDetailed({
+      naturalTotalKwh: inputs.mahsupNaturalTotalKwh,
+      naturalYekdemOld: inputs.mahsupNaturalYekdemValue,
+      naturalYekdemNew: inputs.mahsupNaturalYekdemFinal,
+      kbk: inputs.kbk,
+      btvRate: inputs.btvRate,
+      vatRate: inputs.vatRate,
+      override: mahsupOv,
+    });
+    embeddedYekdemAdder = eff.bare;
+    hasYekdemMahsup = eff.has;
+    finalBreakdown = embedYekdemMahsupIntoEnergy(
+      breakdown,
+      eff.bare,
+      inputs.btvRate,
+      inputs.vatRate,
+      inputs.totalConsumptionKwh
+    );
+  } else if (!isNetMethod && mahsupOv && !inputs.lisansliSatis) {
     const eff = computeYekdemMahsupWithOverride({
       naturalTotalKwh: inputs.mahsupNaturalTotalKwh,
       naturalYekdemOld: inputs.mahsupNaturalYekdemValue,
@@ -787,13 +817,14 @@ export function buildBreakdownFromInputs(
   }
 
   return {
-    breakdown,
+    breakdown: finalBreakdown,
     riPercent,
     rcPercent,
-    reactivePenaltyCharge: breakdown.reactivePenaltyCharge,
+    reactivePenaltyCharge: finalBreakdown.reactivePenaltyCharge,
     yekdemMahsup,
     hasYekdemMahsup,
+    embeddedYekdemAdder,
     totalWithMahsup:
-      breakdown.totalInvoice + yekdemMahsup + inputs.digerDegerler,
+      finalBreakdown.totalInvoice + yekdemMahsup + inputs.digerDegerler,
   };
 }

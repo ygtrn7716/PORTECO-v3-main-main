@@ -631,3 +631,73 @@ export function computeYekdemMahsupWithOverride(args: {
   if (!hasValue) return { mahsup: 0, has: false, missing: "value" };
   return { mahsup: 0, has: false, missing: "final" };
 }
+
+/**
+ * Aşama 2L — Metod 6 (Kepsaş) için `computeYekdemMahsupWithOverride`'ın
+ * genişletilmişi: aynı karar sırasını (forceZero → forceCompute → doğal) izler,
+ * ama hem ÇIPLAK (vergi öncesi) hem vergi-DAHİL mahsubu döner.
+ *   bare    = (yekdemNew − yekdemOld) × kbk × totalKwh      (= calculateYekdemMahsup ara değeri)
+ *   taxIncl = bare × (1 + btvRate) × (1 + vatRate)          (= calculateYekdemMahsup çıktısı)
+ * Böylece `taxIncl` mevcut metod-1 post-total mahsubuyla BİREBİR aynı sayıdır;
+ * `bare` ise Metod 6'nın enerji birim fiyatına gömdüğü tutardır. MANUEL KAZANIR
+ * override önceliği aynen korunur.
+ */
+export function computeYekdemMahsupDetailed(args: {
+  naturalTotalKwh: number;
+  naturalYekdemOld: number | null;
+  naturalYekdemNew: number | null;
+  kbk: number;
+  btvRate: number;
+  vatRate: number;
+  override?: InvoiceLineOverride | null;
+}): { bare: number; taxIncl: number; has: boolean; missing: YekdemMahsupMissing } {
+  const {
+    naturalTotalKwh,
+    naturalYekdemOld,
+    naturalYekdemNew,
+    kbk,
+    btvRate,
+    vatRate,
+    override,
+  } = args;
+
+  // Vergi çarpanları calculateYekdemMahsup ile AYNI sırada (soldan sağa) uygulanır.
+  const taxOf = (bare: number) => bare * (1 + btvRate) * (1 + vatRate);
+  const bareOf = (totalKwh: number, yekdemOld: number, yekdemNew: number): number => {
+    if (
+      !Number.isFinite(totalKwh) ||
+      !Number.isFinite(kbk) ||
+      !Number.isFinite(yekdemOld) ||
+      !Number.isFinite(yekdemNew)
+    ) {
+      return 0;
+    }
+    return (yekdemNew - yekdemOld) * kbk * totalKwh;
+  };
+
+  const resolved = resolveYekdemMahsupInputs({
+    naturalTotalKwh,
+    naturalYekdemOld,
+    naturalYekdemNew,
+    override,
+  });
+
+  if (resolved?.forceZero) {
+    return { bare: 0, taxIncl: 0, has: true, missing: "none" };
+  }
+  if (resolved?.forceCompute) {
+    const bare = bareOf(resolved.totalKwh, resolved.yekdemOld, resolved.yekdemNew);
+    return { bare, taxIncl: taxOf(bare), has: true, missing: "none" };
+  }
+
+  const hasValue = naturalYekdemOld != null;
+  const hasFinal = naturalYekdemNew != null;
+  if (!(naturalTotalKwh > 0)) return { bare: 0, taxIncl: 0, has: false, missing: "both" };
+  if (hasValue && hasFinal) {
+    const bare = bareOf(naturalTotalKwh, naturalYekdemOld, naturalYekdemNew);
+    return { bare, taxIncl: taxOf(bare), has: true, missing: "none" };
+  }
+  if (!hasValue && !hasFinal) return { bare: 0, taxIncl: 0, has: false, missing: "both" };
+  if (!hasValue) return { bare: 0, taxIncl: 0, has: false, missing: "value" };
+  return { bare: 0, taxIncl: 0, has: false, missing: "final" };
+}

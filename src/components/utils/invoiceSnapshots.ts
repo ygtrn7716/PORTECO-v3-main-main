@@ -133,6 +133,10 @@ export function buildSnapshotBreakdown(
       netPositiveDrawKwh: row.net_positive_draw_kwh != null ? Number(row.net_positive_draw_kwh) : undefined,
       netExcessFeedKwh: row.net_excess_feed_kwh != null ? Number(row.net_excess_feed_kwh) : undefined,
       methodInputs,
+      // Metod 6 (Kepsaş) replay: gömülen çıplak YEKDEM adder'ı saklı kolondan → dispatcher
+      // enerji satırına yeniden gömer. Diğer metodlarda null → 0 → etkisiz (bit-identik).
+      embeddedYekdemAdderTL:
+        row.embedded_yekdem_adder != null ? Number(row.embedded_yekdem_adder) : undefined,
       // Aşama 2K: mahsup tavanı kapısı — dönem saklı damgadan, Kayseri
       // invoice_from'dan ('kayseri_osb', 20260718_002; NOT NULL 20260718_003).
       // Dönem alanları select'te yoksa Number(undefined)=NaN → kapı kapalı,
@@ -162,7 +166,7 @@ export function recomputeSnapshotTotalWithMahsup(
 /** Tek noktadan import edilen "snapshot select" listesi — recompute yapacak
  * çağıran tarafların kullanması beklenir. */
 export const INVOICE_SNAPSHOT_RECOMPUTE_FIELDS =
-  "period_year, period_month, total_consumption_kwh, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, total_with_mahsup, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price";
+  "period_year, period_month, total_consumption_kwh, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, total_with_mahsup, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price, embedded_yekdem_adder";
 
 export type InvoiceType = "billed" | "backdated";
 
@@ -254,6 +258,10 @@ export type InvoiceSnapshotRow = {
   prev_yekdem_gerceklesen: number | null;
   mahsuplasma_unit_price: number | null;    // m3 muhtelif-2'de uygulanan efektif fiyat
 
+  // ── Aşama 2L: Metod 6 (Kepsaş) replay alanı. Enerji birim fiyatına gömülen
+  // çıplak (vergi öncesi) YEKDEM mahsup tutarı. Diğer metodlarda null.
+  embedded_yekdem_adder: number | null;
+
   // ── Backdated damgaları (20260806_002). Replay OKUMAZ; GES Olmasaydı kartı
   // snapshot-öncelikli okur. null = eski/billed satır → canlı fallback.
   monthly_yekdem: number | null;            // dönemin ÇIPLAK aylık YEKDEM'i (TL/kWh)
@@ -322,6 +330,8 @@ export async function upsertInvoiceSnapshot(params: {
   invoiceFrom: string | null;
   /** Metod 2/3 saatlik-net girdileri (replay için damgalanır). Metod 1'de verilmez → kolonlar null. */
   methodInputs?: InvoiceMethodInputs | null;
+  /** Metod 6 (Kepsaş): enerji birim fiyatına gömülen çıplak YEKDEM adder'ı (replay damgası). */
+  embeddedYekdemAdder?: number | null;
 
   // ── Backdated damgaları. monthly_* yalnız parametre VERİLDİĞİNDE payload'a
   // girer (billed writer'lar kolona dokunmaz); kbk/prev_* metod-1'de de damga
@@ -409,6 +419,9 @@ export async function upsertInvoiceSnapshot(params: {
     // Efektif (override uygulanmış) fiyat yazılır → replay idempotent kalır.
     mahsuplasma_unit_price: params.breakdown.mahsuplasmaUnitPriceApplied ?? null,
 
+    // Aşama 2L: Metod 6 (Kepsaş) gömülü çıplak YEKDEM adder'ı (diğer metodlarda null).
+    embedded_yekdem_adder: params.embeddedYekdemAdder ?? null,
+
     // Backdated damgaları: yalnız parametre verildiğinde alan payload'a girer —
     // billed writer'ların upsert'i mevcut kolon değerini KORUR (alan yok = dokunma).
     ...(params.monthlyYekdem !== undefined ? { monthly_yekdem: params.monthlyYekdem } : {}),
@@ -436,7 +449,7 @@ export async function listInvoiceSnapshots(params: {
   const base = supabase
     .from("invoice_snapshots")
     .select(
-      "user_id, subscription_serno, period_year, period_month, invoice_type, month_label, total_with_mahsup, total_invoice, total_consumption_kwh, updated_at, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price"
+      "user_id, subscription_serno, period_year, period_month, invoice_type, month_label, total_with_mahsup, total_invoice, total_consumption_kwh, updated_at, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price, embedded_yekdem_adder"
     )
     .eq("user_id", params.userId);
 
@@ -545,5 +558,7 @@ export function snapshotParamsFromEngine(args: {
     invoiceMethod: inputs.invoiceMethodId,
     invoiceFrom: inputs.invoiceFrom,
     methodInputs: inputs.methodInputs,
+    // Metod 6 (Kepsaş): gömülen çıplak YEKDEM adder'ı (diğer metodlarda 0).
+    embeddedYekdemAdder: result.embeddedYekdemAdder,
   };
 }

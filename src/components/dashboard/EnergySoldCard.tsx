@@ -389,6 +389,8 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
   // Satış kartı boş-durum metni — nedene göre (Metod 4'te "mahsup edildi" deme).
   const satisBosMesaj = !derived
     ? null
+    : derived.mahsup.kind === "info-only"
+    ? "Kepsaş faturalandırmasında veriş satışa/mahsuba yansımaz; veriş kWh'ı solda bilgi olarak gösterilir."
     : derived.mahsup.kind === "none" && derived.mahsup.reason === "method4"
     ? "Geçen ay üretim kaydı bulunamadı."
     : derived.mahsupKwh > 0
@@ -495,6 +497,21 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
                   <p className="mt-4 text-xs text-neutral-400">
                     Metot 2: mahsup faturada ayrı satır değil — enerji bedeli saatlik
                     mahsup sonrası net tüketim üzerinden hesaplanır.
+                  </p>
+                </>
+              ) : derived.mahsup.kind === "info-only" ? (
+                <>
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-neutral-600">Veriş (Bilgi)</span>
+                      <span className="text-sm font-medium text-neutral-700">
+                        {fmtKwh(derived.mahsup.kwh)} kWh
+                      </span>
+                    </div>
+                  </div>
+                  <p className="mt-4 text-xs text-neutral-400">
+                    Kepsaş faturalandırmasında veriş faturaya yansımaz (mahsup/kredi
+                    yok); yalnızca bilgi amaçlı gösterilir.
                   </p>
                 </>
               ) : derived.mahsup.kind === "muhtelif2" ? (

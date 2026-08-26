@@ -87,6 +87,10 @@ export default function AlternateTariffInvoiceSection(props: {
   /** Aşama 2K: ana faturayla aynı çözülmüş mahsup tavanı kapısı (InvoiceDetail
    *  hesaplar: dönem ≥ 2026-07 && !Kayseri). Perakende kaynağı mevcut prop. */
   applyVerisMahsupPerakendeCap?: boolean;
+  /** Metod 6 (Kepsaş): ana faturanın enerji fiyatına gömülen ÇIPLAK YEKDEM adder'ı.
+   *  Tarifeden bağımsız (fark×kbk×prevKwh) → alt simülasyonda da aynen gömülür
+   *  (alt tarifenin BTV/KDV oranıyla). Diğer metodlarda 0/null. */
+  embeddedYekdemAdderTL?: number | null;
 }) {
   const {
     uid,
@@ -114,6 +118,7 @@ export default function AlternateTariffInvoiceSection(props: {
     invoiceMethodId = DEFAULT_INVOICE_METHOD,
     methodInputs = null,
     applyVerisMahsupPerakendeCap,
+    embeddedYekdemAdderTL = 0,
   } = props;
 
   const [loading, setLoading] = useState(false);
@@ -295,6 +300,8 @@ export default function AlternateTariffInvoiceSection(props: {
           netExcessFeedKwh,
           methodInputs: methodInputs ?? undefined,
           applyVerisMahsupPerakendeCap, // 2K: ana faturayla aynı kapı
+          // Metod 6 (Kepsaş): çıplak adder alt tarifenin BTV/KDV oranıyla gömülür.
+          embeddedYekdemAdderTL: embeddedYekdemAdderTL ?? undefined,
         });
 
         if (cancel) return;
@@ -339,6 +346,7 @@ export default function AlternateTariffInvoiceSection(props: {
     invoiceMethodId,
     methodInputs,
     applyVerisMahsupPerakendeCap, // 2K
+    embeddedYekdemAdderTL, // 2L: metod 6 adder'ı değişirse alt breakdown yeniden gömülmeli
   ]);
 
   // 2H — Ana faturanın dış mahsup kalemleri karş-olgusala AYNEN taşınır (yeniden hesap YOK):
@@ -519,6 +527,13 @@ export default function AlternateTariffInvoiceSection(props: {
                       <>
                         {fmtUnit(altBreakdown.energyUnitPriceApplied ?? 0)} TL/kWh ×{" "}
                         {fmtKwh(altBreakdown.netEnergyKwh)} kWh
+                      </>
+                    ) : (altBreakdown.embeddedYekdemAdderTL ?? 0) !== 0 ? (
+                      // Metod 6 (Kepsaş): gömülü YEKDEM mahsuplu birim fiyat.
+                      <>
+                        {fmtUnit(altBreakdown.energyUnitPriceShown ?? unitPriceEnergy)} TL/kWh ×{" "}
+                        {fmtKwh(totalConsumptionKwh)} kWh
+                        <span className="text-neutral-400"> (YEKDEM mahsubu dahil)</span>
                       </>
                     ) : (
                       <>

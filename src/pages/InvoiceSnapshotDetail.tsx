@@ -151,6 +151,10 @@ const yekdemCell = useMemo(() => {
   // m5 (İpragaz): m2 kopyası, tek fark BTV matrahına YEK'in girmesi. Damgadan okunur;
   // w_pos'suz eski satır m1'e düştüyse (snapIsNetMethod=false) m1 metni gösterilir.
   const snapIsM5 = snapIsNetMethod && Number(row?.invoice_method) === 5;
+  // Metod 6 (Kepsaş): net değil; damgadan okunur. Replay'de liveBreakdown
+  // gömülü breakdown'dır (embeddedYekdemAdderTL + energyUnitPriceShown set).
+  const snapIsM6 = Number(row?.invoice_method) === 6;
+  const snapEmbeddedAdder = Number(liveBreakdown?.embeddedYekdemAdderTL ?? 0);
 
   // Efektif (override'lı) enerji birim fiyatı — kart + satır açıklamaları.
   const effUnitPriceEnergyDisplay = useMemo(() => {
@@ -328,6 +332,17 @@ const yekdemCell = useMemo(() => {
                             {fmtUnit(liveBreakdown?.energyUnitPriceApplied ?? 0)} TL/kWh ×{" "}
                             {fmtKwh(liveBreakdown?.netEnergyKwh ?? 0)} kWh
                           </>
+                        ) : snapIsM6 ? (
+                          // Metod 6 (Kepsaş): birim fiyat = (enerji + gömülü YEKDEM mahsubu) / brüt kWh.
+                          <>
+                            {fmtUnit(
+                              liveBreakdown?.energyUnitPriceShown ?? effUnitPriceEnergyDisplay
+                            )}{" "}
+                            TL/kWh × {fmtKwh(row.total_consumption_kwh)} kWh
+                            {snapEmbeddedAdder !== 0 && (
+                              <span className="text-neutral-400"> (YEKDEM mahsubu dahil)</span>
+                            )}
+                          </>
                         ) : (
                           <>
                             {fmtUnit(effUnitPriceEnergyDisplay)} TL/kWh × {fmtKwh(row.total_consumption_kwh)} kWh
@@ -480,12 +495,15 @@ const yekdemCell = useMemo(() => {
 
                   <tr className="border-b border-neutral-200">
                     <td className="py-2 pr-4 font-semibold">Genel Toplam (KDV Dahil)</td>
-                    <td className="py-2 pr-4 text-neutral-600">Bu dönem (mahsup hariç)</td>
+                    <td className="py-2 pr-4 text-neutral-600">
+                      {snapIsM6 ? "Bu dönem (YEKDEM mahsubu dahil)" : "Bu dönem (mahsup hariç)"}
+                    </td>
                     <td className="py-2 pr-4 text-right font-semibold">{fmtMoney2(liveBreakdown?.totalInvoice ?? row.total_invoice)} TL</td>
                   </tr>
 
-                  {/* Metod 2/3'te fark KDV matrahındaki kalem (yukarıda) — bu satır gizli (D4). */}
-                  {!snapIsNetMethod && (
+                  {/* Metod 2/3/5'te fark KDV matrahındaki kalem, Metod 6'da enerji birim
+                      fiyatına gömülü → post-total satır gizli. */}
+                  {!snapIsNetMethod && !snapIsM6 && (
                     <tr className="border-b border-neutral-200">
                       <td className="py-2 pr-4 font-semibold">Önceki Dönem YEKDEM Mahsubu</td>
                       <td className="py-2 pr-4 text-neutral-600">M-1 için (yekdem_final - yekdem_value)</td>
@@ -509,7 +527,9 @@ const yekdemCell = useMemo(() => {
 )}
 
                   <tr>
-                    <td className="py-3 pr-4 font-semibold text-neutral-900">Genel Toplam (YEKDEM Mahsubu Dahil)</td>
+                    <td className="py-3 pr-4 font-semibold text-neutral-900">
+                      {snapIsM6 ? "Genel Toplam (Ödenecek)" : "Genel Toplam (YEKDEM Mahsubu Dahil)"}
+                    </td>
                     <td className="py-3 pr-4 text-neutral-600">Ödenecek toplam</td>
                     <td className="py-3 pr-4 text-right text-lg font-semibold text-neutral-900">
                       {fmtMoney2(liveTotalWithMahsup)} TL

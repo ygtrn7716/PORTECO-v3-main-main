@@ -18,10 +18,16 @@
 // tedarikçi faturasının yapısıyla değil. Sayfaları açmak onları GERÇEK FATURA
 // YAPISINA HİZALAR.
 //
-// KAPSAM: kontroller yalnız saatlik-net metotlarını (2, 3) hedefler. Metod 1 ve
-// Metod 4 (GES'siz düz fatura) metod-1 motorundan geçer, w_pos/kbk/yekdem_tahmini
-// gibi saatlik-net kolonlarını STAMPLAMAZ → filtreler bilerek `IN (2,3)` kalır;
-// metod 4 bu sağlık kontrolleri açısından kapsam dışıdır (normal, eksik damga değil).
+// KAPSAM: kontroller yalnız saatlik-net metotlarını (2, 3) hedefler. Metod 1,
+// Metod 4 (GES'siz düz fatura) ve Metod 6 (Kepsaş) metod-1 motorundan geçer;
+// w_pos/kbk/yekdem_tahmini gibi saatlik-net kolonlarını STAMPLAMAZ → filtreler
+// bilerek `IN (2,3)` kalır; bu metotlar bu sağlık kontrolleri açısından kapsam
+// dışıdır (normal, eksik damga değil).
+//   • Metod 4: yalnız üretimi sıfırlar; ek replay kolonu damgalamaz.
+//   • Metod 6: enerji fiyatına gömülen çıplak YEKDEM adder'ını `embedded_yekdem_adder`
+//     kolonuna damgalar (mahsup yoksa 0/null → normal). Metod-1 türevi olduğundan
+//     `w_pos` DAİMA NULL olmalıdır (net değil); dolu ise anomali (aşağıda kontrol edilir).
+// Not: Metod 5 (İpragaz, net) şu an filtrelere dahil DEĞİL — önceden var olan boşluk.
 
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
@@ -122,6 +128,22 @@ async function main() {
       console.log(
         `      · serno ${r.subscription_serno} · ${donem(r)} · m${r.invoice_method} · eksik: ${eksik.join(", ")}`
       );
+    }
+    console.log("      → Onarım: bu tesislerin ilgili ay fatura sayfasını aç.\n");
+  }
+
+  // ── 2b) Metod 6 (Kepsaş) tutarlılığı ──────────────────────────────
+  // Metod 6 metod-1 türevidir → w_pos DAİMA NULL olmalı (net değil). Dolu ise
+  // metod yanlış yazılmış / firma yanlış eşlenmiş demektir.
+  const m6Anomali = snaps.filter((r) => r.invoice_method === 6 && r.w_pos != null);
+  console.log("②b Metod 6 tutarlılığı — invoice_method=6 AND w_pos IS NOT NULL");
+  if (m6Anomali.length === 0) {
+    console.log("   ✅ 0 satır (beklenen).\n");
+  } else {
+    problems += m6Anomali.length;
+    console.log(`   ❌ ${m6Anomali.length} satırda Metod 6 net kolon damgalı (anomali):`);
+    for (const r of m6Anomali) {
+      console.log(`      · serno ${r.subscription_serno} · ${donem(r)}`);
     }
     console.log("      → Onarım: bu tesislerin ilgili ay fatura sayfasını aç.\n");
   }

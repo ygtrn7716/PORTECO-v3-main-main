@@ -43,19 +43,23 @@ import {
 import {
   calculateInvoiceForMethod,
   isNetInvoiceMethod,
+  isEmbeddedYekdemMethod,
+  hidesPostTotalMahsup,
   methodForProvider,
   resolveInvoiceMethods,
   type InvoiceMethodId,
 } from "@/lib/invoiceMethods";
 import { assembleMethodInputs } from "@/components/utils/hourlyNetAggregates";
-import type {
-  InvoiceMethodInputs,
-  MethodInvoiceBreakdown,
+import {
+  embedYekdemMahsupIntoEnergy,
+  type InvoiceMethodInputs,
+  type MethodInvoiceBreakdown,
 } from "@/components/utils/calculateInvoiceNetMethods";
 import {
   fetchInvoiceOverrides,
   applyReactiveValueOverrides,
   computeYekdemMahsupWithOverride,
+  computeYekdemMahsupDetailed,
   resolveUnitPriceOverride,
 } from "@/components/utils/invoiceOverrides";
 
@@ -823,7 +827,10 @@ export default function InvoiceDetail() {
         }
 
         // 8) fatura hesabı (mahsup hariç)
-          const breakdown = calculateInvoiceForMethod(invoiceMethodId, {
+        // Metod 6 (Kepsaş): önce metod-1 breakdown'ı (adder henüz bilinmiyor →
+        // dispatcher embed(0) = base + gösterim alanları); mahsup çözülünce
+        // aşağıda gerçek çıplak adder ile YENİDEN gömülür (`let`).
+          let breakdown = calculateInvoiceForMethod(invoiceMethodId, {
             totalConsumptionKwh,
             unitPriceEnergy,
             unitPriceDistribution,
@@ -863,7 +870,13 @@ export default function InvoiceDetail() {
         // D4: Metod 2/3'te YEKDEM farkı zaten KDV matrahındaki bir KALEM
         // (yekFarkiCharge) → toplam-sonrası mahsup 0'a zorlanır (çift sayım önlenir).
         const isNetMethod = isNetInvoiceMethod(invoiceMethodId);
+        // Metod 6 (Kepsaş): mahsup HESAPLANIR (net değil) ama post-total satır
+        // yerine enerji birim fiyatına GÖMÜLÜR. Çıplak adder snapshot'a, vergi-dahil
+        // değer GES simetri paramına gider.
+        const isEmbeddedMethod = isEmbeddedYekdemMethod(invoiceMethodId);
         let yekdemMahsupValue = 0;
+        let embeddedYekdemAdderTL = 0;   // m6: gömülen çıplak tutar (snapshot damgası)
+        let embeddedYekdemTaxIncl = 0;   // m6: GES Kart-3 simetri paramı (vergi-dahil)
         let hasYekdemMahsup = false;
         let yekdemMissing: "none" | "value" | "final" | "both" =
           lisansliSatis || isNetMethod ? "none" : "both";
@@ -919,8 +932,7 @@ export default function InvoiceDetail() {
               year: prevForYekdem.year(),
               month: prevForYekdem.month() + 1,
             });
-
-            const eff = computeYekdemMahsupWithOverride({
+            const mahsupArgs = {
               naturalTotalKwh: prevPeriodKwh,
               naturalYekdemOld:
                 yRow?.yekdem_value != null ? Number(yRow.yekdem_value) : null,
@@ -930,11 +942,29 @@ export default function InvoiceDetail() {
               btvRate,
               vatRate,
               override: mahsupOv,
-            });
+            };
 
-            yekdemMahsupValue = eff.mahsup;
-            hasYekdemMahsup = eff.has;
-            yekdemMissing = eff.missing;
+            if (isEmbeddedMethod) {
+              // Metod 6: çıplak adder'ı enerji satırına göm; post-total EKLENMEZ.
+              const eff = computeYekdemMahsupDetailed(mahsupArgs);
+              embeddedYekdemAdderTL = eff.bare;
+              embeddedYekdemTaxIncl = eff.taxIncl;
+              hasYekdemMahsup = eff.has;
+              yekdemMissing = eff.missing;
+              breakdown = embedYekdemMahsupIntoEnergy(
+                breakdown,
+                eff.bare,
+                btvRate,
+                vatRate,
+                totalConsumptionKwh
+              );
+              // yekdemMahsupValue 0 kalır — mahsup gömülü totalInvoice'ta.
+            } else {
+              const eff = computeYekdemMahsupWithOverride(mahsupArgs);
+              yekdemMahsupValue = eff.mahsup;
+              hasYekdemMahsup = eff.has;
+              yekdemMissing = eff.missing;
+            }
           }
         } catch (e) {
           console.error("YEKDEM mahsup hesap hatası:", e);
@@ -942,6 +972,7 @@ export default function InvoiceDetail() {
           hasYekdemMahsup = false;
         }
 
+        // m6: adder gömülü totalInvoice'ta (yekdemMahsupValue=0 → çift sayım yok).
         const totalWithMahsup = breakdown.totalInvoice + yekdemMahsupValue + digerDegerler;
 
 
@@ -1044,6 +1075,9 @@ try {
     invoiceFrom,
     // Metod 2/3 replay alanları (metod 1'de null → kolonlar boş kalır).
     methodInputs,
+    // Metod 6 (Kepsaş) replay: enerji fiyatına gömülen çıplak YEKDEM adder'ı
+    // (diğer metodlarda 0/null → kolon boş).
+    embeddedYekdemAdder: embeddedYekdemAdderTL,
   });
 } catch (e) {
   console.error("upsertInvoiceSnapshot error:", e);
@@ -1149,8 +1183,11 @@ try {
             verisMahsupKwh: breakdown.verisMahsupKwh,
             satisKwh: breakdown.verisFazlaKwh,
             satisNetGelir: gesSatis?.satisNetGelir ?? 0,
-            // Kart 3 simetrisi: karşı-olgusal faturaya da eklenir.
-            yekdemMahsup: yekdemMahsupValue,
+            // Kart 3 simetrisi: karşı-olgusal faturaya da eklenir. Metod 6'da
+            // post-total mahsup 0 (gömülü) ama simetri için VERGİ-DAHİL değer
+            // geçilir (metod 1 ile birebir; mevcutBirimFiyat RAW kaldığından
+            // karşı-olgusal fiyata adder SIZMAZ → çift sayım yok).
+            yekdemMahsup: isEmbeddedMethod ? embeddedYekdemTaxIncl : yekdemMahsupValue,
             digerDegerler,
             allocatedKwh: allocatedGesKwh,
             monthlyYekdem,
@@ -1605,6 +1642,7 @@ const excludedItems = new Set<string>(
             invoiceMethodId={data.invoiceMethodId}
             methodInputs={data.methodInputs}
             applyVerisMahsupPerakendeCap={data.applyVerisMahsupPerakendeCap}
+            embeddedYekdemAdderTL={data.breakdown.embeddedYekdemAdderTL}
           />
           )}
 
@@ -1637,6 +1675,17 @@ const excludedItems = new Set<string>(
                           <>
                             {fmtUnit(data.breakdown.energyUnitPriceApplied ?? 0)} TL/kWh ×{" "}
                             {fmtKwh(data.breakdown.netEnergyKwh)} kWh
+                          </>
+                        ) : isEmbeddedYekdemMethod(data.invoiceMethodId) ? (
+                          // Metod 6 (Kepsaş): birim fiyat = (enerji + gömülü YEKDEM mahsubu) / brüt kWh.
+                          <>
+                            {fmtUnit(
+                              data.breakdown.energyUnitPriceShown ?? data.unitPriceEnergy
+                            )}{" "}
+                            TL/kWh × {fmtKwh(data.totalConsumptionKwh)} kWh
+                            {(data.breakdown.embeddedYekdemAdderTL ?? 0) !== 0 && (
+                              <span className="text-neutral-400"> (YEKDEM mahsubu dahil)</span>
+                            )}
                           </>
                         ) : (
                           <>
@@ -1855,8 +1904,9 @@ const excludedItems = new Set<string>(
                     </td>
                   </tr>
 
-                  {/* Metod 2/3'te fark KDV matrahındaki kalem (yukarıda) — bu satır gizli (D4). */}
-                  {!isNetInvoiceMethod(data.invoiceMethodId) && (
+                  {/* Metod 2/3/5'te fark KDV matrahındaki kalem, Metod 6'da enerji birim
+                      fiyatına gömülü → post-total satır gizli (çift sayım önlenir). */}
+                  {!hidesPostTotalMahsup(data.invoiceMethodId) && (
                   <tr className="border-b border-neutral-200">
                     <td className="py-2 pr-4 font-semibold">
                       Önceki Dönem YEKDEM Mahsubu
@@ -1904,7 +1954,7 @@ const excludedItems = new Set<string>(
                   
                   <tr>
                     <td className="py-3 pr-4 font-semibold text-neutral-900">
-                      {isNetInvoiceMethod(data.invoiceMethodId)
+                      {hidesPostTotalMahsup(data.invoiceMethodId)
                         ? "Genel Toplam (Ödenecek)"
                         : "Genel Toplam (YEKDEM Mahsubu Dahil)"}
                     </td>
