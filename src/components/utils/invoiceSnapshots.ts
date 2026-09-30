@@ -11,9 +11,10 @@ import {
   isNetInvoiceMethod,
   type InvoiceMethodId,
 } from "@/lib/invoiceMethods";
-import type {
-  InvoiceMethodInputs,
-  MethodInvoiceBreakdown,
+import {
+  isIpragazYekBirlesikPeriod,
+  type InvoiceMethodInputs,
+  type MethodInvoiceBreakdown,
 } from "@/components/utils/calculateInvoiceNetMethods";
 import {
   applyReactivePayloadToSnapshot,
@@ -49,9 +50,12 @@ type RecomputeRow = Partial<InvoiceSnapshotRow> & {
   diger_degerler?: number | null;
 };
 
-/** Metod 2/3/5 snapshot satırından saatlik-net girdilerini yeniden kurar.
+/** Metod 2/3/5/7 snapshot satırından saatlik-net girdilerini yeniden kurar.
  *  sumMahsup = sumCn − sumPos (min(cn,gn) kimliği). Metod 1/null → undefined.
- *  Kolonlar eksikse (teoride yok) 0'lı girdiler döner → motor 0 kalem üretir. */
+ *  Kolonlar eksikse (teoride yok) 0'lı girdiler döner → motor 0 kalem üretir.
+ *  Metod 7: C = total_consumption_kwh (ham Σcn) + trafo_kaybi_kwh; N = net_positive_draw_kwh
+ *  (m7 yazımında t'li); `meram` kolonlardan. Kolonlar SEÇİLMEMİŞSE (undefined) `meram`
+ *  kurulmaz → dispatcher uyarı + Metod 1 (sessiz 0'lama yok). */
 export function methodInputsFromSnapshotRow(
   row: RecomputeRow
 ): InvoiceMethodInputs | undefined {
@@ -63,7 +67,19 @@ export function methodInputsFromSnapshotRow(
   // (2B öncesi yazım) METOD 1 MOTORUYLA hesaplanmıştı. Replay de m1 ile yapılmalı
   // — yoksa wPos=0 ile enerji kalemi çöker. undefined → dispatcher m1'e düşer.
   if (row.w_pos == null) return undefined;
-  const sumCn = Number(row.total_consumption_kwh ?? 0);
+  const meram =
+    methodId === 7 && row.trafo_kaybi_kwh !== undefined && row.own_gn_kwh !== undefined
+      ? {
+          ownGnTotal: Number(row.own_gn_kwh ?? 0),
+          trafoKaybiSaatlik: Number(row.trafo_kaybi_saatlik ?? 0),
+          trafoKaybiKwh: Number(row.trafo_kaybi_kwh ?? 0),
+          unitPriceAdjustment: Number(row.unit_price_adjustment ?? 0),
+          yekdemIsFinal: row.yekdem_is_final === true,
+          gddk: row.yekdem_gddk != null ? Number(row.yekdem_gddk) : null,
+        }
+      : undefined;
+  const sumCn =
+    Number(row.total_consumption_kwh ?? 0) + (meram ? meram.trafoKaybiKwh : 0);
   const sumPos = Number(row.net_positive_draw_kwh ?? 0);
   return {
     sumCn,
@@ -81,6 +97,7 @@ export function methodInputsFromSnapshotRow(
       row.prev_yekdem_gerceklesen != null ? Number(row.prev_yekdem_gerceklesen) : null,
     mahsuplasmaUnitPrice:
       row.mahsuplasma_unit_price != null ? Number(row.mahsuplasma_unit_price) : null,
+    ...(meram ? { meram } : {}),
   };
 }
 
@@ -144,6 +161,11 @@ export function buildSnapshotBreakdown(
       applyVerisMahsupPerakendeCap:
         isM1MahsupCapPeriod(Number(row.period_year), Number(row.period_month)) &&
         row.invoice_from !== "kayseri_osb",
+      // İpragaz 2026-08+ replay: YEK bedeli enerji satırına gömülü. Dönem saklı
+      // damgadan; alan yoksa NaN → kapı kapalı (eski satır yapısı). Yalnız m5 okur.
+      ipragazYekBirlesik:
+        methodId === 5 &&
+        isIpragazYekBirlesikPeriod(Number(row.period_year), Number(row.period_month)),
     },
     overrides
   );
@@ -166,7 +188,7 @@ export function recomputeSnapshotTotalWithMahsup(
 /** Tek noktadan import edilen "snapshot select" listesi — recompute yapacak
  * çağıran tarafların kullanması beklenir. */
 export const INVOICE_SNAPSHOT_RECOMPUTE_FIELDS =
-  "period_year, period_month, total_consumption_kwh, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, total_with_mahsup, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price, embedded_yekdem_adder";
+  "period_year, period_month, total_consumption_kwh, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, total_with_mahsup, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price, embedded_yekdem_adder, unit_price_adjustment, trafo_kaybi_saatlik, trafo_kaybi_kwh, own_gn_kwh, yekdem_gddk, yekdem_is_final";
 
 export type InvoiceType = "billed" | "backdated";
 
@@ -266,9 +288,23 @@ export type InvoiceSnapshotRow = {
   // snapshot-öncelikli okur. null = eski/billed satır → canlı fallback.
   monthly_yekdem: number | null;            // dönemin ÇIPLAK aylık YEKDEM'i (TL/kWh)
   monthly_ptf: number | null;               // tüketim-ağırlıklı aylık PTF (TL/kWh, audit)
+
+  // ── Metod 7 (Meram) replay alanları (20260930_003). Diğer metodlarda null.
+  // U = (w_pos + yekdem_tahmini)×kbk + unit_price_adjustment ve F (w_mahsup, perakende)
+  // bu alanlardan TÜRETİLİR — saklanmaz.
+  trafo_kaybi_saatlik: number | null;       // t (kWh/saat)
+  trafo_kaybi_kwh: number | null;           // t × saat; C = total_consumption_kwh + bu
+  own_gn_kwh: number | null;                // G_own (tesisin kendi ham verişi) — dağıtım
+  yekdem_gddk: number | null;               // yazım anındaki efektif YEKDEM GDDK (TL)
+  yekdem_is_final: boolean | null;          // yekdem_tahmini = yekdem_final mı
 };
 
-export async function upsertInvoiceSnapshot(params: {
+/**
+ * Snapshot satırını (upsert payload'ı) SAF olarak kurar — yazım yapmaz.
+ * upsertInvoiceSnapshot'ın tek payload kaynağı; salt-okunur önizlemeler
+ * (scripts/compare-meram-m7.ts --snapshots) aynı satırı yazmadan gösterir.
+ */
+export function buildInvoiceSnapshotPayload(params: {
   userId: string;
   subscriptionSerno: number;
   periodYear: number;
@@ -426,7 +462,33 @@ export async function upsertInvoiceSnapshot(params: {
     // billed writer'ların upsert'i mevcut kolon değerini KORUR (alan yok = dokunma).
     ...(params.monthlyYekdem !== undefined ? { monthly_yekdem: params.monthlyYekdem } : {}),
     ...(params.monthlyPtf !== undefined ? { monthly_ptf: params.monthlyPtf } : {}),
+
+    // Metod 7 (Meram): breakdown GERÇEKTEN m7 motorundan geldiyse (lisanslı → m1
+    // yönlendirmesinde gelmez) net agregalar t'li girdilerden damgalanır — caller'ın
+    // ham satır toplamları trafo kaybını içermez. Replay: C = total + trafo_kaybi_kwh.
+    // Yeni kolonlar asla null yazılmaz. Diğer metodlarda anahtarlar payload'a GİRMEZ.
+    ...(params.breakdown.meram && params.methodInputs?.meram
+      ? {
+          net_positive_draw_kwh: params.methodInputs.sumPos,
+          net_excess_feed_kwh: params.methodInputs.sumExcess,
+          total_production_kwh: params.methodInputs.sumGn,
+          unit_price_adjustment: params.methodInputs.meram.unitPriceAdjustment,
+          trafo_kaybi_saatlik: params.methodInputs.meram.trafoKaybiSaatlik,
+          trafo_kaybi_kwh: params.methodInputs.meram.trafoKaybiKwh,
+          own_gn_kwh: params.methodInputs.meram.ownGnTotal,
+          yekdem_gddk: params.breakdown.meram.gddk,
+          yekdem_is_final: params.methodInputs.meram.yekdemIsFinal,
+        }
+      : {}),
   };
+
+  return payload;
+}
+
+export type UpsertInvoiceSnapshotParams = Parameters<typeof buildInvoiceSnapshotPayload>[0];
+
+export async function upsertInvoiceSnapshot(params: UpsertInvoiceSnapshotParams) {
+  const payload = buildInvoiceSnapshotPayload(params);
 
   const { error } = await supabase
     .from("invoice_snapshots")
@@ -449,7 +511,7 @@ export async function listInvoiceSnapshots(params: {
   const base = supabase
     .from("invoice_snapshots")
     .select(
-      "user_id, subscription_serno, period_year, period_month, invoice_type, month_label, total_with_mahsup, total_invoice, total_consumption_kwh, updated_at, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price, embedded_yekdem_adder"
+      "user_id, subscription_serno, period_year, period_month, invoice_type, month_label, total_with_mahsup, total_invoice, total_consumption_kwh, updated_at, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price, embedded_yekdem_adder, unit_price_adjustment, trafo_kaybi_saatlik, trafo_kaybi_kwh, own_gn_kwh, yekdem_gddk, yekdem_is_final"
     )
     .eq("user_id", params.userId);
 

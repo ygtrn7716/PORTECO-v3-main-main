@@ -28,8 +28,17 @@ import {
   type InvoiceMethodId,
   type MethodInvoiceBreakdown,
 } from "@/lib/invoiceMethods";
-import type { InvoiceMethodInputs } from "@/components/utils/calculateInvoiceNetMethods";
+import {
+  isIpragazYekBirlesikPeriod,
+  type InvoiceMethodInputs,
+} from "@/components/utils/calculateInvoiceNetMethods";
 import { computeHourlyNetAggregates } from "@/components/utils/hourlyNetAggregates";
+import {
+  addTrafoKaybiToRows,
+  hourGridKeys,
+  normalizeTrafoKaybi,
+  trafoGridCapIso,
+} from "@/components/utils/trafoKaybi";
 
 const PAGE = 1000;
 
@@ -120,8 +129,47 @@ export interface GesOlmasaydiParams {
   invoiceMethodId?: InvoiceMethodId;
   /** MEVCUT (GES'li) faturanın metod 2/3 girdileri. Karşı-olgusalda yalnız önceki
    *  dönem YEKDEM alanları taşınır (önceki dönem her iki dünyada da aynı gerçek);
-   *  cari agregalar ham seriden yeniden kurulur. */
+   *  cari agregalar ham seriden yeniden kurulur.
+   *  Metod 7 (Meram): `meram` bloğu da taşınır — Y (tahminiYekdem), trafo kaybı t,
+   *  adj ve GDDK iki dünyada AYNI (GES'ten bağımsız); yalnız G_own = 0 (GES yok →
+   *  kendi veriş yok → dağıtım D×C tam) ve mahsup 0. */
   methodInputs?: InvoiceMethodInputs | null;
+}
+
+/**
+ * Metod 7 karşı-olgusu için ORTAK kurulum: mevcut girdide `meram` yoksa null
+ * (diğer metodlar → davranış birebir). t > 0 ise ham satırlara dönemin her saatinde
+ * t eklenir (trafoKaybi.ts; cari dönemde son veri saatine kadar) → wPos t-ağırlıklı.
+ */
+function meramCounterfactualRows<R extends { ts?: string | number | Date; cn?: unknown; gn?: unknown }>(
+  prev: InvoiceMethodInputs | null | undefined,
+  rows: readonly R[],
+  startIso: string,
+  endIso: string,
+): { rows: Array<R | { ts: string; cn: number; gn: number }>; trafoKwh: number } | null {
+  if (!prev?.meram) return null;
+  const t = normalizeTrafoKaybi(prev.meram.trafoKaybiSaatlik);
+  if (!(t > 0)) return { rows: rows.slice(), trafoKwh: 0 };
+  let lastMs = -Infinity;
+  for (const r of rows) {
+    const ms = r.ts != null ? new Date(r.ts).getTime() : NaN;
+    if (ms > lastMs) lastMs = ms;
+  }
+  const capIso = trafoGridCapIso({
+    startIso,
+    endIso,
+    lastTs: Number.isFinite(lastMs) ? lastMs : null,
+    nowMs: Date.now(),
+  });
+  return addTrafoKaybiToRows(rows, t, hourGridKeys(startIso, endIso, { capIso }));
+}
+
+/** Metod 7 karşı-olgu `meram` bloğu: G_own = 0, trafo kWh karşı-olgu satırlarından. */
+function meramCounterfactualBlock(
+  prev: InvoiceMethodInputs,
+  trafoKwh: number,
+): NonNullable<InvoiceMethodInputs["meram"]> {
+  return { ...prev.meram!, ownGnTotal: 0, trafoKaybiKwh: trafoKwh };
 }
 
 /** Tasarruf formülü TEK yerde: tüm modlar bu montajdan geçer. */
@@ -159,8 +207,16 @@ function assembleResult(args: {
   // çıktıdan okunur (override dahil) — yeni aritmetik veya ikinci bir fiyat yolu YOK.
   // Metod 1/4 çıktısında energyUnitPriceApplied anahtarı hiç bulunmaz → ikisi de
   // undefined kalır ve UI bugünkü tek satırı korur.
+  // m5 birleşik (İpragaz 2026-08+): YEK zaten enerji satırına gömülü → ayrışım
+  // anlamsız; her ikisi undefined kalır ve UI tek "Birim Fiyat (GES'siz)" satırına
+  // (hamBirimFiyat = (PTF+YEKDEM)×KBK, YEK dahil) düşer — Metod 1/4 ile aynı görünüm.
   const mb = breakdown as MethodInvoiceBreakdown;
-  const splitOk = mb.energyUnitPriceApplied != null && mb.netEnergyKwh > 0;
+  // m7 (Meram): YEKDEM zaten enerji birim fiyatında (U) → ayrışım yok, tek satır.
+  const splitOk =
+    mb.energyUnitPriceApplied != null &&
+    mb.netEnergyKwh > 0 &&
+    !mb.yekEnerjiyeGomulu &&
+    !mb.meram;
   const gesOlmasaydiEnerjiBirim = splitOk ? mb.energyUnitPriceApplied : undefined;
   const gesOlmasaydiYekBirim = splitOk
     ? (mb.yekTahminiCharge ?? 0) / mb.netEnergyKwh
@@ -226,8 +282,11 @@ async function buildNoGesCounterfactualMi(p: {
     fetchAllPtf({ supabase: p.supabase, columns: "ts, ptf_tl_mwh", startIso, endIso }),
   ]);
   if (cnRes.error || ptfRes.error) return null;
-  const rows = (cnRes.data ?? []) as Array<{ ts: string; cn: unknown }>;
-  if (rows.length === 0) return null;
+  const rawRows = (cnRes.data ?? []) as Array<{ ts: string; cn: unknown }>;
+  if (rawRows.length === 0) return null;
+  // Metod 7: trafo kaybı t karşı-olguda da tüketimin içinde (GES'ten bağımsız).
+  const meramRows = meramCounterfactualRows(p.prev, rawRows, startIso, endIso);
+  const rows = meramRows ? meramRows.rows : rawRows;
 
   // hourlyNetAggregates.ts ile AYNI anahtarlama (UTC saat başı).
   const ptfMap = new Map<string, number>();
@@ -248,13 +307,17 @@ async function buildNoGesCounterfactualMi(p: {
     sumExcess: 0,
     wPos: agg.wPos,
     kbk: p.kbk,
-    tahminiYekdem: p.monthlyYekdem,
+    // m7: Y (final varsa final) mevcut girdiden; diğer metodlarda aylık tahmini.
+    tahminiYekdem: meramRows && p.prev ? p.prev.tahminiYekdem : p.monthlyYekdem,
     // Önceki dönem her iki dünyada da AYNI gerçek → mevcut girdilerden taşınır
     // (üretici dalındaki kuralın aynısı).
     prevSumPos: p.prev?.prevSumPos ?? null,
     prevTahminiYekdem: p.prev?.prevTahminiYekdem ?? null,
     prevGerceklesenYekdem: p.prev?.prevGerceklesenYekdem ?? null,
     mahsuplasmaUnitPrice: null,
+    ...(meramRows && p.prev
+      ? { meram: meramCounterfactualBlock(p.prev, meramRows.trafoKwh) }
+      : {}),
   };
 }
 
@@ -382,6 +445,9 @@ export async function calculateGesOlmasaydi(
 ): Promise<GesOlmasaydiResult | null> {
   const { supabase, userId, subscriptionSerno, periodYear, periodMonth } = params;
   const methodId = params.invoiceMethodId ?? DEFAULT_INVOICE_METHOD;
+  // İpragaz 2026-08+ (m5): karşı-olgusal fatura da YEK'i enerji satırına gömer
+  // (ana faturayla aynı kapı; yalnız m5 okur, diğer metodlar yok sayar).
+  const ipragazYekBirlesik = methodId === 5 && isIpragazYekBirlesikPeriod(periodYear, periodMonth);
 
   // ── Receiver modu: Talep Birleştirme ile mahsup alan üretimsiz tesis ──────
   // Üretim/veriş yok → ham tüketim = çekiş; DB fetch gerekmez. "GES olmasaydı
@@ -421,6 +487,7 @@ export async function calculateGesOlmasaydi(
       totalProductionKwh: 0, // tahsis yok → veriş/mahsup yok
       // netPositiveDraw/netExcessFeed bilinçli geçilmiyor → aylık davranış (mahsup 0)
       methodInputs: cfMi ?? undefined,
+      ipragazYekBirlesik,
     });
 
     return assembleResult({
@@ -474,6 +541,7 @@ export async function calculateGesOlmasaydi(
       // (GES tüketim faturasını etkilemez). Metod 2/3'te bu, mevcut girdilerin
       // aynen kullanılması demektir — ek fetch YOK, Metod 1 yaklaşımından kesin daha doğru.
       methodInputs: params.methodInputs ?? undefined,
+      ipragazYekBirlesik,
     });
 
     return assembleResult({
@@ -548,6 +616,7 @@ export async function calculateGesOlmasaydi(
       totalProductionKwh: 0, // mahsup yok → dağıtım düzeltmesiz, tam BTV
       // netPositiveDraw/netExcessFeed bilinçli geçilmiyor → aylık davranış (mahsup 0)
       methodInputs: cfMi ?? undefined,
+      ipragazYekBirlesik,
     });
 
     return assembleResult({
@@ -599,6 +668,11 @@ export async function calculateGesOlmasaydi(
 
   if (gesRes.error || cnRes.error || ptfRes.error) return null;
 
+  // Metod 7: ham tüketime trafo kaybı t da girer (her saat, eksik satırlar dahil) —
+  // GES'ten bağımsız, iki dünyada aynı. Diğer metodlarda null → satırlar aynen.
+  const meramRows = meramCounterfactualRows(params.methodInputs, cnRes.data, startIso, endIso);
+  const cnRows = meramRows ? meramRows.rows : cnRes.data;
+
   let totalHamKwh = 0;
   let totalGesKwh = 0;
   let hamPtfTl = 0; // Σ(ham_kwh × ptf_TL_per_kWh)
@@ -618,7 +692,7 @@ export async function calculateGesOlmasaydi(
     }
 
     // Saat bazında ham tüketim hesapla + PTF ağırlıklı ortalama
-    for (const row of cnRes.data) {
+    for (const row of cnRows) {
       const key = hourKey(row.ts);
       const cn = Number(row.cn) || 0;
       const gn = Number(row.gn) || 0;
@@ -657,7 +731,7 @@ export async function calculateGesOlmasaydi(
 
     type DayAgg = { cn: number; gn: number; ptfSum: number; ptfCount: number };
     const dayMap = new Map<string, DayAgg>();
-    for (const row of cnRes.data) {
+    for (const row of cnRows) {
       const k = dayKeyTR(row.ts);
       const agg = dayMap.get(k) ?? { cn: 0, gn: 0, ptfSum: 0, ptfCount: 0 };
       agg.cn += Number(row.cn) || 0;
@@ -691,9 +765,11 @@ export async function calculateGesOlmasaydi(
   // 7) Ham tüketim-ağırlıklı ortalama PTF (TL/kWh)
   const hamWeightedPtf = hamPtfTl / totalHamKwh;
 
-  // 8) GES olmasaydı birim fiyat
+  // 8) GES olmasaydı birim fiyat. m7: Y = mevcut girdinin YEKDEM'i (final varsa final).
+  const cfYekdem =
+    meramRows && params.methodInputs ? params.methodInputs.tahminiYekdem : params.monthlyYekdem;
   const hamUnitPriceEnergy =
-    (hamWeightedPtf + params.monthlyYekdem) * params.kbk + (params.unitPriceAdjustment ?? 0);
+    (hamWeightedPtf + cfYekdem) * params.kbk + (params.unitPriceAdjustment ?? 0);
 
   // 8b) Metod 2/3 karşı-olgusal girdiler: GES yok → gn=0 ⇒ pos=cn=ham,
   // mahsup/excess=0, wPos = ham-ağırlıklı ÇIPLAK PTF (zaten hesaplandı).
@@ -708,11 +784,14 @@ export async function calculateGesOlmasaydi(
           sumExcess: 0,
           wPos: hamWeightedPtf,
           kbk: params.kbk,
-          tahminiYekdem: params.monthlyYekdem,
+          tahminiYekdem: cfYekdem,
           prevSumPos: params.methodInputs?.prevSumPos ?? null,
           prevTahminiYekdem: params.methodInputs?.prevTahminiYekdem ?? null,
           prevGerceklesenYekdem: params.methodInputs?.prevGerceklesenYekdem ?? null,
           mahsuplasmaUnitPrice: null, // mahsup 0 → muhtelif-2 zaten 0
+          ...(meramRows && params.methodInputs
+            ? { meram: meramCounterfactualBlock(params.methodInputs, meramRows.trafoKwh) }
+            : {}),
         }
       : undefined;
 
@@ -733,6 +812,7 @@ export async function calculateGesOlmasaydi(
     totalProductionKwh: 0, // GES yok → veriş yok
     // on_yil ve perakende irrelevant — veriş 0
     methodInputs: counterfactualMi,
+    ipragazYekBirlesik,
   });
 
   return assembleResult({

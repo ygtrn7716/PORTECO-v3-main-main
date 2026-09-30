@@ -25,6 +25,7 @@ export default function SubscriptionSettingsAdmin() {
           { key: "tarife", label: "tarife", type: "enum", options: ["sanayi", "ticarethane", "tarimsal"] },
           { key: "guc_bedel_limit", label: "guc_bedel_limit", type: "number" },
           { key: "unit_price_adjustment", label: "unit_price_adjustment", type: "number" },
+          { key: "trafo_kaybi_saatlik", label: "trafo_kaybi_saatlik (Meram, kWh/saat)", type: "number" },
           { key: "active", label: "active", type: "bool" },
           { key: "created_at", label: "created_at", type: "text", readOnly: true, hideInTable: true },
         ],

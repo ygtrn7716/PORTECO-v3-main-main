@@ -9,7 +9,18 @@
       "mcp__claude_ai_Supabase__execute_sql",
       "mcp__claude_ai_Supabase__apply_migration",
       "mcp__claude_ai_Supabase__list_projects",
-      "Bash(npx tsx *)"
+      "Bash(npx tsx *)",
+      "PowerShell(npx tsc --noEmit -p tsconfig.json)",
+      "PowerShell(git stash)",
+      "PowerShell(npx tsc --noEmit -p tsconfig.json 2>&1)",
+      "PowerShell(git stash pop)",
+      "PowerShell(npx vite build 2>&1)",
+      "PowerShell(npm run check:invoice-methods 2>&1)",
+      "PowerShell(npm run check:muhasebe 2>&1)",
+      "Bash(node -e ' *)",
+      "Bash(npx tsc *)",
+      "Bash(npx eslint *)",
+      "Bash(npm run *)"
     ]
   }
 }

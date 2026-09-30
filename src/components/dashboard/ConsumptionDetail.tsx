@@ -9,7 +9,13 @@ import { useSession } from "@/hooks/useSession";
 import { supabase } from "@/lib/supabase";
 import { dayjsTR } from "@/lib/dayjs";
 import { computeMonthInvoiceToDate } from "@/components/utils/calculateInvoiceToDate";
+import type { MethodInvoiceBreakdown } from "@/components/utils/calculateInvoiceNetMethods";
 import GesUretimSatisiCard from "@/components/dashboard/shared/GesUretimSatisiCard";
+import {
+  MERAM_BTV_TEXT,
+  MeramSatir2Row,
+  MeramYekdemBadge,
+} from "@/components/dashboard/shared/MeramInvoiceParts";
 import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
 
 import { ChevronDown } from "lucide-react";
@@ -178,6 +184,8 @@ export default function ConsumptionDetail() {
   const estimateExcludedItems = new Set<string>(
     invoiceToDate?.breakdown.appliedOverrides?.excludedItems ?? []
   );
+  // Metod 7 (Meram) tahmini: m7 motoru çıktısıysa kendi kalemleri (Satır 2, tahmini YEKDEM).
+  const estimateMeram = (invoiceToDate?.breakdown as MethodInvoiceBreakdown | undefined)?.meram;
   // ─────────────────────────────
   // 0) Tesis listesini yükle
   // ─────────────────────────────
@@ -638,10 +646,23 @@ useEffect(() => {
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Enerji Bedeli</td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {fmtUnit6(invoiceToDate.unitPriceEnergy)} TL/kWh ×{" "}
-                        <span className="font-medium text-amber-600">
-                          {fmtKwh(invoiceToDate.projectedConsumptionKwh)} kWh
-                        </span>
+                        {estimateMeram ? (
+                          // Metod 7 (Meram): U = (wPos + tahmini YEKDEM) × KBK, taban N (trafo dahil net).
+                          <>
+                            {fmtUnit6((invoiceToDate.breakdown as MethodInvoiceBreakdown).energyUnitPriceApplied ?? 0)} TL/kWh ×{" "}
+                            <span className="font-medium text-amber-600">
+                              {fmtKwh(invoiceToDate.breakdown.netEnergyKwh)} kWh
+                            </span>
+                            <MeramYekdemBadge meram={estimateMeram} />
+                          </>
+                        ) : (
+                          <>
+                            {fmtUnit6(invoiceToDate.unitPriceEnergy)} TL/kWh ×{" "}
+                            <span className="font-medium text-amber-600">
+                              {fmtKwh(invoiceToDate.projectedConsumptionKwh)} kWh
+                            </span>
+                          </>
+                        )}
                       </td>
                       <td className="py-2 pr-4 text-right">
                         {fmtMoney2(invoiceToDate.breakdown.energyCharge)}
@@ -649,7 +670,10 @@ useEffect(() => {
                     </tr>
                   )}
 
-                  {invoiceToDate.trafoDegeri > 0 && !estimateExcludedItems.has("trafo") && (
+                  {/* Metod 7 (Meram): YEKDEM Mahsup + GDDK + Mahsuplaşma Farkı */}
+                  {estimateMeram && <MeramSatir2Row meram={estimateMeram} />}
+
+                  {invoiceToDate.trafoDegeri > 0 && !estimateMeram && !estimateExcludedItems.has("trafo") && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Trafo Kaybı</td>
                       <td className="py-2 pr-4 text-neutral-600">
@@ -685,8 +709,12 @@ useEffect(() => {
                         BTV (%{(invoiceToDate.btvRate * 100).toFixed(2)})
                       </td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {invoiceToDate.invoiceMethodId === 5
-                          ? "(Enerji bedeli + YEK bedeli) × BTV oranı"
+                        {estimateMeram
+                          ? MERAM_BTV_TEXT
+                          : invoiceToDate.invoiceMethodId === 5
+                          ? (invoiceToDate.breakdown as MethodInvoiceBreakdown).yekEnerjiyeGomulu
+                            ? "Enerji bedeli (YEK dahil) × BTV oranı"
+                            : "(Enerji bedeli + YEK bedeli) × BTV oranı"
                           : "Enerji bedeli × BTV oranı"}
                       </td>
                       <td className="py-2 pr-4 text-right">
@@ -758,6 +786,8 @@ useEffect(() => {
                     </td>
                   </tr>
 
+                  {/* Metod 7 (Meram): sonraki ay YEKDEM mahsubu yok → satır gizli. */}
+                  {!estimateMeram && (
                   <tr className="border-b border-neutral-200">
                     <td className="py-2 pr-4 font-semibold">Önceki Dönem YEKDEM Mahsubu</td>
                     <td className="py-2 pr-4 text-neutral-600">
@@ -784,6 +814,7 @@ useEffect(() => {
                           )} TL`}
                     </td>
                   </tr>
+                  )}
 
                   {invoiceToDate.digerDegerler !== 0 && (
                     <tr className="border-b border-neutral-100">

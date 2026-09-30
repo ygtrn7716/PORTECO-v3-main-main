@@ -13,6 +13,12 @@ import type {
   InvoiceMethodInputs,
   MethodInvoiceBreakdown,
 } from "@/components/utils/calculateInvoiceNetMethods";
+import {
+  MERAM_BTV_TEXT,
+  MeramDagitimNote,
+  MeramSatir2Row,
+  MeramYekdemBadge,
+} from "@/components/dashboard/shared/MeramInvoiceParts";
 
 const fmtMoney2 = (n: number | null | undefined) =>
   n == null || !Number.isFinite(Number(n))
@@ -87,6 +93,9 @@ export default function AlternateTariffInvoiceSection(props: {
   /** Aşama 2K: ana faturayla aynı çözülmüş mahsup tavanı kapısı (InvoiceDetail
    *  hesaplar: dönem ≥ 2026-07 && !Kayseri). Perakende kaynağı mevcut prop. */
   applyVerisMahsupPerakendeCap?: boolean;
+  /** İpragaz 2026-08+ (m5): ana faturayla aynı çözülmüş birleşik-YEK kapısı
+   *  (InvoiceDetail hesaplar). Alt simülasyon da YEK'i enerji satırına gömer. */
+  ipragazYekBirlesik?: boolean;
   /** Metod 6 (Kepsaş): ana faturanın enerji fiyatına gömülen ÇIPLAK YEKDEM adder'ı.
    *  Tarifeden bağımsız (fark×kbk×prevKwh) → alt simülasyonda da aynen gömülür
    *  (alt tarifenin BTV/KDV oranıyla). Diğer metodlarda 0/null. */
@@ -118,6 +127,7 @@ export default function AlternateTariffInvoiceSection(props: {
     invoiceMethodId = DEFAULT_INVOICE_METHOD,
     methodInputs = null,
     applyVerisMahsupPerakendeCap,
+    ipragazYekBirlesik = false,
     embeddedYekdemAdderTL = 0,
   } = props;
 
@@ -300,6 +310,7 @@ export default function AlternateTariffInvoiceSection(props: {
           netExcessFeedKwh,
           methodInputs: methodInputs ?? undefined,
           applyVerisMahsupPerakendeCap, // 2K: ana faturayla aynı kapı
+          ipragazYekBirlesik, // İpragaz 2026-08+: ana faturayla aynı kapı (m5)
           // Metod 6 (Kepsaş): çıplak adder alt tarifenin BTV/KDV oranıyla gömülür.
           embeddedYekdemAdderTL: embeddedYekdemAdderTL ?? undefined,
         });
@@ -346,6 +357,7 @@ export default function AlternateTariffInvoiceSection(props: {
     invoiceMethodId,
     methodInputs,
     applyVerisMahsupPerakendeCap, // 2K
+    ipragazYekBirlesik, // İpragaz 2026-08+ (m5)
     embeddedYekdemAdderTL, // 2L: metod 6 adder'ı değişirse alt breakdown yeniden gömülmeli
   ]);
 
@@ -523,10 +535,18 @@ export default function AlternateTariffInvoiceSection(props: {
                   <td className="py-2 pr-4">Enerji Bedeli</td>
                   <td className="py-2 pr-4 text-neutral-600">
                     {/* Metod 2/3: taban NET pozitif çekiş, fiyat = wPos × KBK (T-0) */}
-                    {isNetInvoiceMethod(invoiceMethodId) ? (
+                    {altBreakdown.yekEnerjiyeGomulu ? (
+                      // m5 birleşik (İpragaz 2026-08+): fiyat = (PTF + YEKDEM) × KBK, YEK satırı yok.
+                      <>
+                        {fmtUnit(altBreakdown.energyUnitPriceShown ?? 0)} TL/kWh ×{" "}
+                        {fmtKwh(altBreakdown.netEnergyKwh)} kWh
+                        <span className="text-neutral-400"> (YEK dahil)</span>
+                      </>
+                    ) : isNetInvoiceMethod(invoiceMethodId) ? (
                       <>
                         {fmtUnit(altBreakdown.energyUnitPriceApplied ?? 0)} TL/kWh ×{" "}
                         {fmtKwh(altBreakdown.netEnergyKwh)} kWh
+                        {altBreakdown.meram && <MeramYekdemBadge meram={altBreakdown.meram} />}
                       </>
                     ) : (altBreakdown.embeddedYekdemAdderTL ?? 0) !== 0 ? (
                       // Metod 6 (Kepsaş): gömülü YEKDEM mahsuplu birim fiyat.
@@ -544,8 +564,11 @@ export default function AlternateTariffInvoiceSection(props: {
                   <td className="py-2 pr-4 text-right">{fmtMoney2(altBreakdown.energyCharge)}</td>
                 </tr>
 
-                {/* Metod 2: YEK Bedeli · Metod 3: Tahmini YEKDEM — taban NET (netEnergyKwh) */}
-                {(isNetInvoiceMethod(invoiceMethodId)) && (
+                {/* Metod 2: YEK Bedeli · Metod 3: Tahmini YEKDEM — taban NET (netEnergyKwh).
+                    m5 birleşik (İpragaz 2026-08+): YEK enerjiye gömülü → satır gizli. */}
+                {isNetInvoiceMethod(invoiceMethodId) &&
+                  !altBreakdown.yekEnerjiyeGomulu &&
+                  !altBreakdown.meram && (
                   <tr className="border-b border-neutral-100">
                     <td className="py-2 pr-4">
                       {invoiceMethodId === 3 ? "Tahmini YEKDEM" : "YEK Bedeli"}
@@ -575,7 +598,10 @@ export default function AlternateTariffInvoiceSection(props: {
                     </tr>
                   )}
 
-                {Number(trafoDegeri ?? 0) > 0 && (
+                {/* Metod 7 (Meram): YEKDEM Mahsup + GDDK + Mahsuplaşma Farkı */}
+                {altBreakdown.meram && <MeramSatir2Row meram={altBreakdown.meram} />}
+
+                {Number(trafoDegeri ?? 0) > 0 && !altBreakdown.meram && (
                   <tr className="border-b border-neutral-100">
                     <td className="py-2 pr-4">Trafo Kaybı</td>
                     <td className="py-2 pr-4 text-neutral-600">
@@ -597,6 +623,7 @@ export default function AlternateTariffInvoiceSection(props: {
                     {/* Efektif birim × mahsup bazı — tutarla uzlaşır (m1 saatlik-net gate dahil) */}
                     {fmtUnit(altBreakdown.effectiveDistributionUnitPrice)} TL/kWh ×{" "}
                     {fmtKwh(altBreakdown.distributionChargeKwh)} kWh
+                    {altBreakdown.meram && <MeramDagitimNote meram={altBreakdown.meram} />}
                   </td>
                   <td className="py-2 pr-4 text-right">{fmtMoney2(altBreakdown.distributionCharge)}</td>
                 </tr>
@@ -633,10 +660,14 @@ export default function AlternateTariffInvoiceSection(props: {
                 <tr className="border-b border-neutral-100">
                   <td className="py-2 pr-4">BTV</td>
                   <td className="py-2 pr-4 text-neutral-600">
-                    {invoiceMethodId === 3
+                    {altBreakdown.meram
+                      ? MERAM_BTV_TEXT
+                      : invoiceMethodId === 3
                       ? "(Enerji + Tahmini YEKDEM − mahsuplaşma kredisi) × BTV"
                       : invoiceMethodId === 5
-                        ? "(Enerji bedeli + YEK bedeli) × BTV"
+                        ? altBreakdown.yekEnerjiyeGomulu
+                          ? "Enerji bedeli (YEK dahil) × BTV"
+                          : "(Enerji bedeli + YEK bedeli) × BTV"
                         : "Enerji bedeli × BTV"}
                   </td>
                   <td className="py-2 pr-4 text-right">{fmtMoney2(altBreakdown.btvCharge)}</td>

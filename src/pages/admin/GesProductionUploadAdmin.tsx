@@ -29,6 +29,10 @@ type SubscriptionOpt = {
   title: string | null;
 };
 
+// Seçili tesisin mevcut günlük üretim geçmişi (salt okunur özet paneli)
+type DailyRow = { date: string; energy_kwh: number | string };
+type MonthAgg = { period: string; days: number; totalKwh: number };
+
 type ParsedRow = {
   ts: string;            // ISO timestamptz
   energy_kwh: number;    // >= 0
@@ -354,6 +358,25 @@ function parseNumberCell(raw: any): number | null {
 // Bu sınırı aşan değerler büyük olasılıkla format hatasıdır.
 const MAX_HOURLY_KWH = 99_999;
 
+// Özet panelinde kaç günlük kayıt çekilecek (PostgREST 1000 satır tavanının
+// altında — sayfalama gerekmiyor) ve kaç dönem listelenecek.
+const HISTORY_LIMIT = 400;
+const HISTORY_MONTHS = 12;
+
+/** "2026-08-31" → "31.08.2026". Date nesnesi kullanmaz (timezone kayması yok). */
+function fmtDateTr(isoDate: string): string {
+  const parts = String(isoDate).slice(0, 10).split("-");
+  return parts.length === 3 ? `${parts[2]}.${parts[1]}.${parts[0]}` : String(isoDate);
+}
+
+/** tr-TR, 2 ondalık. MWh'a çevirmez, yuvarlamaz. */
+function fmtKwh2(n: number): string {
+  return n.toLocaleString("tr-TR", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* Component                                                          */
 /* ------------------------------------------------------------------ */
@@ -390,6 +413,11 @@ export default function GesProductionUploadAdmin() {
   const [movePlantError, setMovePlantError] = useState<string | null>(null);
   const [movePlantSuccess, setMovePlantSuccess] = useState<string | null>(null);
   const [moveTargetSubscription, setMoveTargetSubscription] = useState<string>("");
+
+  // Seçili tesisin mevcut günlük üretim özeti (salt okunur)
+  const [historyRows, setHistoryRows] = useState<DailyRow[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -514,6 +542,40 @@ export default function GesProductionUploadAdmin() {
       mounted = false;
     };
   }, [selectedUser]);
+
+  /* ---------------- Mevcut üretim verisi (salt okunur) -------------- */
+  // Seçili tesis değiştiğinde günlük üretim geçmişini çeker. Sadece okuma —
+  // yükleme akışına dokunmaz. selectedUser değişince plants effect'i
+  // selectedPlant'i sıfırladığı için bu effect zincirleme tetiklenir.
+  useEffect(() => {
+    setHistoryRows([]);
+    setHistoryError(null);
+    if (!selectedPlant) return;
+
+    let mounted = true;
+    setHistoryLoading(true);
+    (async () => {
+      const { data, error } = await supabase
+        .from("ges_production_daily")
+        .select("date, energy_kwh")
+        .eq("ges_plant_id", selectedPlant)
+        .order("date", { ascending: false })
+        .limit(HISTORY_LIMIT);
+
+      if (!mounted) return;
+      if (error) {
+        console.error("[ges_production_daily history]", error.message);
+        setHistoryError(error.message);
+        setHistoryLoading(false);
+        return;
+      }
+      setHistoryRows((data ?? []) as DailyRow[]);
+      setHistoryLoading(false);
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [selectedPlant]);
 
   /* ---------------- Manuel tesis oluştur --------------------------- */
   async function handleCreateManualPlant() {
@@ -993,6 +1055,31 @@ export default function GesProductionUploadAdmin() {
     };
   }, [parsedRows]);
 
+  /* ---------------- Mevcut veri özeti (yıl-ay bazında) -------------- */
+  // date bir SQL `date` — "YYYY-MM-DD" string olarak döner. slice(0, 7) ile
+  // dönem çıkarıyoruz; new Date() kullanmıyoruz ki timezone kayması olmasın.
+  const monthlyHistory = useMemo<MonthAgg[]>(() => {
+    const map = new Map<string, { days: number; totalKwh: number }>();
+    for (const r of historyRows) {
+      const period = String(r.date).slice(0, 7);
+      const cur = map.get(period) ?? { days: 0, totalKwh: 0 };
+      cur.days += 1;
+      cur.totalKwh += Number(r.energy_kwh) || 0; // PostgREST numeric'i string döndürebilir
+      map.set(period, cur);
+    }
+    return Array.from(map.entries())
+      .map(([period, v]) => ({ period, ...v }))
+      .sort((a, b) => b.period.localeCompare(a.period)) // en yeni → en eski
+      .slice(0, HISTORY_MONTHS);
+  }, [historyRows]);
+
+  // limit(HISTORY_LIMIT) penceresi içindeki en eski / en yeni tarih
+  const historyRange = useMemo(() => {
+    if (historyRows.length === 0) return null;
+    const dates = historyRows.map((r) => String(r.date)).sort();
+    return { first: dates[0], last: dates[dates.length - 1] };
+  }, [historyRows]);
+
   /* ---------------- Upload ----------------------------------------- */
   async function handleUpload() {
     if (!selectedUser) {
@@ -1220,7 +1307,7 @@ export default function GesProductionUploadAdmin() {
   const showTail = parsedRows.length > 13;
 
   return (
-    <div className="p-4 md:p-6 space-y-5 max-w-5xl">
+    <div className="p-4 md:p-6 space-y-5 max-w-7xl">
       <div>
         <h1 className="text-lg font-semibold text-neutral-900">GES Üretim Yükleme</h1>
         <p className="mt-1 text-sm text-neutral-500">
@@ -1536,364 +1623,339 @@ export default function GesProductionUploadAdmin() {
         </div>
       )}
 
-      {/* 2) Format bilgisi */}
-      <div className="rounded-2xl border border-blue-100 bg-blue-50/60 p-4 text-sm">
-        <div className="flex items-start gap-2">
-          <Info size={18} className="text-blue-600 mt-0.5 shrink-0" />
-          <div className="space-y-1.5 text-neutral-700">
-            <div className="font-medium text-neutral-900">Beklenen sütunlar</div>
-            <div>
-              <span className="font-mono rounded bg-white px-1.5 py-0.5 border">
-                ts
-              </span>{" "}
-              veya{" "}
-              <span className="font-mono rounded bg-white px-1.5 py-0.5 border">
-                Tarih
-              </span>{" "}
-              — saat başına tek satır (örn. <em>26.04.2026 08:00</em>,{" "}
-              <em>2026-04-26 08:00</em> ya da Excel datetime)
-            </div>
-            <div>
-              <span className="font-mono rounded bg-white px-1.5 py-0.5 border">
-                energy_kwh
-              </span>{" "}
-              veya{" "}
-              <span className="font-mono rounded bg-white px-1.5 py-0.5 border">
-                Semmak Uretilen Enerji (kWh)
-              </span>{" "}
-              — o saatte üretilen enerji (kWh)
-            </div>
-            <div className="text-xs text-neutral-500">
-              Boş hücre veya 0 değerleri 0 olarak kaydedilir. Saat tekrarları
-              atlanır.
+      {/* Sol: yükleme akışı · Sağ: mevcut üretim verisi */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-5 items-start">
+        <div className="lg:col-span-2 space-y-5">
+          {/* 2) Format bilgisi */}
+          <div className="rounded-2xl border border-blue-100 bg-blue-50/60 p-4 text-sm">
+            <div className="flex items-start gap-2">
+              <Info size={18} className="text-blue-600 mt-0.5 shrink-0" />
+              <div className="space-y-1.5 text-neutral-700">
+                <div className="font-medium text-neutral-900">Beklenen sütunlar</div>
+                <div>
+                  <span className="font-mono rounded bg-white px-1.5 py-0.5 border">
+                    ts
+                  </span>{" "}
+                  veya{" "}
+                  <span className="font-mono rounded bg-white px-1.5 py-0.5 border">
+                    Tarih
+                  </span>{" "}
+                  — saat başına tek satır (örn. <em>26.04.2026 08:00</em>,{" "}
+                  <em>2026-04-26 08:00</em> ya da Excel datetime)
+                </div>
+                <div>
+                  <span className="font-mono rounded bg-white px-1.5 py-0.5 border">
+                    energy_kwh
+                  </span>{" "}
+                  veya{" "}
+                  <span className="font-mono rounded bg-white px-1.5 py-0.5 border">
+                    Semmak Uretilen Enerji (kWh)
+                  </span>{" "}
+                  — o saatte üretilen enerji (kWh)
+                </div>
+                <div className="text-xs text-neutral-500">
+                  Boş hücre veya 0 değerleri 0 olarak kaydedilir. Saat tekrarları
+                  atlanır.
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-      </div>
 
-      {/* 3) File input + drag-drop */}
-      <div
-        onDragOver={handleDragOver}
-        onDragEnter={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
-        className={`rounded-2xl border-2 border-dashed bg-white p-6 shadow-sm transition ${
-          isDragging
-            ? "border-emerald-500 bg-emerald-50/50 ring-2 ring-emerald-300"
-            : "border-neutral-300 hover:border-neutral-400"
-        }`}
-      >
-        <div className="flex flex-col items-center justify-center gap-3 text-center">
+          {/* 3) File input + drag-drop */}
           <div
-            className={`grid h-12 w-12 place-items-center rounded-full transition ${
-              isDragging ? "bg-emerald-100 text-emerald-600" : "bg-neutral-100 text-neutral-500"
+            onDragOver={handleDragOver}
+            onDragEnter={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            className={`rounded-2xl border-2 border-dashed bg-white p-6 shadow-sm transition ${
+              isDragging
+                ? "border-emerald-500 bg-emerald-50/50 ring-2 ring-emerald-300"
+                : "border-neutral-300 hover:border-neutral-400"
             }`}
           >
-            <Upload size={20} />
-          </div>
-
-          {isDragging ? (
-            <div className="text-sm font-medium text-emerald-700">
-              Dosyayı bırakın
-            </div>
-          ) : (
-            <>
-              <div className="text-sm text-neutral-700">
-                <span className="font-medium">Dosyayı sürükleyip bırakın</span>{" "}
-                veya
-              </div>
-              <label
-                htmlFor="ges-upload-file"
-                className="inline-flex items-center gap-2 rounded-lg bg-neutral-900 px-3 py-2 text-sm font-medium text-white hover:bg-neutral-800 cursor-pointer"
+            <div className="flex flex-col items-center justify-center gap-3 text-center">
+              <div
+                className={`grid h-12 w-12 place-items-center rounded-full transition ${
+                  isDragging ? "bg-emerald-100 text-emerald-600" : "bg-neutral-100 text-neutral-500"
+                }`}
               >
-                <Upload size={14} />
-                Dosya seç (.xlsx / .csv)
-              </label>
-              <div className="text-xs text-neutral-400">
-                Desteklenen: .csv, .xlsx, .xls
+                <Upload size={20} />
               </div>
-            </>
-          )}
 
-          <input
-            ref={fileInputRef}
-            id="ges-upload-file"
-            type="file"
-            accept=".xlsx,.xls,.csv"
-            onChange={handleFileChange}
-            className="hidden"
-          />
-
-          {fileName && !isDragging && (
-            <div className="mt-1 inline-flex items-center gap-2 rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1 text-sm text-neutral-700">
-              <FileSpreadsheet size={14} className="text-neutral-500" />
-              <span className="truncate max-w-[260px]">{fileName}</span>
-              <button
-                type="button"
-                onClick={resetFile}
-                className="text-neutral-400 hover:text-neutral-700"
-                aria-label="Temizle"
-              >
-                <X size={14} />
-              </button>
-            </div>
-          )}
-          {parsing && (
-            <div className="text-xs text-neutral-500 inline-flex items-center gap-1">
-              <Loader2 size={14} className="animate-spin" /> Okunuyor...
-            </div>
-          )}
-        </div>
-
-        {parseError && (
-          <div className="mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700 flex items-start gap-2">
-            <AlertTriangle size={16} className="shrink-0 mt-0.5" />
-            <div>{parseError}</div>
-          </div>
-        )}
-
-        {parseWarnings.length > 0 && (
-          <details className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
-            <summary className="cursor-pointer font-medium">
-              {parseWarnings.length} uyarı (görmek için tıklayın)
-            </summary>
-            <ul className="mt-2 list-disc pl-5 space-y-0.5 text-xs">
-              {parseWarnings.slice(0, 50).map((w, i) => (
-                <li key={i}>{w}</li>
-              ))}
-              {parseWarnings.length > 50 && (
-                <li className="italic">
-                  …ve {parseWarnings.length - 50} adet daha
-                </li>
+              {isDragging ? (
+                <div className="text-sm font-medium text-emerald-700">
+                  Dosyayı bırakın
+                </div>
+              ) : (
+                <>
+                  <div className="text-sm text-neutral-700">
+                    <span className="font-medium">Dosyayı sürükleyip bırakın</span>{" "}
+                    veya
+                  </div>
+                  <label
+                    htmlFor="ges-upload-file"
+                    className="inline-flex items-center gap-2 rounded-lg bg-neutral-900 px-3 py-2 text-sm font-medium text-white hover:bg-neutral-800 cursor-pointer"
+                  >
+                    <Upload size={14} />
+                    Dosya seç (.xlsx / .csv)
+                  </label>
+                  <div className="text-xs text-neutral-400">
+                    Desteklenen: .csv, .xlsx, .xls
+                  </div>
+                </>
               )}
-            </ul>
-          </details>
-        )}
-      </div>
 
-      {/* 3b) Şüpheli satırlar paneli */}
-      {suspectRows.length > 0 && (
-        <div className="rounded-2xl border border-amber-300 bg-amber-50/60 p-4 shadow-sm">
-          <div className="flex items-start gap-2 mb-3">
-            <AlertTriangle size={18} className="text-amber-600 mt-0.5 shrink-0" />
-            <div>
-              <div className="text-sm font-semibold text-neutral-900">
-                {suspectRows.length} şüpheli değer tespit edildi
-              </div>
-              <div className="text-xs text-neutral-600 mt-1">
-                Bu satırlar diğerlerinden 10x+ büyük ve birden fazla nokta içeriyor (format
-                hatası belirtisi). Her birinin nasıl ele alınacağını seçin. Default:{" "}
-                <span className="font-medium">100'e böl</span> (Europower CSV'sinde sık
-                görülen bir formatlama hatası).
-              </div>
+              <input
+                ref={fileInputRef}
+                id="ges-upload-file"
+                type="file"
+                accept=".xlsx,.xls,.csv"
+                onChange={handleFileChange}
+                className="hidden"
+              />
+
+              {fileName && !isDragging && (
+                <div className="mt-1 inline-flex items-center gap-2 rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1 text-sm text-neutral-700">
+                  <FileSpreadsheet size={14} className="text-neutral-500" />
+                  <span className="truncate max-w-[260px]">{fileName}</span>
+                  <button
+                    type="button"
+                    onClick={resetFile}
+                    className="text-neutral-400 hover:text-neutral-700"
+                    aria-label="Temizle"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              )}
+              {parsing && (
+                <div className="text-xs text-neutral-500 inline-flex items-center gap-1">
+                  <Loader2 size={14} className="animate-spin" /> Okunuyor...
+                </div>
+              )}
             </div>
+
+            {parseError && (
+              <div className="mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700 flex items-start gap-2">
+                <AlertTriangle size={16} className="shrink-0 mt-0.5" />
+                <div>{parseError}</div>
+              </div>
+            )}
+
+            {parseWarnings.length > 0 && (
+              <details className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+                <summary className="cursor-pointer font-medium">
+                  {parseWarnings.length} uyarı (görmek için tıklayın)
+                </summary>
+                <ul className="mt-2 list-disc pl-5 space-y-0.5 text-xs">
+                  {parseWarnings.slice(0, 50).map((w, i) => (
+                    <li key={i}>{w}</li>
+                  ))}
+                  {parseWarnings.length > 50 && (
+                    <li className="italic">
+                      …ve {parseWarnings.length - 50} adet daha
+                    </li>
+                  )}
+                </ul>
+              </details>
+            )}
           </div>
 
-          <div className="overflow-x-auto rounded-lg border border-amber-200 bg-white">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-amber-200 bg-amber-50/80 text-left text-xs font-medium text-neutral-600 uppercase tracking-wider">
-                  <th className="px-3 py-2">Saat</th>
-                  <th className="px-3 py-2">CSV ham değer</th>
-                  <th className="px-3 py-2 text-right">Algoritma yorumu</th>
-                  <th className="px-3 py-2 text-right">100'e bölünmüş</th>
-                  <th className="px-3 py-2 text-center">Karar</th>
-                  <th className="px-3 py-2 text-right">Manuel değer</th>
-                </tr>
-              </thead>
-              <tbody>
-                {suspectRows.map((s) => (
-                  <tr key={s.index} className="border-b border-amber-100">
-                    <td className="px-3 py-2 font-mono text-xs">
-                      {s.ts.slice(0, 16).replace("T", " ")}
-                    </td>
-                    <td className="px-3 py-2 text-neutral-500 font-mono text-xs">
-                      {s.rawValue}
-                    </td>
-                    <td className="px-3 py-2 text-right text-neutral-700">
-                      {s.energy_kwh.toLocaleString("tr-TR", { maximumFractionDigits: 3 })}
-                    </td>
-                    <td className="px-3 py-2 text-right font-semibold text-emerald-700">
-                      {(s.energy_kwh / 100).toLocaleString("tr-TR", {
-                        maximumFractionDigits: 3,
-                      })}
-                    </td>
-                    <td className="px-3 py-2">
-                      <div className="flex items-center justify-center gap-1 flex-wrap">
-                        <button
-                          type="button"
-                          onClick={() => setSuspectAction(s.index, "divide100")}
-                          className={`px-2 py-1 text-[11px] rounded-md transition ${
-                            s.action === "divide100"
-                              ? "bg-emerald-600 text-white"
-                              : "bg-white border border-neutral-200 text-neutral-600 hover:bg-neutral-50"
-                          }`}
-                        >
-                          /100
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setSuspectAction(s.index, "asIs")}
-                          className={`px-2 py-1 text-[11px] rounded-md transition ${
-                            s.action === "asIs"
-                              ? "bg-blue-600 text-white"
-                              : "bg-white border border-neutral-200 text-neutral-600 hover:bg-neutral-50"
-                          }`}
-                        >
-                          olduğu gibi
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setSuspectAction(s.index, "skip")}
-                          className={`px-2 py-1 text-[11px] rounded-md transition ${
-                            s.action === "skip"
-                              ? "bg-neutral-700 text-white"
-                              : "bg-white border border-neutral-200 text-neutral-600 hover:bg-neutral-50"
-                          }`}
-                        >
-                          atla
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setSuspectAction(s.index, "manual")}
-                          className={`px-2 py-1 text-[11px] rounded-md transition ${
-                            s.action === "manual"
-                              ? "bg-amber-600 text-white"
-                              : "bg-white border border-neutral-200 text-neutral-600 hover:bg-neutral-50"
-                          }`}
-                        >
-                          manuel
-                        </button>
-                      </div>
-                    </td>
-                    <td className="px-3 py-2 text-right">
-                      <div className="flex items-center justify-end gap-1">
-                        <input
-                          type="number"
-                          step="0.001"
-                          value={s.manualValue}
-                          onChange={(e) =>
-                            setSuspectManualValue(s.index, e.target.value)
-                          }
-                          onFocus={() => setSuspectAction(s.index, "manual")}
-                          placeholder="örn. 620.8"
-                          className={`w-24 rounded-md border px-2 py-1 text-xs text-right transition ${
-                            s.action === "manual"
-                              ? "border-amber-400 bg-amber-50 text-neutral-900"
-                              : "border-neutral-200 bg-white text-neutral-500"
-                          }`}
-                        />
-                        <span className="text-[11px] text-neutral-400">kWh</span>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          {/* 3b) Şüpheli satırlar paneli */}
+          {suspectRows.length > 0 && (
+            <div className="rounded-2xl border border-amber-300 bg-amber-50/60 p-4 shadow-sm">
+              <div className="flex items-start gap-2 mb-3">
+                <AlertTriangle size={18} className="text-amber-600 mt-0.5 shrink-0" />
+                <div>
+                  <div className="text-sm font-semibold text-neutral-900">
+                    {suspectRows.length} şüpheli değer tespit edildi
+                  </div>
+                  <div className="text-xs text-neutral-600 mt-1">
+                    Bu satırlar diğerlerinden 10x+ büyük ve birden fazla nokta içeriyor (format
+                    hatası belirtisi). Her birinin nasıl ele alınacağını seçin. Default:{" "}
+                    <span className="font-medium">100'e böl</span> (Europower CSV'sinde sık
+                    görülen bir formatlama hatası).
+                  </div>
+                </div>
+              </div>
 
-          <div className="mt-3 flex items-center justify-end gap-2">
-            <button
-              type="button"
-              onClick={() =>
-                setSuspectRows((prev) =>
-                  prev.map((s) => ({ ...s, action: "divide100" })),
-                )
-              }
-              className="text-xs text-emerald-700 hover:text-emerald-800 underline"
-            >
-              Hepsi: 100'e böl
-            </button>
-            <span className="text-neutral-300">·</span>
-            <button
-              type="button"
-              onClick={() =>
-                setSuspectRows((prev) => prev.map((s) => ({ ...s, action: "skip" })))
-              }
-              className="text-xs text-neutral-600 hover:text-neutral-800 underline"
-            >
-              Hepsi: atla
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* 4) Preview */}
-      {parsedRows.length > 0 && (
-        <div className="rounded-2xl border border-neutral-200 bg-white shadow-sm overflow-hidden">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 p-4 border-b border-neutral-100 text-xs text-neutral-600">
-            <div>
-              <div className="text-neutral-400">Toplam saat</div>
-              <div className="font-semibold text-neutral-900 text-sm">
-                {parsedRows.length.toLocaleString("tr-TR")}
-              </div>
-            </div>
-            <div>
-              <div className="text-neutral-400">Etkilenen gün</div>
-              <div className="font-semibold text-neutral-900 text-sm">
-                {totals.daySet.size}
-              </div>
-            </div>
-            <div>
-              <div className="text-neutral-400">Toplam üretim</div>
-              <div className="font-semibold text-neutral-900 text-sm">
-                {totals.totalKwh.toLocaleString("tr-TR", {
-                  maximumFractionDigits: 2,
-                })}{" "}
-                kWh
-              </div>
-            </div>
-            <div>
-              <div className="text-neutral-400">Aralık</div>
-              <div className="font-semibold text-neutral-900 text-[12px]">
-                {totals.firstTs.slice(0, 16).replace("T", " ")} →{" "}
-                {totals.lastTs.slice(0, 16).replace("T", " ")}
-              </div>
-            </div>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-neutral-200 bg-neutral-50 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
-                  <th className="px-4 py-2">#</th>
-                  <th className="px-4 py-2">ts (UTC+3)</th>
-                  <th className="px-4 py-2">Orijinal değer</th>
-                  <th className="px-4 py-2 text-right">energy_kwh</th>
-                </tr>
-              </thead>
-              <tbody>
-                {previewRows.map((r, i) => (
-                  <tr key={i} className="border-b border-neutral-100">
-                    <td className="px-4 py-1.5 text-neutral-400">{i + 1}</td>
-                    <td className="px-4 py-1.5 font-mono text-xs">
-                      {r.ts.slice(0, 16).replace("T", " ")}
-                    </td>
-                    <td className="px-4 py-1.5 text-neutral-500 text-xs">
-                      {r.rawDate}
-                    </td>
-                    <td className="px-4 py-1.5 text-right">
-                      {r.energy_kwh.toLocaleString("tr-TR", {
-                        maximumFractionDigits: 3,
-                      })}
-                    </td>
-                  </tr>
-                ))}
-                {showTail && (
-                  <>
-                    <tr>
-                      <td
-                        className="px-4 py-2 text-center text-xs text-neutral-400 italic"
-                        colSpan={4}
-                      >
-                        … {parsedRows.length - 13} satır arada …
-                      </td>
+              <div className="overflow-x-auto rounded-lg border border-amber-200 bg-white">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-amber-200 bg-amber-50/80 text-left text-xs font-medium text-neutral-600 uppercase tracking-wider">
+                      <th className="px-3 py-2">Saat</th>
+                      <th className="px-3 py-2">CSV ham değer</th>
+                      <th className="px-3 py-2 text-right">Algoritma yorumu</th>
+                      <th className="px-3 py-2 text-right">100'e bölünmüş</th>
+                      <th className="px-3 py-2 text-center">Karar</th>
+                      <th className="px-3 py-2 text-right">Manuel değer</th>
                     </tr>
-                    {tailRows.map((r, i) => (
-                      <tr key={`tail-${i}`} className="border-b border-neutral-100">
-                        <td className="px-4 py-1.5 text-neutral-400">
-                          {parsedRows.length - tailRows.length + i + 1}
+                  </thead>
+                  <tbody>
+                    {suspectRows.map((s) => (
+                      <tr key={s.index} className="border-b border-amber-100">
+                        <td className="px-3 py-2 font-mono text-xs">
+                          {s.ts.slice(0, 16).replace("T", " ")}
                         </td>
+                        <td className="px-3 py-2 text-neutral-500 font-mono text-xs">
+                          {s.rawValue}
+                        </td>
+                        <td className="px-3 py-2 text-right text-neutral-700">
+                          {s.energy_kwh.toLocaleString("tr-TR", { maximumFractionDigits: 3 })}
+                        </td>
+                        <td className="px-3 py-2 text-right font-semibold text-emerald-700">
+                          {(s.energy_kwh / 100).toLocaleString("tr-TR", {
+                            maximumFractionDigits: 3,
+                          })}
+                        </td>
+                        <td className="px-3 py-2">
+                          <div className="flex items-center justify-center gap-1 flex-wrap">
+                            <button
+                              type="button"
+                              onClick={() => setSuspectAction(s.index, "divide100")}
+                              className={`px-2 py-1 text-[11px] rounded-md transition ${
+                                s.action === "divide100"
+                                  ? "bg-emerald-600 text-white"
+                                  : "bg-white border border-neutral-200 text-neutral-600 hover:bg-neutral-50"
+                              }`}
+                            >
+                              /100
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setSuspectAction(s.index, "asIs")}
+                              className={`px-2 py-1 text-[11px] rounded-md transition ${
+                                s.action === "asIs"
+                                  ? "bg-blue-600 text-white"
+                                  : "bg-white border border-neutral-200 text-neutral-600 hover:bg-neutral-50"
+                              }`}
+                            >
+                              olduğu gibi
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setSuspectAction(s.index, "skip")}
+                              className={`px-2 py-1 text-[11px] rounded-md transition ${
+                                s.action === "skip"
+                                  ? "bg-neutral-700 text-white"
+                                  : "bg-white border border-neutral-200 text-neutral-600 hover:bg-neutral-50"
+                              }`}
+                            >
+                              atla
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setSuspectAction(s.index, "manual")}
+                              className={`px-2 py-1 text-[11px] rounded-md transition ${
+                                s.action === "manual"
+                                  ? "bg-amber-600 text-white"
+                                  : "bg-white border border-neutral-200 text-neutral-600 hover:bg-neutral-50"
+                              }`}
+                            >
+                              manuel
+                            </button>
+                          </div>
+                        </td>
+                        <td className="px-3 py-2 text-right">
+                          <div className="flex items-center justify-end gap-1">
+                            <input
+                              type="number"
+                              step="0.001"
+                              value={s.manualValue}
+                              onChange={(e) =>
+                                setSuspectManualValue(s.index, e.target.value)
+                              }
+                              onFocus={() => setSuspectAction(s.index, "manual")}
+                              placeholder="örn. 620.8"
+                              className={`w-24 rounded-md border px-2 py-1 text-xs text-right transition ${
+                                s.action === "manual"
+                                  ? "border-amber-400 bg-amber-50 text-neutral-900"
+                                  : "border-neutral-200 bg-white text-neutral-500"
+                              }`}
+                            />
+                            <span className="text-[11px] text-neutral-400">kWh</span>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="mt-3 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSuspectRows((prev) =>
+                      prev.map((s) => ({ ...s, action: "divide100" })),
+                    )
+                  }
+                  className="text-xs text-emerald-700 hover:text-emerald-800 underline"
+                >
+                  Hepsi: 100'e böl
+                </button>
+                <span className="text-neutral-300">·</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSuspectRows((prev) => prev.map((s) => ({ ...s, action: "skip" })))
+                  }
+                  className="text-xs text-neutral-600 hover:text-neutral-800 underline"
+                >
+                  Hepsi: atla
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* 4) Preview */}
+          {parsedRows.length > 0 && (
+            <div className="rounded-2xl border border-neutral-200 bg-white shadow-sm overflow-hidden">
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 p-4 border-b border-neutral-100 text-xs text-neutral-600">
+                <div>
+                  <div className="text-neutral-400">Toplam saat</div>
+                  <div className="font-semibold text-neutral-900 text-sm">
+                    {parsedRows.length.toLocaleString("tr-TR")}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-neutral-400">Etkilenen gün</div>
+                  <div className="font-semibold text-neutral-900 text-sm">
+                    {totals.daySet.size}
+                  </div>
+                </div>
+                <div>
+                  <div className="text-neutral-400">Toplam üretim</div>
+                  <div className="font-semibold text-neutral-900 text-sm">
+                    {totals.totalKwh.toLocaleString("tr-TR", {
+                      maximumFractionDigits: 2,
+                    })}{" "}
+                    kWh
+                  </div>
+                </div>
+                <div>
+                  <div className="text-neutral-400">Aralık</div>
+                  <div className="font-semibold text-neutral-900 text-[12px]">
+                    {totals.firstTs.slice(0, 16).replace("T", " ")} →{" "}
+                    {totals.lastTs.slice(0, 16).replace("T", " ")}
+                  </div>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-neutral-200 bg-neutral-50 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
+                      <th className="px-4 py-2">#</th>
+                      <th className="px-4 py-2">ts (UTC+3)</th>
+                      <th className="px-4 py-2">Orijinal değer</th>
+                      <th className="px-4 py-2 text-right">energy_kwh</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {previewRows.map((r, i) => (
+                      <tr key={i} className="border-b border-neutral-100">
+                        <td className="px-4 py-1.5 text-neutral-400">{i + 1}</td>
                         <td className="px-4 py-1.5 font-mono text-xs">
                           {r.ts.slice(0, 16).replace("T", " ")}
                         </td>
@@ -1907,74 +1969,180 @@ export default function GesProductionUploadAdmin() {
                         </td>
                       </tr>
                     ))}
-                  </>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {/* 5) Upload button */}
-      {parsedRows.length > 0 && (
-        <div className="flex items-center justify-end gap-3">
-          {uploadError && (
-            <div className="text-sm text-red-700 inline-flex items-center gap-1.5">
-              <AlertTriangle size={14} /> {uploadError}
+                    {showTail && (
+                      <>
+                        <tr>
+                          <td
+                            className="px-4 py-2 text-center text-xs text-neutral-400 italic"
+                            colSpan={4}
+                          >
+                            … {parsedRows.length - 13} satır arada …
+                          </td>
+                        </tr>
+                        {tailRows.map((r, i) => (
+                          <tr key={`tail-${i}`} className="border-b border-neutral-100">
+                            <td className="px-4 py-1.5 text-neutral-400">
+                              {parsedRows.length - tailRows.length + i + 1}
+                            </td>
+                            <td className="px-4 py-1.5 font-mono text-xs">
+                              {r.ts.slice(0, 16).replace("T", " ")}
+                            </td>
+                            <td className="px-4 py-1.5 text-neutral-500 text-xs">
+                              {r.rawDate}
+                            </td>
+                            <td className="px-4 py-1.5 text-right">
+                              {r.energy_kwh.toLocaleString("tr-TR", {
+                                maximumFractionDigits: 3,
+                              })}
+                            </td>
+                          </tr>
+                        ))}
+                      </>
+                    )}
+                  </tbody>
+                </table>
+              </div>
             </div>
           )}
-          <button
-            type="button"
-            onClick={handleUpload}
-            disabled={
-              uploading || !selectedUser || !selectedPlant || parsedRows.length === 0
-            }
-            className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
-          >
-            {uploading ? (
-              <>
-                <Loader2 size={16} className="animate-spin" />
-                Yükleniyor...
-              </>
-            ) : (
-              <>
-                <Upload size={16} />
-                Supabase'e Yükle
-              </>
-            )}
-          </button>
-        </div>
-      )}
 
-      {/* 6) Result */}
-      {uploadStats && (
-        <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm">
-          <div className="flex items-start gap-2">
-            <CheckCircle2 size={18} className="text-emerald-600 mt-0.5 shrink-0" />
-            <div className="space-y-1.5 text-neutral-800">
-              <div className="font-medium text-emerald-900">Yükleme tamamlandı</div>
-              <div>
-                Toplam satır: <strong>{uploadStats.totalRows}</strong> · Eklendi:{" "}
-                <strong>{uploadStats.inserted}</strong> · Atlandı (zaten vardı):{" "}
-                <strong>{uploadStats.skippedExisting}</strong> · Geçersiz:{" "}
-                <strong>{uploadStats.invalidRows}</strong>
-                {uploadStats.suspectsHandled > 0 && (
+          {/* 5) Upload button */}
+          {parsedRows.length > 0 && (
+            <div className="flex items-center justify-end gap-3">
+              {uploadError && (
+                <div className="text-sm text-red-700 inline-flex items-center gap-1.5">
+                  <AlertTriangle size={14} /> {uploadError}
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={handleUpload}
+                disabled={
+                  uploading || !selectedUser || !selectedPlant || parsedRows.length === 0
+                }
+                className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+              >
+                {uploading ? (
                   <>
-                    {" "}· Şüpheli işlendi:{" "}
-                    <strong>{uploadStats.suspectsHandled}</strong>
+                    <Loader2 size={16} className="animate-spin" />
+                    Yükleniyor...
+                  </>
+                ) : (
+                  <>
+                    <Upload size={16} />
+                    Supabase'e Yükle
                   </>
                 )}
-              </div>
-              <div className="text-xs text-emerald-800">
-                {uploadStats.affectedDays} günün toplamı{" "}
-                <span className="font-mono">ges_production_daily</span> tablosunda
-                güncellendi. GES sayfası artık bu kullanıcı için saatlik & günlük
-                veriyi görüntüleyebilir.
+              </button>
+            </div>
+          )}
+
+          {/* 6) Result */}
+          {uploadStats && (
+            <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm">
+              <div className="flex items-start gap-2">
+                <CheckCircle2 size={18} className="text-emerald-600 mt-0.5 shrink-0" />
+                <div className="space-y-1.5 text-neutral-800">
+                  <div className="font-medium text-emerald-900">Yükleme tamamlandı</div>
+                  <div>
+                    Toplam satır: <strong>{uploadStats.totalRows}</strong> · Eklendi:{" "}
+                    <strong>{uploadStats.inserted}</strong> · Atlandı (zaten vardı):{" "}
+                    <strong>{uploadStats.skippedExisting}</strong> · Geçersiz:{" "}
+                    <strong>{uploadStats.invalidRows}</strong>
+                    {uploadStats.suspectsHandled > 0 && (
+                      <>
+                        {" "}· Şüpheli işlendi:{" "}
+                        <strong>{uploadStats.suspectsHandled}</strong>
+                      </>
+                    )}
+                  </div>
+                  <div className="text-xs text-emerald-800">
+                    {uploadStats.affectedDays} günün toplamı{" "}
+                    <span className="font-mono">ges_production_daily</span> tablosunda
+                    güncellendi. GES sayfası artık bu kullanıcı için saatlik & günlük
+                    veriyi görüntüleyebilir.
+                  </div>
+                </div>
               </div>
             </div>
-          </div>
+          )}
         </div>
-      )}
+
+        {/* 7) Mevcut üretim verisi (salt okunur özet) */}
+        {selectedPlant && (
+          <div className="lg:col-span-1 lg:sticky lg:top-6">
+            <div className="rounded-2xl border border-neutral-200 bg-white shadow-sm overflow-hidden">
+              <div className="flex items-center gap-2 border-b border-neutral-100 px-4 py-3">
+                <div className="grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-[#00AEEF]/10">
+                  <FileSpreadsheet size={15} className="text-[#00AEEF]" />
+                </div>
+                <div className="text-sm font-medium text-neutral-900">
+                  Mevcut Üretim Verisi
+                </div>
+              </div>
+
+              {historyLoading ? (
+                <div className="flex items-center gap-2 px-4 py-6 text-sm text-neutral-500">
+                  <Loader2 size={14} className="animate-spin" />
+                  Yükleniyor...
+                </div>
+              ) : historyError ? (
+                <div className="p-4">
+                  <div className="rounded-lg border border-red-200 bg-red-50 p-2.5 text-sm text-red-700 flex items-start gap-2">
+                    <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+                    <div>{historyError}</div>
+                  </div>
+                </div>
+              ) : monthlyHistory.length === 0 ? (
+                <div className="px-4 py-6 text-sm text-neutral-500">
+                  Bu tesis için henüz üretim kaydı yok.
+                </div>
+              ) : (
+                <>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b border-neutral-200 bg-neutral-50 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
+                          <th className="px-4 py-2">Dönem</th>
+                          <th className="px-4 py-2 text-right">Gün</th>
+                          <th className="px-4 py-2 text-right">Toplam kWh</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {monthlyHistory.map((m) => (
+                          <tr key={m.period} className="border-b border-neutral-100">
+                            <td className="px-4 py-1.5 font-mono text-xs">
+                              {m.period}
+                            </td>
+                            <td className="px-4 py-1.5 text-right text-neutral-500">
+                              {m.days}
+                            </td>
+                            <td className="px-4 py-1.5 text-right">
+                              {fmtKwh2(m.totalKwh)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {historyRange && (
+                    <div className="border-t border-neutral-100 px-4 py-2 text-xs text-neutral-500">
+                      Veri aralığı: {fmtDateTr(historyRange.first)} –{" "}
+                      {fmtDateTr(historyRange.last)}
+                      {historyRows.length >= HISTORY_LIMIT && (
+                        <span className="text-neutral-400">
+                          {" "}
+                          (son {HISTORY_LIMIT} gün)
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

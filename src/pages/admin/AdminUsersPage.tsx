@@ -27,6 +27,8 @@ type SettingsForm = {
   gerilim: string | null;
   guc_bedel_limit: number | null;
   trafo_degeri: number | null;
+  // Metot 7 (Meram): saatlik trafo kaybı (kWh/saat) — dönemin her saatine eklenir.
+  trafo_kaybi_saatlik: number | null;
   nickname: string | null;
   on_yil: boolean;
   satis_hakki: number | null;
@@ -70,6 +72,7 @@ const EMPTY_SETTINGS: SettingsForm = {
   gerilim: null,
   guc_bedel_limit: null,
   trafo_degeri: null,
+  trafo_kaybi_saatlik: null,
   nickname: null,
   on_yil: false,
   satis_hakki: null,
@@ -236,7 +239,7 @@ export default function AdminUsersPage() {
     (async () => {
       const { data } = await supabase
         .from("subscription_settings")
-        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, nickname, on_yil, satis_hakki, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi, muhasebe_excel_enabled, muhasebe_excel_format")
+        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, trafo_kaybi_saatlik, nickname, on_yil, satis_hakki, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi, muhasebe_excel_enabled, muhasebe_excel_format")
         .eq("user_id", selectedUserId)
         .eq("subscription_serno", selectedSerno)
         .maybeSingle();
@@ -706,6 +709,25 @@ export default function AdminUsersPage() {
                         onChange={(e) => setSettings((p) => ({ ...p, trafo_degeri: numOrNull(e.target.value) }))}
                         className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
                       />
+                    </label>
+
+                    {/* Trafo kaybı saatlik — yalnız Metot 7 (Meram) */}
+                    <label className="block">
+                      <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                        Trafo kaybı (kWh/saat) — Meram
+                      </span>
+                      <input
+                        type="number"
+                        step="0.001"
+                        min="0"
+                        value={d(settings.trafo_kaybi_saatlik)}
+                        onChange={(e) => setSettings((p) => ({ ...p, trafo_kaybi_saatlik: numOrNull(e.target.value) }))}
+                        className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                      />
+                      <span className="mt-1 block text-[10px] text-neutral-400">
+                        Yalnız Metot 7: dönemin her saatine tüketime eklenir (AG ölçümlüde ör. 1,12;
+                        OG'de boş). Bu metotta yukarıdaki aylık Trafo Kaybı kullanılmaz.
+                      </span>
                     </label>
 
                     {/* Yıllık Satış Hakkı */}

@@ -273,7 +273,8 @@ export function useIsAdmin() {
 | `xlsx.ts` | `exportToXlsx(...)` (genel) | Excel sheet üretimi (`xlsx` paketi) |
 | `exportConsumptionXlsx.ts` | `exportConsumptionXlsx(uid, sub, range)` | Saatlik tüketimi Excel'e aktarır; `paginatedFetch.fetchAllConsumption` üzerinden veri çeker |
 | `calculateGesOlmasaydi.ts` | `calculateGesOlmasaydi(...)`, `GesOlmasaydiResult` | "GES olmasaydı" karşı-olgu hesabı — 4 kartlı sonuç (Mevcut Fatura / Satılan Enerji / GES Olmasaydı Faturanız / GES Tasarrufu) ve 4 hesap dalı (alıcı, lisanslı satış, arazi GES, öz tüketim) |
-| `gesAllocation.ts` | `fetchGesMahsupContext(...)`, `computeGesAllocation(...)`, `getFacilityAllocation(...)`, `applyAllocationToHourlyRows(...)` | Talep birleştirme: kaynak GES verişinin öncelik sırasına göre saatlik şelale (waterfall) tahsisi; 5 dk TTL cache |
+| `gesAllocation.ts` | `fetchGesMahsupContext(...)`, `computeGesAllocation(...)`, `getFacilityAllocation(...)`, `applyAllocationToHourlyRows(...)` | Talep birleştirme: kaynak GES verişinin tesislere tahsisi (DB/cache/fetch katmanı); 5 dk TTL cache (anahtar mod dahil). Dağıtım matematiği `gesAllocationModes.ts`'e devredilir |
+| `gesAllocationModes.ts` | `allocateByMode(...)`, `allocateSirali/SaatlikOransal/ToplamOransal(...)`, `distributeCapped(...)`, `hourlyCapacity(...)`, `coerceTahsisModu(...)`, `TAHSIS_MODU_LABEL` | Üç dağıtım modunun SAF matematiği (`ges_plants.tahsis_modu`): `sirali` (öncelik şelalesi, varsayılan), `saatlik_oransal` (Meram), `toplam_oransal` (Kayseri). **SIFIR IMPORT** — `scripts/check-ges-allocation-modes.ts` tsx altında relative path'ten yükler. `own_gn` kuralı tek noktada (`hourlyCapacity`, `TB-KARAR: alici-kendi-ges`) |
 | `yearlySatisHakki.ts` | `calcYearlySatisHakkiUsage(...)` | Takvim yılı satış hakkı kullanımı: `Σ_ay max(0, ayVeriş − ayÇekiş)` (yalnız devlete satılan fazla sayılır) |
 | `parseManualConsumptionXlsx.ts` | `parseManualConsumptionXlsx(file)` | Manuel tüketim Excel'ini parse eder (SheetJS): TR ondalık ("1.234,56"), Europe/Istanbul TZ, Excel serial tarih, dosya-içi dedupe |
 
@@ -482,11 +483,15 @@ CI/CD: PortEco Web reposunda `.github/workflows/` altında etkin bir workflow **
 49. `20260706_001_atomic_remove_ges_mahsup_assignment.sql`
 50. `20260710_001_add_anlik_uretim_kullanimi.sql`
 
+… (20260711–20260824 arası migration'lar listeye işlenmemiştir; kanonik liste `supabase/migrations/` dizinidir)
+
+51. `20260927_001_add_tahsis_modu_to_ges_plants.sql` — `ges_plants.tahsis_modu text not null default 'sirali'` + CHECK (`sirali` | `saatlik_oransal` | `toplam_oransal`); talep birleştirme dağıtım modu
+
 `btv_enabled` alanı 2026-02-16'da `subscription_settings` tablosundan `owner_subscriptions` tablosuna taşınmıştır; bu nedenle `btvToggle.ts` `owner_subscriptions` tablosunu hedef alır. `is_hidden` alanı aynı tarihte `subscription_settings`'a eklenmiştir.
 
 2026-04 ayında fatura snapshot'ları için `distribution_adjustment`, `veris_kwh`, `effective_distribution_unit_price`, `veris_mahsup_kwh`, `veris_fazla_kwh`, `veris_satis_bedeli` alanları eklenmiştir. 2026-05..07 döneminde snapshot'lara ayrıca `usd_kur`, `lisansli_satis`, `unit_price_adjustment`, `ges_satis_dagitim_bedeli`, `net_positive_draw_kwh`, `net_excess_feed_kwh`, `allocated_ges_kwh` kolonları eklendi. Eski snapshot'lar `recomputeSnapshotTotalWithMahsup()` ile okunurken yeniden hesaplanır; `20260602_002` migration'ı eski `billed` satırları bir kerelik güncel formülle backfill etmiştir.
 
-**Repoda migration'ı olmayan canlı DB nesneleri:** kod şu kolon/tabloları kullanır ama `supabase/migrations/` altında tanımları yoktur (canlı DB'de manuel oluşturulmuştur): `ges_plants.source_serno` (`gesAllocation.ts:108`), `owner_subscriptions.data_source` ve `manual_data_logs` tablosu (`manualUpload/ManualUploadPanel.tsx`), manuel yükleme için `consumption_hourly` yazma RLS politikaları.
+**Repoda migration'ı olmayan canlı DB nesneleri:** kod şu kolon/tabloları kullanır ama `supabase/migrations/` altında tanımları yoktur (canlı DB'de manuel oluşturulmuştur): `ges_plants.source_serno` (`gesAllocation.ts`, `fetchGesMahsupContext` içindeki `ges_plants` select'i — `tahsis_modu`'nun migration'ı vardır, `source_serno`'nun yoktur), `owner_subscriptions.data_source` ve `manual_data_logs` tablosu (`manualUpload/ManualUploadPanel.tsx`), manuel yükleme için `consumption_hourly` yazma RLS politikaları.
 
 ## 14. Edge Functions
 

@@ -44,6 +44,7 @@ import {
 } from "@/components/utils/hourlyNetAggregates";
 import {
   embedYekdemMahsupIntoEnergy,
+  isIpragazYekBirlesikPeriod,
   type InvoiceMethodInputs,
   type MethodInvoiceBreakdown,
 } from "@/components/utils/calculateInvoiceNetMethods";
@@ -612,8 +613,10 @@ export async function fetchBilledInvoiceInputs(params: {
       subscriptionSerno,
       periodYear,
       periodMonth,
+      invoiceMethodId,
       kbk,
       tahminiYekdem: monthlyYekdem,
+      // Metot 7'de t > 0 ise yok sayılır (t'siz hesaplanmış) → t'li yükleyici.
       current: netAgg,
     });
     // Backdated manuel M-1 YEKDEM'i: assembleMethodInputs imzası değişmeden
@@ -765,6 +768,10 @@ export function buildBreakdownFromInputs(
       applyVerisMahsupPerakendeCap:
         isM1MahsupCapPeriod(inputs.periodYear, inputs.periodMonth) &&
         !inputs.isKayseriOsb,
+      // İpragaz 2026-08+: YEK bedeli enerji satırına gömülü (yalnız m5 okur).
+      ipragazYekBirlesik:
+        inputs.invoiceMethodId === 5 &&
+        isIpragazYekBirlesikPeriod(inputs.periodYear, inputs.periodMonth),
     },
     overrides
   );

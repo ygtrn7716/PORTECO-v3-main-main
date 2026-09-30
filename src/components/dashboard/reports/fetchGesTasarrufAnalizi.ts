@@ -70,13 +70,13 @@ export async function fetchGesTasarrufAnalizi(args: {
   // ── Batch ön-çekim (5 sorgu) — hücre döngüsüne caller sorgusu taşınmaz ──
 
   // 1) Snapshot'lar: recompute alan listesi + motorun snapshot'a özgü girdileri
-  // (unit_price_adjustment, allocated_ges_kwh, monthly_yekdem,
-  // ges_satis_dagitim_bedeli listede yok).
+  // (allocated_ges_kwh, monthly_yekdem, ges_satis_dagitim_bedeli listede yok;
+  // unit_price_adjustment Metod 7 replay'i için listeye girdi).
   const { data: snapData, error: snapError } = await supabase
     .from("invoice_snapshots")
     .select(
       // period_year/period_month artık RECOMPUTE_FIELDS içinde (2K) — çift kolon olmasın.
-      `subscription_serno, invoice_type, unit_price_adjustment, allocated_ges_kwh, monthly_yekdem, ges_satis_dagitim_bedeli, ${INVOICE_SNAPSHOT_RECOMPUTE_FIELDS}`,
+      `subscription_serno, invoice_type, allocated_ges_kwh, monthly_yekdem, ges_satis_dagitim_bedeli, ${INVOICE_SNAPSHOT_RECOMPUTE_FIELDS}`,
     )
     .eq("user_id", uid)
     .in("invoice_type", ["billed", "backdated"])

@@ -23,6 +23,29 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { fetchAllConsumption } from "@/lib/paginatedFetch";
+import {
+  allocateByMode,
+  buildPoolSrcSeries,
+  coerceTahsisModu,
+  isPoolMode,
+  type TahsisModu,
+} from "@/components/utils/gesAllocationModes";
+import {
+  addTrafoKaybiToSeries,
+  hourGridKeys,
+  normalizeTrafoKaybi,
+  trafoGridCapIso,
+} from "@/components/utils/trafoKaybi";
+
+// Dağıtım modu tipleri/sabitleri gesAllocationModes.ts'te (SIFIR IMPORT kuralı —
+// saf matematik tsx kabul testinden yüklenebilsin). Buradan re-export edilir ki
+// mevcut importer'lar tek yerden (gesAllocation) almaya devam edebilsin.
+export type { TahsisModu } from "@/components/utils/gesAllocationModes";
+export {
+  TAHSIS_MODU_LABEL,
+  coerceTahsisModu,
+  isPoolMode,
+} from "@/components/utils/gesAllocationModes";
 
 export type GesMahsupAssignment = {
   id: string;
@@ -42,6 +65,12 @@ export type GesMahsupContext = {
   assignedSernos: Map<number, string>;
   /** kaynak serno → ges_plant_id (yalnız ataması olan plantlar) */
   sourceSernos: Map<number, string>;
+  /** ges_plant_id → dağıtım modu (kolon NULL/bilinmeyen ise "sirali") */
+  plantMode: Map<string, TahsisModu>;
+  /** atanan serno → saatlik trafo kaybı t (kWh/saat, > 0). Metot 7 (Meram): t
+   *  tanımlı tesisin tahsis kapasitesi kap(h) = cn(h) + t, dönemin HER saatinde
+   *  (satırı eksik saatler dahil). Yoksa anahtar yok → tahsis bit-identik. */
+  trafoKaybiBySerno: Map<number, number>;
 };
 
 const EMPTY_CONTEXT: GesMahsupContext = {
@@ -50,6 +79,8 @@ const EMPTY_CONTEXT: GesMahsupContext = {
   plantSourceSerno: new Map(),
   assignedSernos: new Map(),
   sourceSernos: new Map(),
+  plantMode: new Map(),
+  trafoKaybiBySerno: new Map(),
 };
 
 function num(v: unknown, fallback = 0) {
@@ -105,13 +136,14 @@ export async function fetchGesMahsupContext(
   const plantIds = Array.from(byPlant.keys());
   const { data: plants, error: pErr } = await supabase
     .from("ges_plants")
-    .select("id, linked_serno, source_serno")
+    .select("id, linked_serno, source_serno, tahsis_modu")
     .in("id", plantIds);
 
   if (pErr) throw pErr;
 
   const plantSourceSerno = new Map<string, number>();
   const sourceSernos = new Map<number, string>();
+  const plantMode = new Map<string, TahsisModu>();
   for (const p of (plants ?? []) as Record<string, unknown>[]) {
     const src =
       p.source_serno != null
@@ -123,9 +155,34 @@ export async function fetchGesMahsupContext(
       plantSourceSerno.set(String(p.id), src);
       sourceSernos.set(src, String(p.id));
     }
+    // Kaynak serno'su olmayan plant için de doldurulur (eksik anahtar sürprizi olmasın).
+    plantMode.set(String(p.id), coerceTahsisModu(p.tahsis_modu));
   }
 
-  return { hasAny: true, byPlant, plantSourceSerno, assignedSernos, sourceSernos };
+  // Metot 7 (Meram) saatlik trafo kaybı — yalnız listelenmiş tesisler; kolon NULL ise
+  // satır dönmez → harita boş → tahsis bit-identik.
+  const trafoKaybiBySerno = new Map<number, number>();
+  const { data: tkRows, error: tkErr } = await supabase
+    .from("subscription_settings")
+    .select("subscription_serno, trafo_kaybi_saatlik")
+    .eq("user_id", userId)
+    .in("subscription_serno", Array.from(assignedSernos.keys()))
+    .not("trafo_kaybi_saatlik", "is", null);
+  if (tkErr) throw tkErr;
+  for (const r of (tkRows ?? []) as Record<string, unknown>[]) {
+    const t = normalizeTrafoKaybi(r.trafo_kaybi_saatlik);
+    if (t > 0) trafoKaybiBySerno.set(Number(r.subscription_serno), t);
+  }
+
+  return {
+    hasAny: true,
+    byPlant,
+    plantSourceSerno,
+    assignedSernos,
+    sourceSernos,
+    plantMode,
+    trafoKaybiBySerno,
+  };
 }
 
 export type GesAllocationResult = {
@@ -137,6 +194,9 @@ export type GesAllocationResult = {
   excessTotal: number;
   /** Kaynak gn toplamı — sanity: gesGnTotal ≈ Σ allocTotal + excessTotal */
   gesGnTotal: number;
+  /** serno → tesisin KENDİ sayacının dönem verişi (ham Σgn). Yalnız görünüm;
+   *  hiçbir tahsis hesabına girmez. */
+  ownGnBySerno: Map<number, number>;
 };
 
 // (gesPlantId|range) başına tek hesap; eşzamanlı caller'lar Promise'i paylaşır.
@@ -171,11 +231,23 @@ export function computeGesAllocation(params: {
     return Promise.resolve(null);
   }
 
-  const key = `${gesPlantId}|${startIso}|${endIso}|${endInclusive ? 1 : 0}`;
+  const mode = ctx.plantMode.get(gesPlantId) ?? "sirali";
+
+  // Mod cache ANAHTARINA girer: clearGesAllocationCache() yalnız admin sayfasından
+  // çağrılıyor; mod başka bir sekmede/oturumda değişirse eski anahtar TTL boyunca
+  // eski algoritmayı servis ederdi. Modu anahtara koymak değişimi anında görünür kılar.
+  // Trafo kaybı (Metot 7) da tahsisi değiştirdiği için anahtara girer; t'siz
+  // listelerde ek yok → anahtar eskisiyle aynı.
+  const tDigest = assignments
+    .map((a) => ctx.trafoKaybiBySerno.get(a.subscription_serno) ?? 0)
+    .join(",");
+  const key =
+    `${gesPlantId}|${startIso}|${endIso}|${endInclusive ? 1 : 0}|${mode}` +
+    (/[1-9]/.test(tDigest) ? `|t:${tDigest}` : "");
   const hit = allocationCache.get(key);
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.promise;
 
-  const promise = computeGesAllocationUncached(params, assignments, sourceSerno, ctx);
+  const promise = computeGesAllocationUncached(params, assignments, sourceSerno, ctx, mode);
   allocationCache.set(key, { at: Date.now(), promise });
   // Hata alan hesap TTL boyunca cache'te kalmasın — sonraki çağrı yeniden dener.
   promise.catch(() => {
@@ -195,15 +267,22 @@ async function computeGesAllocationUncached(
   },
   assignments: GesMahsupAssignment[],
   sourceSerno: number,
-  ctx: GesMahsupContext
+  ctx: GesMahsupContext,
+  mode: TahsisModu
 ): Promise<GesAllocationResult | null> {
   const { supabase, userId, startIso, endIso, endInclusive = false } = params;
 
-  // Kaynak + atanan tesislerin saatlik serileri (paginated)
-  const sernosToFetch = new Set<number>([sourceSerno]);
+  // HAVUZ modeli (oransal modlar): havuz = LİSTEDEKİ sayaçların verişleri.
+  // GES kaydının kaynak sayacı listede değilse havuza girmez → fetch EDİLMEZ.
+  // TEK KAYNAK modeli (sirali): kaynak sayaç + atananlar (bugünkü davranış).
+  const pool = isPoolMode(mode);
+
+  const sernosToFetch = new Set<number>();
+  if (!pool) sernosToFetch.add(sourceSerno);
   for (const a of assignments) sernosToFetch.add(a.subscription_serno);
 
   const seriesBySerno = new Map<number, Map<string, { cn: number; gn: number }>>();
+  const lastTsBySerno = new Map<number, string>();
   await Promise.all(
     Array.from(sernosToFetch).map(async (serno) => {
       const res = await fetchAllConsumption({
@@ -219,7 +298,14 @@ async function computeGesAllocationUncached(
       // hata görünür olmalı (cache eviction sayesinde sonraki çağrı yeniden dener).
       if (res.error) throw res.error;
       const map = new Map<string, { cn: number; gn: number }>();
+      let lastMs = -Infinity;
+      let lastTs: string | null = null;
       for (const row of (res.data ?? []) as Array<{ ts: string; cn?: unknown; gn?: unknown }>) {
+        const ms = new Date(row.ts).getTime();
+        if (ms > lastMs) {
+          lastMs = ms;
+          lastTs = row.ts;
+        }
         const key = hourKeyUtc(row.ts);
         const prev = map.get(key);
         if (prev) {
@@ -230,42 +316,65 @@ async function computeGesAllocationUncached(
         }
       }
       seriesBySerno.set(serno, map);
+      if (lastTs != null) lastTsBySerno.set(serno, lastTs);
     })
   );
 
-  const srcSeries = seriesBySerno.get(sourceSerno) ?? new Map();
-
-  const perSerno = new Map<number, { allocByHour: Map<string, number>; allocTotal: number }>();
+  // Metot 7 (Meram): t tanımlı LİSTELENMİŞ tesiste kapasite = cn + t, dönemin her
+  // saatinde (eksik satır = cn 0). Seri ön-dönüşümü — mod fonksiyonları değişmez.
+  // gn'e dokunulmaz → havuz (src) ve ownGnBySerno aynen. Cari dönemde ızgara
+  // tesisin son veri saatinde kapanır (gelecek saatlere t eklenmez).
+  const nowMs = Date.now();
   for (const a of assignments) {
-    perSerno.set(a.subscription_serno, { allocByHour: new Map(), allocTotal: 0 });
+    const t = ctx.trafoKaybiBySerno.get(a.subscription_serno) ?? 0;
+    const series = seriesBySerno.get(a.subscription_serno);
+    if (!(t > 0) || !series) continue;
+    const capIso = trafoGridCapIso({
+      startIso,
+      endIso,
+      endInclusive,
+      lastTs: lastTsBySerno.get(a.subscription_serno) ?? null,
+      nowMs,
+    });
+    const keys = hourGridKeys(startIso, endIso, { endInclusive, capIso });
+    seriesBySerno.set(a.subscription_serno, addTrafoKaybiToSeries(series, t, keys));
   }
 
-  let excessTotal = 0;
-  let gesGnTotal = 0;
+  // Dağıtım matematiği moda göre saf fonksiyonlara devredilir (gesAllocationModes.ts).
+  // "sirali" modu eski satır-içi şelalenin BİREBİR taşınmış hâlidir → bit-identik.
+  //
+  // İki modelin TEK ayrım noktası burada, girdi kurulumunda:
+  //  • sirali  → src = kaynak sayacın serisi; isSourceSerno = ctx.sourceSernos
+  //              (alıcı kaynak değilse önce kendi verişiyle netleşir)
+  //  • oransal → src = listedeki sayaçların verişlerinin saatlik toplamı;
+  //              isSourceSerno = "listede mi?" → listedeki HERKES için own_gn=0,
+  //              yani kapasite ham cn. (TB-KARAR: alici-kendi-ges)
+  // Matematik fonksiyonları modelden habersizdir.
+  const listSernos = new Set<number>(assignments.map((a) => a.subscription_serno));
 
-  for (const [hour, src] of srcSeries) {
-    const srcGn = src.gn;
-    if (!(srcGn > 0)) continue;
-    gesGnTotal += srcGn;
+  const srcSeries = pool
+    ? buildPoolSrcSeries({ assignments, seriesBySerno })
+    : seriesBySerno.get(sourceSerno) ?? new Map();
 
-    let remaining = srcGn;
-    for (const a of assignments) {
-      if (remaining <= 0) break;
-      const row = seriesBySerno.get(a.subscription_serno)?.get(hour);
-      const cn = row ? row.cn : 0;
-      // HERHANGİ bir plant'in kaynak sernosuysa own_gn=0 sayılır: gn'i kendi
-      // tüketiminin verişi değil, bir havuzun üretimidir.
-      const ownGn = row && !ctx.sourceSernos.has(a.subscription_serno) ? row.gn : 0;
-      const residual = Math.max(0, cn - ownGn);
-      const alloc = Math.min(remaining, residual);
-      if (alloc > 0) {
-        const bucket = perSerno.get(a.subscription_serno)!;
-        bucket.allocByHour.set(hour, (bucket.allocByHour.get(hour) ?? 0) + alloc);
-        bucket.allocTotal += alloc;
-        remaining -= alloc;
-      }
-    }
-    excessTotal += remaining;
+  const { perSerno, excessTotal, gesGnTotal } = allocateByMode(mode, {
+    assignments,
+    seriesBySerno,
+    srcSeries,
+    // TB-KARAR: alici-kendi-ges
+    isSourceSerno: pool
+      ? (serno) => listSernos.has(serno)
+      : (serno) => ctx.sourceSernos.has(serno),
+  });
+
+  // Tesis bazlı HAM kendi verişi (Σgn) — yalnız görünüm/bilgi amaçlı.
+  // Zaten çekilmiş serilerden türetilir (ek sorgu yok). Tahsise GİRMEZ; Metot 7
+  // (Meram) dağıtım bedelinde G_own olarak kullanılır (hourlyNetAggregates.sumOwnGn).
+  // Trafo kaybı yalnız cn'e eklendiği için bu toplamı etkilemez.
+  const ownGnBySerno = new Map<number, number>();
+  for (const [serno, series] of seriesBySerno) {
+    let g = 0;
+    for (const [, row] of series) g += row.gn;
+    ownGnBySerno.set(serno, Number.isFinite(g) ? g : 0);
   }
 
   return {
@@ -274,6 +383,7 @@ async function computeGesAllocationUncached(
     perSerno,
     excessTotal,
     gesGnTotal,
+    ownGnBySerno,
   };
 }
 
@@ -287,8 +397,19 @@ export type FacilityAllocationView =
       excessTotal: number;
       /** Tesis aynı zamanda bir GES'in üretim sayacı — own gn havuz sayılır (0) */
       isSource: boolean;
+      /** Bu GES'in dağıtım modu — yalnız UI bilgilendirmesi; matematiğe GİRMEZ
+       *  (tahsis zaten allocByHour/excessTotal içinde uygulanmış geldi). */
+      mode: TahsisModu;
+      /** Tesisin KENDİ sayacının dönem verişi (ham Σgn). Havuz modunda bu miktar
+       *  havuza katılmıştır. Tahsis hesabına GİRMEZ; Metot 7 (Meram) dağıtım bedelinde
+       *  G_own olarak okunur (kendi veriş > tüketim → yarım dağıtım). */
+      ownGnTotal: number;
     }
-  | { role: "source" }
+  | {
+      role: "source";
+      /** Kaynak sayacın dönem verişi (ham Σgn) — dağıtılan havuz. Yalnız görünüm. */
+      ownGnTotal: number;
+    }
   | null;
 
 /**
@@ -315,8 +436,29 @@ export async function getFacilityAllocation(params: {
   // Kaynak sayaç, atama listesinde de olabilir (öz tüketim + dağıtım);
   // bu durumda "assigned" görünümü esas alınır (gn'i applyAllocation'da havuz sayılır).
   if (!assignedPlantId) {
-    if (sourcePlantId) return { role: "source" };
-    return null;
+    if (!sourcePlantId) return null;
+
+    // HAVUZ modeli: listede OLMAYAN kaynak sayaç "source" rolü ALMAZ. Verişi
+    // dağıtılmadığı (havuza girmediği) için kendi faturasında sıfırlanmamalı —
+    // aksi halde hem havuza katılmayan üretim kaybolur hem çift sayım doğar.
+    // Görünüm null → caller mevcut (tahsissiz) davranışını sürdürür.
+    if (isPoolMode(ctx.plantMode.get(sourcePlantId) ?? "sirali")) return null;
+
+    // TEK KAYNAK modeli (sirali): verişi dağıtıldı → kendi faturasında gn=0.
+    // ownGnTotal yalnız görünüm için; dağıtılan havuzun büyüklüğünü gösterir.
+    const srcResult = await computeGesAllocation({
+      supabase,
+      userId,
+      gesPlantId: sourcePlantId,
+      startIso,
+      endIso,
+      endInclusive,
+      ctx,
+    });
+    return {
+      role: "source",
+      ownGnTotal: srcResult?.ownGnBySerno.get(subscriptionSerno) ?? 0,
+    };
   }
 
   const result = await computeGesAllocation({
@@ -337,11 +479,15 @@ export async function getFacilityAllocation(params: {
   const bucket = result.perSerno.get(subscriptionSerno);
 
   // Fazla üretim satışı EN YÜKSEK önceliğe yazılır (normalde 1; silme/renumber
-  // arası geçici boşlukta bile artık kaybolmaz).
+  // arası geçici boşlukta bile artık kaybolmaz). Oransal modlarda öncelik
+  // dağıtımı etkilemez, YALNIZ artanın kime yazılacağını belirler.
   const minPriority = plantAssignments.reduce(
     (m, a) => Math.min(m, a.priority),
     Infinity
   );
+
+  const mode = ctx.plantMode.get(assignedPlantId) ?? "sirali";
+  const poolMode = isPoolMode(mode);
 
   return {
     role: "assigned",
@@ -349,7 +495,12 @@ export async function getFacilityAllocation(params: {
     allocByHour: bucket?.allocByHour ?? new Map(),
     allocTotal: bucket?.allocTotal ?? 0,
     excessTotal: assignment.priority === minPriority ? result.excessTotal : 0,
-    isSource: ctx.sourceSernos.has(subscriptionSerno),
+    // HAVUZ modunda listedeki HERKES için own_gn=0 (verişi havuzda) → isSource=true.
+    // TEK KAYNAK modunda yalnız gerçek kaynak sayaç için true.
+    // TB-KARAR: alici-kendi-ges
+    isSource: poolMode || ctx.sourceSernos.has(subscriptionSerno),
+    mode,
+    ownGnTotal: result.ownGnBySerno.get(subscriptionSerno) ?? 0,
   };
 }
 
@@ -389,6 +540,9 @@ export function applyAllocationToHourlyRows(
     const usedHours = new Set<string>();
     for (const row of rows) {
       const cn = num(row.cn);
+      // TB-KARAR: alici-kendi-ges — Alıcı tesis bir havuzun kaynağı değilse önce
+      // kendi verişiyle netleşir, orana net çekişiyle girer. İş kuralı değişebilir;
+      // değişirse bu etiketli satırlar güncellenir.
       // Üretim sayacı olan tesiste own gn havuzdur; kendi verişi sayılmaz —
       // aksi halde havuz üretimi hem burada hem dağıtımda çift sayılır.
       const ownGn = view.isSource ? 0 : num(row.gn);

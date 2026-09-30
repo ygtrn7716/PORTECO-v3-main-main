@@ -20,7 +20,13 @@ import {
 } from "lucide-react";
 import { supabase } from "@/lib/supabase";
 import { dayjsTR } from "@/lib/dayjs";
-import { clearGesAllocationCache } from "@/components/utils/gesAllocation";
+import {
+  clearGesAllocationCache,
+  coerceTahsisModu,
+  isPoolMode,
+  TAHSIS_MODU_LABEL,
+  type TahsisModu,
+} from "@/components/utils/gesAllocation";
 
 type UserRow = { user_id: string; aril_user: string | null };
 
@@ -31,7 +37,15 @@ type PlantRow = {
   linked_serno: number | null;
   source_serno: number | null;
   is_active: boolean | null;
+  tahsis_modu: string | null;
 };
+
+/** Admin seçicideki etiketler (iş tarafının kullandığı adlandırma). */
+const TAHSIS_MODU_OPTIONS: Array<{ value: TahsisModu; label: string }> = [
+  { value: "sirali", label: "Sıralı (mevcut sistem)" },
+  { value: "saatlik_oransal", label: "Saatlik oransal (Meram mantığı)" },
+  { value: "toplam_oransal", label: "Toplam tüketim oransal (Kayseri mantığı)" },
+];
 
 type FacilityRow = {
   subscription_serno: number;
@@ -112,7 +126,7 @@ export default function TalepBirlestirmeAdmin() {
       const [plantsRes, subsRes, settingsRes, asgRes] = await Promise.all([
         supabase
           .from("ges_plants")
-          .select("id, plant_name, nickname, linked_serno, source_serno, is_active")
+          .select("id, plant_name, nickname, linked_serno, source_serno, is_active, tahsis_modu")
           .eq("user_id", userId)
           .order("created_at", { ascending: true }),
         supabase
@@ -152,6 +166,7 @@ export default function TalepBirlestirmeAdmin() {
           linked_serno: p.linked_serno != null ? Number(p.linked_serno) : null,
           source_serno: p.source_serno != null ? Number(p.source_serno) : null,
           is_active: (p.is_active as boolean | null) ?? null,
+          tahsis_modu: (p.tahsis_modu as string | null) ?? null,
         }))
       );
       setFacilities(
@@ -215,8 +230,9 @@ export default function TalepBirlestirmeAdmin() {
   }, [assignments]);
 
   // Seçili GES'e zaten atanmış tesisler (uq_gma_plant_serno — UI'da da engelle).
-  // uq_gma_user_serno kaldırıldı: bir tesis birden fazla GES'e atanabilir
-  // (waterfall zincirleme işler) — başka GES'e atanmış olmak artık engel değil.
+  // uq_gma_user_serno canlı DB'de kaldırılmış (repo migration'ında duruyor — drift):
+  // SIRALI modda bir tesis birden fazla GES'e atanabilir (şelale zincirleme işler).
+  // ORANSAL (havuz) modda ise YASAK — addAssignment içinde engelleniyor (çift sayım).
   const assignedToSelectedPlant = useMemo(() => {
     const s = new Set<number>();
     for (const a of assignments) {
@@ -254,6 +270,9 @@ export default function TalepBirlestirmeAdmin() {
   const sourceInList =
     selectedPlantSourceSerno != null &&
     plantAssignments.some((a) => a.subscription_serno === selectedPlantSourceSerno);
+  // Kolon NULL / bilinmeyen değer → "sirali" (mevcut davranış).
+  const selectedPlantMode = coerceTahsisModu(selectedPlant?.tahsis_modu);
+  const selectedPlantIsPool = isPoolMode(selectedPlantMode);
 
   // Aday tesis: son 3 ayda gn>0 kontrolü (tek indexli sorgu — yumuşak uyarı)
   useEffect(() => {
@@ -293,6 +312,38 @@ export default function TalepBirlestirmeAdmin() {
   async function addAssignment() {
     if (!selectedUserId || !selectedPlantId || !candidateSerno) return;
     const serno = Number(candidateSerno);
+
+    // ÇİFT SAYIM KORUMASI: bir serno aynı anda bir oransal (HAVUZ) listede ve
+    // başka bir listede olamaz. Havuzda tesisin verişi havuza katılır ve tüketimi
+    // ham girer; aynı serno ikinci bir listede de bulunursa verişi iki havuzda
+    // sayılır ve tüketimi iki kez mahsup alır.
+    // NOT: `uq_gma_user_serno` canlı DB'de KALDIRILMIŞ (repo migration'ında hâlâ
+    // duruyor — drift). Bu yüzden koruma UI katmanında; kalıcı çözüm için
+    // validate_ges_mahsup_assignment trigger'ına aynı kural eklenmeli.
+    const otherPlantIds = new Set(
+      assignments.filter((a) => a.subscription_serno === serno).map((a) => a.ges_plant_id)
+    );
+    otherPlantIds.delete(selectedPlantId);
+    if (otherPlantIds.size > 0) {
+      const conflictPool = [...otherPlantIds].some((pid) =>
+        isPoolMode(coerceTahsisModu(plants.find((p) => p.id === pid)?.tahsis_modu))
+      );
+      if (conflictPool || isPoolMode(selectedPlantMode)) {
+        const names = [...otherPlantIds]
+          .map((pid) => {
+            const p = plants.find((x) => x.id === pid);
+            return p ? plantLabel(p) : pid.slice(0, 8);
+          })
+          .join(", ");
+        setErr(
+          `Tesis ${serno} zaten şu GES listesinde: ${names}. Oransal (havuz) modda bir ` +
+            `tesis yalnızca TEK listede olabilir — aksi halde verişi iki havuzda, tüketimi ` +
+            `iki kez mahsupta sayılır. Önce diğer listeden çıkarın.`
+        );
+        return;
+      }
+    }
+
     setBusy(true);
     setErr(null);
     try {
@@ -310,6 +361,32 @@ export default function TalepBirlestirmeAdmin() {
       await loadUserData(selectedUserId);
     } catch (e) {
       setErr(errMsg(e, "Atama eklenemedi"));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Dağıtım modu — ges_plants.tahsis_modu doğrudan UPDATE edilir (RLS
+  // ges_plants_admin_all zaten admin'e FOR ALL izni veriyor; RPC gerekmez).
+  // Mod cache anahtarına girdiği için clearGesAllocationCache() şart değil, ama
+  // diğer mutasyonlarla desen bütünlüğü ve aynı sekmedeki eski hesapları düşürmek
+  // için çağrılıyor.
+  async function saveTahsisModu(mode: TahsisModu) {
+    if (!selectedPlantId) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const { error } = await supabase
+        .from("ges_plants")
+        .update({ tahsis_modu: mode })
+        .eq("id", selectedPlantId);
+      if (error) throw error;
+      clearGesAllocationCache();
+      showToast(`Dağıtım yöntemi: ${TAHSIS_MODU_LABEL[mode]}`);
+      await loadUserData(selectedUserId);
+    } catch (e) {
+      setErr(errMsg(e, "Dağıtım yöntemi kaydedilemedi"));
+      await loadUserData(selectedUserId);
     } finally {
       setBusy(false);
     }
@@ -494,7 +571,8 @@ export default function TalepBirlestirmeAdmin() {
                         </span>
                         {count > 0 && (
                           <span className="shrink-0 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-800 ring-1 ring-emerald-200">
-                            Talep Birleştirme aktif ({count} tesis)
+                            Talep Birleştirme aktif ({count} tesis •{" "}
+                            {TAHSIS_MODU_LABEL[coerceTahsisModu(p.tahsis_modu)]})
                           </span>
                         )}
                       </button>
@@ -541,7 +619,61 @@ export default function TalepBirlestirmeAdmin() {
                   </div>
                 )}
 
-                {plantAssignments.length > 0 && selectedPlant.linked_serno != null && (
+                {/* Dağıtım yöntemi — havuzun tesislere NASIL bölüneceğini seçer.
+                    Kapasite/ownGn/artan kuralları her modda aynıdır. */}
+                <div className="mb-3 rounded-xl border border-neutral-200 bg-neutral-50 p-3">
+                  <label className="mb-1 block text-sm font-medium text-neutral-700">
+                    Dağıtım yöntemi
+                  </label>
+                  <select
+                    className="w-full rounded-lg border px-3 py-2 text-sm"
+                    value={selectedPlantMode}
+                    onChange={(e) => saveTahsisModu(e.target.value as TahsisModu)}
+                    disabled={busy}
+                  >
+                    {TAHSIS_MODU_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="mt-2 rounded-lg border border-sky-200 bg-sky-50 p-2.5 text-sm text-sky-800">
+                    Faturası kesilmiş aylar değişmez; geçmişe yansıtmak için yukarıdaki
+                    “Önceki ay snapshot'larını sıfırla” ile önceki ay snapshot'larını sıfırla.
+                  </div>
+                </div>
+
+                {/* ORANSAL (HAVUZ) modu — havuz mantığını anlatır. Sıralı moda özgü
+                    "kaynak tesis listede / önce kendi tüketiminden" metinleri bu modda
+                    GÖSTERİLMEZ (aşağıdaki bloklar selectedPlantIsPool ile kapalı). */}
+                {plantAssignments.length > 0 && selectedPlantIsPool && (
+                  <div className="mb-3 rounded-lg border border-sky-200 bg-sky-50 p-2.5 text-sm text-sky-800">
+                    <strong>Havuz:</strong> listedeki sayaçların verişleri saat saat
+                    toplanır, tüketimler ham girer; artan üretim 1. sıradaki tesise satış
+                    olarak yazılır.
+                    {selectedPlantSourceSerno != null && !sourceInList && (
+                      <>
+                        {" "}
+                        GES kaydının kaynak sayacı ({selectedPlantSourceSerno}) listede
+                        değilse havuza katılmaz.
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {plantAssignments.length > 0 && selectedPlantIsPool && (
+                  <div className="mb-3 flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-800">
+                    <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                    <div>
+                      Bu modda sıra mahsubu etkilemez; yalnız 1. sıradaki tesis artan
+                      üretimin satışını alır.
+                    </div>
+                  </div>
+                )}
+
+                {plantAssignments.length > 0 &&
+                  !selectedPlantIsPool &&
+                  selectedPlant.linked_serno != null && (
                   <div className="mb-3 rounded-lg border border-sky-200 bg-sky-50 p-2.5 text-sm text-sky-800">
                     Talep Birleştirme aktif: bu GES için linked_serno ({selectedPlant.linked_serno})
                     tekil mahsup davranışı devre dışı — üretim aşağıdaki öncelik sırasına göre
@@ -556,6 +688,7 @@ export default function TalepBirlestirmeAdmin() {
                   </div>
                 )}
                 {plantAssignments.length > 0 &&
+                  !selectedPlantIsPool &&
                   selectedPlant.linked_serno == null &&
                   sourceInList && (
                     <div className="mb-3 rounded-lg border border-sky-200 bg-sky-50 p-2.5 text-sm text-sky-800">

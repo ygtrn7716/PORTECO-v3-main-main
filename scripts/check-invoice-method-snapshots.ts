@@ -28,6 +28,8 @@
 //     kolonuna damgalar (mahsup yoksa 0/null → normal). Metod-1 türevi olduğundan
 //     `w_pos` DAİMA NULL olmalıdır (net değil); dolu ise anomali (aşağıda kontrol edilir).
 // Not: Metod 5 (İpragaz, net) şu an filtrelere dahil DEĞİL — önceden var olan boşluk.
+// Metod 7 (Meram, net): ayrı kontrol ②c — w_pos + m7 replay kolonları (trafo_kaybi_kwh,
+// own_gn_kwh, yekdem_gddk, yekdem_is_final, unit_price_adjustment) dolu olmalı.
 
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
@@ -61,11 +63,18 @@ type SnapRow = {
   yekdem_tahmini: number | null;
   mahsuplasma_unit_price: number | null;
   w_mahsup: number | null;
+  trafo_kaybi_kwh: number | null;
+  own_gn_kwh: number | null;
+  yekdem_gddk: number | null;
+  yekdem_is_final: boolean | null;
+  unit_price_adjustment: number | null;
+  lisansli_satis: boolean | null;
 };
 
 const SNAP_FIELDS =
   "user_id, subscription_serno, period_year, period_month, invoice_type, invoice_method, " +
-  "invoice_from, total_with_mahsup, w_pos, kbk, yekdem_tahmini, mahsuplasma_unit_price, w_mahsup";
+  "invoice_from, total_with_mahsup, w_pos, kbk, yekdem_tahmini, mahsuplasma_unit_price, w_mahsup, " +
+  "trafo_kaybi_kwh, own_gn_kwh, yekdem_gddk, yekdem_is_final, unit_price_adjustment, lisansli_satis";
 
 const donem = (r: SnapRow) => `${r.period_year}-${String(r.period_month).padStart(2, "0")}`;
 
@@ -144,6 +153,38 @@ async function main() {
     console.log(`   ❌ ${m6Anomali.length} satırda Metod 6 net kolon damgalı (anomali):`);
     for (const r of m6Anomali) {
       console.log(`      · serno ${r.subscription_serno} · ${donem(r)}`);
+    }
+    console.log("      → Onarım: bu tesislerin ilgili ay fatura sayfasını aç.\n");
+  }
+
+  // ── 2c) Metod 7 (Meram) damga bütünlüğü ──────────────────────────
+  // m7 replay'i w_pos/w_mahsup/kbk/yekdem_tahmini (= Y) + m7 kolonlarına dayanır; biri
+  // NULL ise replay Metod 1'e düşer (dispatcher uyarısı). Lisanslı m7 tesisi m1'e
+  // yönlendirildiği için kapsam dışı.
+  const m7Eksik = snaps
+    .filter((r) => r.invoice_method === 7 && r.lisansli_satis !== true)
+    .map((r) => {
+      const eksik: string[] = [];
+      if (r.w_pos == null) eksik.push("w_pos");
+      if (r.w_mahsup == null) eksik.push("w_mahsup");
+      if (r.kbk == null) eksik.push("kbk");
+      if (r.yekdem_tahmini == null) eksik.push("yekdem_tahmini");
+      if (r.trafo_kaybi_kwh == null) eksik.push("trafo_kaybi_kwh");
+      if (r.own_gn_kwh == null) eksik.push("own_gn_kwh");
+      if (r.yekdem_gddk == null) eksik.push("yekdem_gddk");
+      if (r.yekdem_is_final == null) eksik.push("yekdem_is_final");
+      if (r.unit_price_adjustment == null) eksik.push("unit_price_adjustment");
+      return { r, eksik };
+    })
+    .filter((x) => x.eksik.length > 0);
+  console.log("②c Metod 7 damgası — invoice_method=7 (lisanslı hariç) ve m7 replay kolonlarından biri NULL");
+  if (m7Eksik.length === 0) {
+    console.log("   ✅ 0 satır (beklenen).\n");
+  } else {
+    problems += m7Eksik.length;
+    console.log(`   ❌ ${m7Eksik.length} satırda eksik m7 damgası:`);
+    for (const { r, eksik } of m7Eksik) {
+      console.log(`      · serno ${r.subscription_serno} · ${donem(r)} · eksik: ${eksik.join(", ")}`);
     }
     console.log("      → Onarım: bu tesislerin ilgili ay fatura sayfasını aç.\n");
   }

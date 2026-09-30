@@ -140,8 +140,10 @@ export function deriveGesSatisMahsup(args: {
     mahsup = { kind: "none", reason: "lisansli" };
   } else if (!(mahsupKwh > 0)) {
     mahsup = { kind: "none", reason: "zero" };
-  } else if (effectiveMethodId === 2 || effectiveMethodId === 5) {
+  } else if (effectiveMethodId === 2 || effectiveMethodId === 5 || effectiveMethodId === 7) {
     // m5 = m2 kopyası: mahsup net faturalamada örtük, ayrı kredi satırı yok.
+    // m7 (Meram): mahsup yine net enerjide örtük; faturadaki "mahsuplaşma farkı"
+    // bir fiyat düzeltmesidir (Satır 2), mahsup TL kredisi değil.
     mahsup = { kind: "implicit-net", kwh: mahsupKwh };
   } else if (effectiveMethodId === 3) {
     mahsup = {

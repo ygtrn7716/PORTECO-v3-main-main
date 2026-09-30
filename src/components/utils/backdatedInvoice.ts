@@ -310,8 +310,10 @@ export async function precheckBackdatedPeriod(p: {
   // Hangi alan sorulacak: yalnız DB'de OLMAYANLAR ve methodun ihtiyaç duydukları.
   // Metod 4 (GES'siz düz fatura): mahsup/YEK Farkı ve satış yok → prev+usd sorulmaz.
   // Metod 6 (Kepsaş): önceki dönem YEKDEM mahsubu enerji fiyatına gömülür → prev SORULUR.
+  // Metod 7 (Meram): sonraki ay YEKDEM mahsubu yok → prev sorulmaz.
   const needsPrev =
     (methodId === 1 || methodId === 6 || isNetInvoiceMethod(methodId)) &&
+    methodId !== 7 &&
     !lisansliSatis &&
     consPrev;
   const ask: Record<BackdatedYekdemField, boolean> = {

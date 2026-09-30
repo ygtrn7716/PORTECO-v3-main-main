@@ -12,7 +12,9 @@
     "test:sms": "tsx scripts/test-sms.ts",
     "check:invoice-methods": "tsx scripts/check-invoice-methods.ts",
     "check:method-snapshots": "tsx scripts/check-invoice-method-snapshots.ts",
-    "check:muhasebe": "tsx scripts/check-muhasebe-report.ts"
+    "check:muhasebe": "tsx scripts/check-muhasebe-report.ts",
+    "check:ges-modes": "tsx scripts/check-ges-allocation-modes.ts",
+    "compare:meram-m7": "tsx --tsconfig scripts/tsconfig.harness.json scripts/compare-meram-m7.ts"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.2.3",

@@ -37,7 +37,14 @@ export type InvoiceOverrideItemKey =
    * matrahına efektif değeriyle akar; m2/m3'te satırı değiştirir ama BTV'yi
    * ETKİLEMEZ. Metod 1/4 bu anahtarı görmezden gelir.
    */
-  | "yek";
+  | "yek"
+  /**
+   * Metot 7 (Meram) — "YEKDEM Mahsup + GDDK + Mahsuplaşma Farkı" satırının YEKDEM
+   * GDDK bileşeni (TL, KDV öncesi, işaretli). Formülü bilinmiyor; faturadaki
+   * "YEKDEM Mahsup + YEKDEM GDDK" notundan AYLIK elle girilir (yalnız
+   * amountOverride; isExcluded → 0). BTV matrahına girer. Diğer metodlar yok sayar.
+   */
+  | "yekdem_gddk";
 
 /**
  * Kalem payload'ı. Alanlar kaleme göre anlamlıdır:
@@ -89,6 +96,7 @@ const ITEM_KEYS: InvoiceOverrideItemKey[] = [
   "yekdem_mahsup",
   "mahsuplasma",
   "yek",
+  "yekdem_gddk",
 ];
 
 // Caller'lardaki reaktif eşiklerin aynısı (Dashboard/InvoiceDetail/calculateInvoiceToDate).

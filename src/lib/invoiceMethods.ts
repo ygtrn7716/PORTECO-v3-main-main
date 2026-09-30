@@ -7,6 +7,7 @@ import {
   calculateInvoiceMethod2,
   calculateInvoiceMethod3,
   calculateInvoiceMethod5,
+  calculateInvoiceMethod7,
   embedYekdemMahsupIntoEnergy,
   type InvoiceMethodInputs,
   type MethodInvoiceBreakdown,
@@ -32,14 +33,16 @@ export type {
  * bkz. billedInvoiceInputs.ts başındaki not) → admin bağlamında doğrudan sorgu.
  */
 
-export type InvoiceMethodId = 1 | 2 | 3 | 4 | 5 | 6;
+export type InvoiceMethodId = 1 | 2 | 3 | 4 | 5 | 6 | 7;
 export const DEFAULT_INVOICE_METHOD: InvoiceMethodId = 1;
 
-/** Saatlik-net motorundan geçen metodlar (2=Uedaş, 3=Tredaş, 5=İpragaz).
+/** Saatlik-net motorundan geçen metodlar (2=Uedaş, 3=Tredaş, 5=İpragaz, 7=Meram).
  *  Metod 5, Metod 2 kopyasıdır; tek fark BTV matrahına YEK bedelinin girmesi.
+ *  Metod 7 (Meram/MEPAŞ) aynı saatlik-net iskelet; ayrı YEK satırı yok, kendine özgü
+ *  kalemler `breakdown.meram`'da (UI m7 sunumunu o anahtarla kapılar).
  *  ⚠️ Metod 6 (Kepsaş) NET DEĞİLDİR — metod-1 türevidir, buraya eklenmez. */
 export function isNetInvoiceMethod(id: InvoiceMethodId): boolean {
-  return id === 2 || id === 3 || id === 5;
+  return id === 2 || id === 3 || id === 5 || id === 7;
 }
 
 /** Post-total "Önceki Dönem YEKDEM Mahsubu" satırını BASTIRAN metodlar:
@@ -68,7 +71,7 @@ export type ResolveInvoiceMethodsParams =
   | { context: "admin"; userId: string; supabase: SupabaseClient };
 
 export function isInvoiceMethodId(v: unknown): v is InvoiceMethodId {
-  return v === 1 || v === 2 || v === 3 || v === 4 || v === 5 || v === 6;
+  return v === 1 || v === 2 || v === 3 || v === 4 || v === 5 || v === 6 || v === 7;
 }
 
 /** Snapshot/DB'den gelen metod değerini güvenle daraltır.
@@ -209,7 +212,7 @@ export function methodForProvider(
  * Metod dispatcher'ı (Aşama 2B).
  *
  * Metod 1 → değişmemiş calculateInvoice (bit-identik).
- * Metod 2/3/5 → saatlik-net motorları. Bu motorlar `input.methodInputs` (veya
+ * Metod 2/3/5/7 → saatlik-net motorları. Bu motorlar `input.methodInputs` (veya
  * açık `methodInputs` argümanı) olmadan çalışamaz; gelmemişse UYARI basıp
  * Metod 1'e düşülür. Böylece boru hattı henüz bağlanmamış bir yüzey (örn.
  * bir what-if simülasyonu) çökmez, yalnızca eski davranışı sürdürür.
@@ -235,6 +238,17 @@ export function calculateInvoiceForMethod(
         `invoiceMethods: Metod ${methodId} için saatlik-net girdileri (methodInputs) yok — Metod 1 ile hesaplanıyor.`
       );
       return calculateInvoice(input, overrides);
+    }
+    if (methodId === 7) {
+      // Metod 7 girdileri (G_own, trafo kaybı, adj, GDDK) `mi.meram`'da. Yoksa (m7'yi
+      // bilmeyen bir kurucu) sessizce 0'lamak yerine Metod 1'e düşülür.
+      if (!mi.meram) {
+        console.warn(
+          "invoiceMethods: Metod 7 için methodInputs.meram yok — Metod 1 ile hesaplanıyor."
+        );
+        return calculateInvoice(input, overrides);
+      }
+      return calculateInvoiceMethod7(input, overrides, mi);
     }
     return methodId === 2
       ? calculateInvoiceMethod2(input, overrides, mi)

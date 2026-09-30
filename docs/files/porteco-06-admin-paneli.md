@@ -247,8 +247,14 @@ Admin GES üretim verisi yükleme sayfası (~1980 satır; `TableManager` kullanm
 
 `auth.users` tablosuna doğrudan SELECT yapılamadığı için (Postgres-internal şema), bu sayfa `user_integrations` tablosundan kullanıcı listesi türetir; e-posta arama `user_integrations.aril_user` üzerinde çalışır. Kullanıcı+tesis seçildikten sonra iki sekme sunar:
 
-- **Ayarlar sekmesi** — `subscription_settings` formu (`AdminUsersPage.tsx:214` select'i): KBK, terim, tarife, gerilim, güç bedel limiti, trafo, nickname, on_yil + yeni alanlar: **"Yıllık Satış Hakkı (kWh)"** (`satis_hakki`, `:643`), **"Birim Fiyat Manipülasyonu"** (`unit_price_adjustment`, `:661`), **"Lisanslı Satış Üretim Tesisi"** checkbox (`lisansli_satis`, `:688`) ve **üç durumlu `anlik_uretim_kullanimi` select'i** (`:704-713`: boş seçenek → `null`, "Evet" → `true`, "Hayır" → `false`; GES Olmasaydı hesabının arazi GES dalını kontrol eder).
+- **Ayarlar sekmesi** — `subscription_settings` formu (`AdminUsersPage.tsx:214` select'i): KBK, terim, tarife, gerilim, güç bedel limiti, trafo, **"Trafo kaybı (kWh/saat) — Meram"** (`trafo_kaybi_saatlik`; yalnız Metot 7 — dönemin her saatine tüketime eklenir, bu metotta aylık trafo kullanılmaz), nickname, on_yil + yeni alanlar: **"Yıllık Satış Hakkı (kWh)"** (`satis_hakki`, `:643`), **"Birim Fiyat Manipülasyonu"** (`unit_price_adjustment`, `:661`), **"Lisanslı Satış Üretim Tesisi"** checkbox (`lisansli_satis`, `:688`) ve **üç durumlu `anlik_uretim_kullanimi` select'i** (`:704-713`: boş seçenek → `null`, "Evet" → `true`, "Hayır" → `false`; GES Olmasaydı hesabının arazi GES dalını kontrol eder).
 - **YEKDEM sekmesi** — ay bazlı `yekdem_value`, `yekdem_final`, `diger_degerler` ve **"USD/TL Kuru (10 yıl üstü)"** (`usd_kur`, `:869-880`) girişleri; tekil kayıt ve toplu kayıt/refresh sorgularının tümü `usd_kur`'u içerir (`:239,299-356`).
+
+**Fatura Kalem Düzenleme** (`InvoiceOverridesAdmin`, `/dashboard/admin/faturalar`) — Metot 7 (Meram) tesislerinde
+**"YEKDEM GDDK"** kalemi (`invoice_line_overrides.item_key = 'yekdem_gddk'`, yalnız tutar) görünür: faturadaki
+"YEKDEM Mahsup + YEKDEM GDDK" notundaki tutar aylık elle girilir; "YEKDEM Mahsup + GDDK + Mahsuplaşma Farkı"
+satırına eklenir ve BTV matrahına girer. m7'de `mahsuplasma` birim override'ı mahsuplaşma farkını (F = −M × birim)
+yönetir; `yek`, `trafo` kalemleri ve YEKDEM mahsup kartı gizlidir (motor bu override'ları yok sayar).
 
 ### 5.4 SubscriptionYekdemAdmin (`/dashboard/admin/subscription-yekdem`)
 
@@ -262,7 +268,30 @@ GES mahsup **talep birleştirme** yönetimi (`TableManager` kullanmaz). Akış: 
 - Reorder `supabase.rpc("set_ges_mahsup_priorities")` (`TalepBirlestirmeAdmin.tsx:309`; RPC tanımı `20260705_001:72-101`, `unnest ... with ordinality` ile 1..N renumber), silme `remove_ges_mahsup_assignment` RPC (`:341`; `20260706_001` — silme + renumber tek transaction). `20260705_003` iki fonksiyona `set search_path = ''` hardening'i ekler.
 - **Kaynak tesis de öncelik listesine eklenebilir** (`availableFacilities` filtresi yalnızca zaten atanmış tesisleri çıkarır, `TalepBirlestirmeAdmin.tsx:396-400`); listede "Kaynak tesis" chip'iyle işaretlenir (`:577-588`).
 - Yumuşak uyarılar: hedef tesisin kendi GES verişi varsa (`:274-277`) ve lisanslı satış tesisi seçilirse (`:669`). "Önceki ay snapshot'larını sıfırla" aksiyonu (`resetSnapshots`, `:358-394`) tahsis değişikliği sonrası eski snapshot'ların yeniden hesaplanmasını tetikler.
-- Tahsisin fatura hesabına etkisi caller katmanındadır: bkz. [porteco-05-fatura-sayfasi.md](./porteco-05-fatura-sayfasi.md) §7 ve `src/components/utils/gesAllocation.ts` (saatlik şelale: kaynak serno `source_serno ?? linked_serno`, saat başına `alloc = min(kalan, max(0, cn − ownGn))`, artan `excess` yalnızca 1. önceliğin görünümüne eklenir).
+- Tahsisin fatura hesabına etkisi caller katmanındadır: bkz. [porteco-05-fatura-sayfasi.md](./porteco-05-fatura-sayfasi.md) §7 ve `src/components/utils/gesAllocation.ts`. Artan `excess` her modda yalnızca en yüksek önceliğin (`minPriority`) görünümüne eklenir.
+- **Dağıtım yöntemi seçici** (`ges_plants.tahsis_modu`, sağ panelde öncelik listesinin üstünde): GES başına üç mod. Matematik `src/components/utils/gesAllocationModes.ts`.
+
+  **İKİ AYRI MODEL var** — hangisinin geçerli olduğunu `gesAllocation.ts` girdi kurulumunda belirler (`isPoolMode`):
+
+  | | TEK KAYNAK (`sirali`) | HAVUZ (oransal modlar) |
+  |---|---|---|
+  | `src(h)` | GES kaydının kaynak sayacı (`source_serno ?? linked_serno`) | **Σ listedeki TÜM sayaçların `gn_i(h)`'i** |
+  | `kap_i(h)` | `max(0, cn_i(h) − own_gn_i(h))` — alıcı önce kendi verişiyle netleşir | **`cn_i(h)` (HAM)** — verişi havuzda olduğu için düşülmez |
+  | Kaynak listede DEĞİLSE | rolü `"source"` → kendi faturasında `gn = 0` | **havuza katılmaz ve `"source"` rolü ALMAZ** → görünüm `null` |
+
+  - `sirali` — **Sıralı (mevcut sistem)**, varsayılan: öncelik şelalesi, `alloc_i(h) = min(kalan, kap_i(h))`.
+  - `saatlik_oransal` — **Saatlik oransal (Meram mantığı)**: `alloc_i(h) = kap_i(h) × min(1, src(h)/K(h))`.
+  - `toplam_oransal` — **Toplam tüketim oransal (Kayseri mantığı)**: `M = Σ_{src>0} min(src(h), K(h))`, pay tabanı `T_i = Σ_{TÜM saatler} kap_i(h)`; `distributeCapped(M, T, caps = T)` + saatlik yansıtma `alloc_i(h) = kap_i(h) × (A_i/T_i)` **dönemin TÜM saatlerinde**. ⚠️ **Üretim saati sınırı YOK** — Kayseri OSB dağıtımda bunu uygulamıyor (gerçek fatura: `105013200`'ün üretim saatlerindeki çekişi 522 kWh iken 1.297 kWh mahsup almış). Bu yüzden emme sınırı üretim-saati çekişi (eski `S_i`) değil, dönemin tüm çekişidir.
+
+  Havuz modeli iki gerçek faturayla **birebir** doğrulandı (Ağustos 2026, Europe/Istanbul ay penceresi): **Meram / Niğde As Beton** — `3.060,06 / 15.715,88 / 10.014,85`, toplam `28.790,78`, artan `428.781,34` (fixture testi `check:ges-modes` S8); **Kayseri OSB / AYTEKS** — `48.534,66 / 14.009,00 / 1.290,38`, `M 63.834,049`, artan `64.461,419`.
+
+  ⚠️ **Ay penceresi Europe/Istanbul olmalı.** Tüm gerçek yollar `dayjsTR().startOf("month")` kullanır (İstanbul sınırı = `21:00Z`) ve `startIso`/`endIso`'yu **aynı değişkenlerden** hem tüketim fetch'ine hem `getFacilityAllocation`'a geçirir — doğrulandı: `billedInvoiceInputs`, `InvoiceDetail`, `Dashboard` Effect 1/6, `hourlyNetAggregates`, `calculateInvoiceToDate`, `EnergySoldCard`. UTC ayı ile hesaplanırsa 3 saatlik kayma olur (AYTEKS'te `T_107183100` 76.789,08 → 76.721,32, tahsiste ~10 kWh sapma). `toplam_oransal` tahsisi **tüm** saatlere yaydığı için pencere kayarsa sınır saatlerinin tahsisi faturaya girmez; dahası bu kayıp `allocated_ges_kwh`'ta **görünmez** (audit alanı `allocTotal`'ı aynen taşır), yalnız efektif `gn`'de belirir. `check:ges-modes` S9 bunu hem tutarlılık hem kayıp senaryosu olarak assert eder.
+
+  Oransal modlarda **öncelik dağıtımı etkilemez**, yalnız artanın kime yazılacağını belirler. Kaydetme doğrudan `ges_plants` UPDATE'idir (RLS `ges_plants_admin_all`) + `clearGesAllocationCache()`. Mod değişimi **kesilmiş** faturaları değiştirmez; geçmişe yansıtmak için `resetSnapshots` gerekir.
+- **Çift sayım koruması:** bir tesis (`user_id`, `subscription_serno`) yalnızca **TEK** GES listesinde olabilir. Gerekçe her modda aynı: **zincirli tahsis defteri hiç kodlanmadı** — `gesAllocation.ts` her GES'i bağımsız hesaplar, ortak "kalan çekiş" defteri yoktur; aynı serno iki listede olursa her iki GES aynı boş kapasiteyi görür ve aynı kWh iki kez tahsis edilir. Oransal (havuz) modda ek olarak tesisin verişi iki havuza katılır.
+  - **UI katmanı:** `addAssignment` bunu engeller (`TalepBirlestirmeAdmin.tsx`).
+  - **DB katmanı:** `uq_gma_user_serno unique (user_id, subscription_serno)` — `20260705_001`'de tanımlıydı, sonra canlıda **elle kaldırıldı** (repo güncellenmediği için şema drift'i oluştu). `20260930_001_restore_uq_gma_user_serno.sql` ile **geri konur**; uygulama öncesi salt-SELECT kontrolü yapıldı (2026-09-30: 15 atama, 15 distinct → çakışma yok).
+- **`FacilityAllocationView.ownGnTotal`**: tesisin KENDİ sayacının dönem verişi (ham `Σgn`), her rolde dolu. Havuz modunda bu miktar havuza katılmıştır. Hiçbir tahsis/fatura hesabına GİRMEZ — banner metninde gösterilir; Meram ve Kayseri OSB dağıtım/veriş bedeli metotları (sonraki işler) bunu kullanacak.
 
 ### 5.6 DataHealthAdmin (`/dashboard/admin/veri-sagligi`)
 

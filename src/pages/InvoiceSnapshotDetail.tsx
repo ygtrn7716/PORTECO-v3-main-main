@@ -18,6 +18,13 @@ import {
   type InvoiceOverrides,
 } from "@/components/utils/invoiceOverrides";
 import GesUretimSatisiCard from "@/components/dashboard/shared/GesUretimSatisiCard";
+import {
+  MERAM_BTV_TEXT,
+  MeramDagitimNote,
+  MeramInvoiceNotes,
+  MeramSatir2Row,
+  MeramYekdemBadge,
+} from "@/components/dashboard/shared/MeramInvoiceParts";
 import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
 import { resolveGesSatisDagitimRate } from "@/lib/ges/gesSatisDagitimRate";
 
@@ -151,10 +158,15 @@ const yekdemCell = useMemo(() => {
   // m5 (İpragaz): m2 kopyası, tek fark BTV matrahına YEK'in girmesi. Damgadan okunur;
   // w_pos'suz eski satır m1'e düştüyse (snapIsNetMethod=false) m1 metni gösterilir.
   const snapIsM5 = snapIsNetMethod && Number(row?.invoice_method) === 5;
+  // m5 birleşik (İpragaz 2026-08+): replay motoru YEK'i enerji satırına gömdü
+  // (dönem saklı damgadan çözülür). YEK satırı gizli, fiyat energyUnitPriceShown.
+  const snapYekGomulu = liveBreakdown?.yekEnerjiyeGomulu === true;
   // Metod 6 (Kepsaş): net değil; damgadan okunur. Replay'de liveBreakdown
   // gömülü breakdown'dır (embeddedYekdemAdderTL + energyUnitPriceShown set).
   const snapIsM6 = Number(row?.invoice_method) === 6;
   const snapEmbeddedAdder = Number(liveBreakdown?.embeddedYekdemAdderTL ?? 0);
+  // Metod 7 (Meram): replay motoru m7 çıktısı ürettiyse (m7 kolonları seçili + damga 7).
+  const snapMeram = liveBreakdown?.meram;
 
   // Efektif (override'lı) enerji birim fiyatı — kart + satır açıklamaları.
   const effUnitPriceEnergyDisplay = useMemo(() => {
@@ -327,10 +339,18 @@ const yekdemCell = useMemo(() => {
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Enerji Bedeli</td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {snapIsNetMethod ? (
+                        {snapYekGomulu ? (
+                          // m5 birleşik: fiyat = (PTF + YEKDEM) × KBK, YEK satırı yok.
+                          <>
+                            {fmtUnit(liveBreakdown?.energyUnitPriceShown ?? 0)} TL/kWh ×{" "}
+                            {fmtKwh(liveBreakdown?.netEnergyKwh ?? 0)} kWh
+                            <span className="text-neutral-400"> (YEK dahil)</span>
+                          </>
+                        ) : snapIsNetMethod ? (
                           <>
                             {fmtUnit(liveBreakdown?.energyUnitPriceApplied ?? 0)} TL/kWh ×{" "}
                             {fmtKwh(liveBreakdown?.netEnergyKwh ?? 0)} kWh
+                            {snapMeram && <MeramYekdemBadge meram={snapMeram} />}
                           </>
                         ) : snapIsM6 ? (
                           // Metod 6 (Kepsaş): birim fiyat = (enerji + gömülü YEKDEM mahsubu) / brüt kWh.
@@ -354,7 +374,7 @@ const yekdemCell = useMemo(() => {
                   )}
 
                   {/* Metod 2/5: YEK Bedeli · Metod 3: Tahmini YEKDEM — hepsinin tabanı NET */}
-                  {snapIsNetMethod && !excludedItems.has("yek") && (
+                  {snapIsNetMethod && !snapYekGomulu && !snapMeram && !excludedItems.has("yek") && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">{snapIsM3 ? "Tahmini YEKDEM" : "YEK Bedeli"}</td>
                       <td className="py-2 pr-4 text-neutral-600">Tahmini YEKDEM × KBK</td>
@@ -376,11 +396,15 @@ const yekdemCell = useMemo(() => {
                     </tr>
                   )}
 
+                  {/* Metod 7 (Meram): YEKDEM Mahsup + GDDK + Mahsuplaşma Farkı */}
+                  {snapMeram && <MeramSatir2Row meram={snapMeram} />}
+
                   {!excludedItems.has("dagitim") && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Dağıtım Bedeli</td>
                       <td className="py-2 pr-4 text-neutral-600">
                         {fmtUnit(liveBreakdown?.effectiveDistributionUnitPrice ?? row.effective_distribution_unit_price ?? row.unit_price_distribution)} TL/kWh × {fmtKwh(liveBreakdown?.distributionChargeKwh ?? (Number(row.total_consumption_kwh ?? 0) - Number(row.veris_kwh ?? 0)))} kWh
+                        {snapMeram && <MeramDagitimNote meram={snapMeram} />}
                       </td>
                       <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.distributionCharge ?? row.distribution_charge)}</td>
                     </tr>
@@ -410,11 +434,15 @@ const yekdemCell = useMemo(() => {
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">BTV (%{((Number(row.btv_rate ?? 0)) * 100).toFixed(2)})</td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {snapIsNetMethod
+                        {snapMeram
+                          ? MERAM_BTV_TEXT
+                          : snapIsNetMethod
                           ? snapIsM3
                             ? "(Enerji + Tahmini YEKDEM − mahsuplaşma kredisi) × BTV oranı"
                             : snapIsM5
-                              ? "(Enerji bedeli + YEK bedeli) × BTV oranı"
+                              ? snapYekGomulu
+                                ? "Enerji bedeli (YEK dahil) × BTV oranı"
+                                : "(Enerji bedeli + YEK bedeli) × BTV oranı"
                               : "Enerji bedeli × BTV oranı"
                           : "Net enerji bedeli × BTV oranı"}
                       </td>
@@ -452,7 +480,7 @@ const yekdemCell = useMemo(() => {
                     </tr>
                   )}
 
-                  {Number(row.trafo_degeri ?? 0) > 0 && !excludedItems.has("trafo") && (
+                  {Number(row.trafo_degeri ?? 0) > 0 && !snapMeram && !excludedItems.has("trafo") && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Trafo Bedeli</td>
                       <td className="py-2 pr-4 text-neutral-600">
@@ -538,6 +566,9 @@ const yekdemCell = useMemo(() => {
                 </tbody>
               </table>
             </div>
+            {snapMeram && (
+              <MeramInvoiceNotes meram={snapMeram} netKwh={liveBreakdown?.netEnergyKwh ?? 0} />
+            )}
           </div>
 
           {/* GES Üretim Satışı — fazla üretim satışı, faturaya dahil DEĞİL */}

@@ -14,7 +14,10 @@ import {
   type InvoiceMethodId,
 } from "@/lib/invoiceMethods";
 import { assembleMethodInputs } from "@/components/utils/hourlyNetAggregates";
-import type { InvoiceMethodInputs } from "@/components/utils/calculateInvoiceNetMethods";
+import {
+  isIpragazYekBirlesikPeriod,
+  type InvoiceMethodInputs,
+} from "@/components/utils/calculateInvoiceNetMethods";
 import {
   fetchInvoiceOverrides,
   applyReactiveValueOverrides,
@@ -22,6 +25,10 @@ import {
   resolveUnitPriceOverride,
 } from "@/components/utils/invoiceOverrides";
 import { fetchAllConsumption, fetchAllPtf } from "@/lib/paginatedFetch";
+import {
+  getFacilityAllocation,
+  applyAllocationToHourlyRows,
+} from "@/components/utils/gesAllocation";
 
 type TariffRow = {
   dagitim_bedeli: number | null;
@@ -422,6 +429,38 @@ export async function computeMonthInvoiceToDate(params: {
     sumPtfWeighted += cn * ptf;
   }
 
+  // ── Talep Birleştirme tahsisi (cari ay) ───────────────────────────────────
+  // billedInvoiceInputs.ts'teki desenin aynısı: yalnız totalGn/net değerleri
+  // değişir; totalConsumptionKwh/Ri/Rc'ye DOKUNULMAZ (reaktif yüzde paydası ham).
+  //
+  // Aralık, yukarıdaki tüketim fetch'iyle BİREBİR aynı olmalı ([ay başı, cutoff]
+  // inclusive): getFacilityAllocation'ın cache anahtarı endInclusive içeriyor,
+  // farklı aralık ikinci bir hesap turu ve tutarsız tahsis demek olurdu.
+  //
+  // excludeGesMahsup'ta tahsis UYGULANMAZ: o modda veriş zaten 0 kabul ediliyor
+  // (aşağıda productionForCalc=0), tahsis uygulanırsa net değerler tutarsız kalır.
+  //
+  // NOT (bilinen sapma): metod 2/3/5 yolu agregalarını assembleMethodInputs →
+  // loadHourlyNetAggregates üzerinden TAM AY aralığıyla alır; bu blok ise kısmi ay
+  // kullanır. toplam_oransal modunda pay tabanı (T_i) iki pencerede farklı
+  // olduğundan aynı tesiste m1 ve m2/3/5 cari-ay tahsisi bir miktar sapabilir.
+  if (!excludeGesMahsup) {
+    const allocView = await getFacilityAllocation({
+      supabase,
+      userId: uid,
+      subscriptionSerno: subscriptionSerNo,
+      startIso: monthStartIso,
+      endIso: cutoffIso,
+      endInclusive: true,
+    });
+    if (allocView) {
+      const eff = applyAllocationToHourlyRows(cons.data ?? [], allocView);
+      totalGn = eff.totalGn;
+      netPositiveDrawKwh = eff.netPositiveDrawKwh;
+      netExcessFeedKwh = eff.netExcessFeedKwh;
+    }
+  }
+
   if (!(billableKwh > 0)) return null;
 
   const monthlyPTF = sumPtfWeighted / billableKwh; // tüketim ağırlıklı ortalama
@@ -613,11 +652,21 @@ export async function computeMonthInvoiceToDate(params: {
       subscriptionSerno: subscriptionSerNo,
       periodYear: year,
       periodMonth: month,
+      invoiceMethodId,
       kbk,
       tahminiYekdem: monthlyYekdem,
     });
     if (mi) {
       const f = projectionFactor;
+      // Metot 7: kWh büyüklükleri (G_own, trafo kaybı) da f ile ölçeklenir; GES
+      // mahsubu hariç tutulunca kendi veriş de yok sayılır (dağıtım D×C tam).
+      const meram = mi.meram
+        ? {
+            ...mi.meram,
+            ownGnTotal: excludeGesMahsup ? 0 : mi.meram.ownGnTotal * f,
+            trafoKaybiKwh: mi.meram.trafoKaybiKwh * f,
+          }
+        : undefined;
       methodInputs = excludeGesMahsup
         ? { ...mi, sumCn: mi.sumCn * f, sumGn: 0, sumPos: mi.sumCn * f, sumMahsup: 0, sumExcess: 0 }
         : {
@@ -628,6 +677,7 @@ export async function computeMonthInvoiceToDate(params: {
             sumMahsup: mi.sumMahsup * f,
             sumExcess: mi.sumExcess * f,
           };
+      if (meram) methodInputs = { ...methodInputs, meram };
     }
   }
 
@@ -657,6 +707,9 @@ export async function computeMonthInvoiceToDate(params: {
     // (dönem = projeksiyonun hedef ayı; vhs_kayseri kapsam dışı).
     applyVerisMahsupPerakendeCap:
       isM1MahsupCapPeriod(year, month) && provider !== "vhs_kayseri",
+    // İpragaz 2026-08+: YEK bedeli enerji satırına gömülü (yalnız m5 okur).
+    ipragazYekBirlesik:
+      invoiceMethodId === 5 && isIpragazYekBirlesikPeriod(year, month),
   }, lineOverrides);
 
   // YEKDEM mahsup: M-1 (tam ay)  — InvoiceDetail ile aynı mantık

@@ -48,6 +48,7 @@ const ITEM_LABELS: Record<InvoiceOverrideItemKey, string> = {
   yekdem_mahsup: "YEKDEM Mahsubu",
   mahsuplasma: "Mahsuplaşma Fiyatı (boş = otomatik: perakende − (mahsup PTF + YEKDEM) × KBK)",
   yek: "YEK Bedeli",
+  yekdem_gddk: "YEKDEM GDDK (Meram — tutar, faturadaki \"YEKDEM Mahsup + YEKDEM GDDK\" notu)",
 };
 
 /**
@@ -57,7 +58,7 @@ const ITEM_LABELS: Record<InvoiceOverrideItemKey, string> = {
  * görünürlük guard'ı, persist) onu ayrıca ele alır.
  */
 const ITEM_ORDER: InvoiceOverrideItemKey[] = [
-  "enerji", "yek", "trafo", "dagitim", "btv", "guc", "reaktif", "mahsuplasma",
+  "enerji", "yek", "trafo", "dagitim", "btv", "guc", "reaktif", "mahsuplasma", "yekdem_gddk",
 ];
 
 /** Yalnız enerji/dagitim/mahsuplasma/yek kaleminde birim fiyat override'ı anlamlı.
@@ -132,6 +133,7 @@ const emptyDraft = (): Draft => ({
   yekdem_mahsup: emptyRow(),
   mahsuplasma: emptyRow(),
   yek: emptyRow(),
+  yekdem_gddk: emptyRow(),
 });
 
 /** DB'den gelen override'ları form taslağına çevirir. */
@@ -426,7 +428,15 @@ export default function InvoiceOverridesAdmin() {
         setHasSnapshot(!!snap);
 
         if (res.ok) {
-          setInputs(res.inputs);
+          // Metod 7: GDDK girdiye DB override'ından da taşınır (override almayan
+          // tüketiciler için). Bu sayfada TEK kaynak taslak olmalı — aksi hâlde
+          // taslakta silinen GDDK girdideki eski değere düşerdi. Doğal = GDDK'sız.
+          const mi = res.inputs.methodInputs;
+          setInputs(
+            mi?.meram
+              ? { ...res.inputs, methodInputs: { ...mi, meram: { ...mi.meram, gddk: null } } }
+              : res.inputs
+          );
           setNoDataReason(null);
         } else {
           setInputs(null);
@@ -480,15 +490,19 @@ export default function InvoiceOverridesAdmin() {
   const visibleItems = useMemo<InvoiceOverrideItemKey[]>(() => {
     if (!selectedFacility) return [];
     const trafo = Number(selectedFacility.trafo_degeri ?? 0);
+    const m7 = inputs?.invoiceMethodId === 7;
     return ITEM_ORDER.filter((key) => {
-      if (key === "trafo") return trafo > 0;
+      // Metod 7 (Meram): aylık trafo_degeri kullanılmaz (saatlik t tüketimde).
+      if (key === "trafo") return trafo > 0 && !m7;
       if (key === "dagitim") return selectedFacility.provider !== "vhs_kayseri";
       if (key === "guc") return selectedFacility.terim === "cift_terim";
-      // Muhtelif-2 mahsuplaşma fiyatı yalnız Metod 3 (Tredaş) faturasında var.
-      if (key === "mahsuplasma") return inputs?.invoiceMethodId === 3;
-      // YEK Bedeli satırı yalnız net metod (2/3/5) faturalarında var.
+      // Mahsuplaşma birimi: m3 Muhtelif-2 kredisi · m7 mahsuplaşma farkı (F = −M × birim).
+      if (key === "mahsuplasma") return inputs?.invoiceMethodId === 3 || m7;
+      // YEK Bedeli satırı yalnız net metod (2/3/5) faturalarında var; m7'de YEKDEM enerji fiyatında.
       if (key === "yek")
-        return inputs != null && isNetInvoiceMethod(inputs.invoiceMethodId);
+        return inputs != null && isNetInvoiceMethod(inputs.invoiceMethodId) && !m7;
+      // YEKDEM GDDK yalnız Metod 7 (Meram) faturasında.
+      if (key === "yekdem_gddk") return m7;
       return true;
     });
   }, [selectedFacility, inputs]);
@@ -520,6 +534,8 @@ export default function InvoiceOverridesAdmin() {
   // Manuel panel çalışır (yekdem_mahsup override'ı) ama önizleme gömülü gösterir.
   const isEmbedded =
     inputs != null && isEmbeddedYekdemMethod(inputs.invoiceMethodId);
+  // Metod 7 (Meram): sonraki ay YEKDEM mahsubu yok → manuel mahsup kartı gizli.
+  const isMeram = inputs?.invoiceMethodId === 7;
 
   const showVerisWarning =
     draft.enerji.isExcluded && (naturalResult?.breakdown.verisMahsupKwh ?? 0) > 0;
@@ -692,12 +708,24 @@ export default function InvoiceOverridesAdmin() {
     // Metod 2/3/5 kalemleri (metod 1 önizlemesi değişmez).
     const mId = inputs?.invoiceMethodId;
     if (isNetMethod) {
-      rows.push({
-        label: mId === 3 ? "Tahmini YEKDEM" : "YEK Bedeli",
-        natural: nb.yekTahminiCharge ?? 0,
-        edited: eb.yekTahminiCharge ?? 0,
-        excluded: excluded.has("yek"),
-      });
+      // m5 birleşik (İpragaz 2026-08+): YEK enerji satırına gömülü → ayrı satır yok
+      // (Enerji Bedeli satırı YEK dahil tutarı gösterir; 'yek' override gömülü kısmı yönetir).
+      // m7 (Meram): YEKDEM enerji birim fiyatında → YEK satırı yok; Satır 2 ayrı.
+      if (nb.meram || eb.meram) {
+        rows.push({
+          label: "YEKDEM Mahsup + GDDK + Mahsuplaşma Farkı",
+          natural: nb.meram?.satir2 ?? 0,
+          edited: eb.meram?.satir2 ?? 0,
+          excluded: false,
+        });
+      } else if (!nb.yekEnerjiyeGomulu) {
+        rows.push({
+          label: mId === 3 ? "Tahmini YEKDEM" : "YEK Bedeli",
+          natural: nb.yekTahminiCharge ?? 0,
+          edited: eb.yekTahminiCharge ?? 0,
+          excluded: excluded.has("yek"),
+        });
+      }
       if ((nb.yekFarkiCharge ?? 0) !== 0 || (eb.yekFarkiCharge ?? 0) !== 0) {
         rows.push({
           label: mId === 3 ? "Önceki YEKDEM Mahsup" : "YEK Farkı",
@@ -708,7 +736,7 @@ export default function InvoiceOverridesAdmin() {
         });
       }
     }
-    if (inputs && inputs.trafoDegeri > 0) {
+    if (inputs && inputs.trafoDegeri > 0 && !nb.meram) {
       rows.push({ label: "Trafo Kaybı", natural: nb.trafoCharge, edited: eb.trafoCharge, excluded: excluded.has("trafo") });
     }
     if (inputs && !inputs.isKayseriOsb) {
@@ -990,6 +1018,10 @@ export default function InvoiceOverridesAdmin() {
                             ? nb.energyCharge
                             : key === "yek"
                               ? nb.yekTahminiCharge ?? 0
+                              : key === "yekdem_gddk"
+                                ? nb.meram?.gddk ?? 0
+                              : key === "mahsuplasma" && nb.meram
+                                ? nb.meram.mahsuplasmaFarki
                               : key === "trafo"
                                 ? nb.trafoCharge
                                 : key === "dagitim"
@@ -1014,6 +1046,19 @@ export default function InvoiceOverridesAdmin() {
                               <div className="mt-1 text-[10px] text-neutral-400 max-w-[14rem]">
                                 Birim fiyat TL/kWh (doğal: tahmini YEKDEM × KBK). Metod 5'te BTV
                                 matrahına efektif değeriyle girer; metod 2/3'te BTV'yi etkilemez.
+                              </div>
+                            )}
+                            {key === "yekdem_gddk" && (
+                              <div className="mt-1 text-[10px] text-neutral-400 max-w-[14rem]">
+                                Aylık elle girilir (formülü bilinmiyor): faturadaki "YEKDEM Mahsup + YEKDEM
+                                GDDK" notundaki tutar, işaretli. Satır 2'ye (mahsuplaşma farkıyla) eklenir,
+                                BTV matrahına girer.
+                              </div>
+                            )}
+                            {key === "mahsuplasma" && isMeram && (
+                              <div className="mt-1 text-[10px] text-neutral-400 max-w-[14rem]">
+                                Metod 7: mahsuplaşma farkı F = −M × birim (doğal birim: perakende − (mahsup PTF
+                                + YEKDEM) × KBK).
                               </div>
                             )}
                           </td>
@@ -1130,7 +1175,9 @@ export default function InvoiceOverridesAdmin() {
                 </div>
               )}
 
-              {/* YEKDEM Mahsubu (Manuel) — kalem DEĞİL, ayrı kart */}
+              {/* YEKDEM Mahsubu (Manuel) — kalem DEĞİL, ayrı kart. Metod 7'de (Meram)
+                  sonraki ay YEKDEM mahsubu yok → kart gizli (motor override'ı yok sayar). */}
+              {!isMeram && (
               <div className="mt-4 rounded-xl border border-neutral-200 bg-neutral-50 p-3">
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-xs font-medium text-neutral-700">
@@ -1281,6 +1328,7 @@ export default function InvoiceOverridesAdmin() {
                   </>
                 )}
               </div>
+              )}
 
               {/* Önizleme */}
               <div className="mt-5">

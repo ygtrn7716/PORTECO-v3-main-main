@@ -25,7 +25,10 @@ import {
   resolveInvoiceMethods,
 } from "@/lib/invoiceMethods";
 import { assembleMethodInputs } from "@/components/utils/hourlyNetAggregates";
-import type { InvoiceMethodInputs } from "@/components/utils/calculateInvoiceNetMethods";
+import {
+  isIpragazYekBirlesikPeriod,
+  type InvoiceMethodInputs,
+} from "@/components/utils/calculateInvoiceNetMethods";
 import {
   fetchInvoiceOverrides,
   fetchAllInvoiceOverridesForUser,
@@ -1070,6 +1073,7 @@ export default function Dashboard() {
             subscriptionSerno: selectedSub,
             periodYear,
             periodMonth,
+            invoiceMethodId,
             kbk: monthlyKbk,
             tahminiYekdem: monthlyYekdem,
           });
@@ -1101,6 +1105,9 @@ export default function Dashboard() {
           applyVerisMahsupPerakendeCap:
             isM1MahsupCapPeriod(periodYear, periodMonth) &&
             subRow?.provider !== "vhs_kayseri",
+          // İpragaz 2026-08+: YEK bedeli enerji satırına gömülü (yalnız m5 okur).
+          ipragazYekBirlesik:
+            invoiceMethodId === 5 && isIpragazYekBirlesikPeriod(periodYear, periodMonth),
         }, lineOverrides);
 
         // ✅ YEKDEM mahsup (M-1)
@@ -1516,6 +1523,7 @@ export default function Dashboard() {
               subscriptionSerno: serno,
               periodYear: pYear,
               periodMonth: pMonth,
+              invoiceMethodId: subInvoiceMethodId,
               kbk: subKbk,
               tahminiYekdem: subYekdem,
             });
@@ -1547,6 +1555,9 @@ export default function Dashboard() {
             applyVerisMahsupPerakendeCap:
               isM1MahsupCapPeriod(pYear, pMonth) &&
               subRow?.provider !== "vhs_kayseri",
+            // İpragaz 2026-08+: YEK bedeli enerji satırına gömülü (yalnız m5 okur).
+            ipragazYekBirlesik:
+              subInvoiceMethodId === 5 && isIpragazYekBirlesikPeriod(pYear, pMonth),
           }, subLineOverrides);
 
           // YEKDEM Mahsup (M-1) — Lisanslı Satış tesisleri için atlanır.

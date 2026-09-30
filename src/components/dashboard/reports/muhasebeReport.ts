@@ -314,8 +314,13 @@ export function buildMuhasebeReport(p: MuhasebePayload): MuhasebeReport {
     const netKwh = b.netEnergyKwh; // sumPos
     const mahsupKwh = b.verisMahsupKwh; // sumMahsup
     const grossKwh = netKwh + mahsupKwh; // sumCn (brüt çekiş)
-    const eUP = netKwh > 0 ? b.energyCharge / netKwh : 0; // fatura net çekiş birim fiyatı
-    const yekTahminiCharge = b.yekTahminiCharge ?? 0;
+    // m5 birleşik (İpragaz 2026-08+): motor YEK'i enerji satırına katladı
+    // (yekTahminiCharge=0, energyCharge YEK dahil, yekGomuluTutar = katlanan). Rapor
+    // eski enerji/YEK ayrışımıyla kurulur → geri ayır. Bayrak yokken 0 → bit-identik.
+    const yekGomulu = b.yekGomuluTutar ?? 0;
+    const energyChargeBare = b.energyCharge - yekGomulu; // çıplak enerji (YEK hariç)
+    const eUP = netKwh > 0 ? energyChargeBare / netKwh : 0; // fatura net çekiş birim fiyatı
+    const yekTahminiCharge = (b.yekTahminiCharge ?? 0) + yekGomulu;
     const yekFarkiCharge = b.yekFarkiCharge ?? 0;
     const yekUP = netKwh > 0 ? yekTahminiCharge / netKwh : 0; // fatura YEK birim fiyatı
     const trafoKwh = eUP > 0 ? b.trafoCharge / eUP : 0;
@@ -339,7 +344,7 @@ export function buildMuhasebeReport(p: MuhasebePayload): MuhasebeReport {
 
     // Tek kaynak mahsup bileşenleri (BİR KEZ hesaplanır)
     const grossEnergy = grossKwh * grossUP;
-    const enerjiMahsupTutar = grossEnergy - b.energyCharge; // residual — mahsup saatlerinin gerçek değeri
+    const enerjiMahsupTutar = grossEnergy - energyChargeBare; // residual — mahsup saatlerinin gerçek değeri
     const yekMahsupTutar = mahsupKwh * yekUP; // YEKDEM saat bağımsız → grossup değişmez
     // m2 BTV matrahı yalnız enerji; m5 matrahında YEK de var → mahsup etkisi YEK'i içerir.
     // Çapa inşaen korunur: btvMahsupsuz − btvMahsupEffect ≡ b.btvCharge.
@@ -372,7 +377,7 @@ export function buildMuhasebeReport(p: MuhasebePayload): MuhasebeReport {
     // Fatura köprüsü: faturanın gerçek (net) enerji/YEK kalemleri — muhasebeci Excel'i
     // fatura sayfasıyla eşleştirebilsin. "Bilgi" sınıfı → S2'ye ve kapanışa GİRMEZ.
     blok2Tail = [
-      item("Bilgi", "Fatura Enerji Bedeli (net, mahsup sonrası)", "Fatura sayfasındaki enerji kalemi", netKwh, "kWh", eUP, b.energyCharge, "Fatura sayfasındaki Enerji Bedeli kalemidir. BLOK 1 brüt tutarından BLOK 2 enerji mahsubu düşüldüğünde bu değere ulaşılır."),
+      item("Bilgi", "Fatura Enerji Bedeli (net, mahsup sonrası)", "Fatura sayfasındaki enerji kalemi", netKwh, "kWh", eUP, energyChargeBare, "Fatura sayfasındaki Enerji Bedeli kalemidir. BLOK 1 brüt tutarından BLOK 2 enerji mahsubu düşüldüğünde bu değere ulaşılır."),
       item("Bilgi", "Fatura YEK Bedeli (net, mahsup sonrası)", "Fatura sayfasındaki YEK kalemi", netKwh, "kWh", yekUP, yekTahminiCharge, "Fatura sayfasındaki YEK Bedeli kalemidir. BLOK 1 brüt tutarından BLOK 2 YEK mahsubu düşüldüğünde bu değere ulaşılır."),
     ];
   } else {

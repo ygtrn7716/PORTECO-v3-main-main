@@ -165,6 +165,7 @@ totalInvoice      = subtotalBeforeVat + vatCharge
 | 4 | PTF map (`fetchPtfMapToDate`) | `ay başı → cutoff` arası saatlik PTF'ler okunur; kolon `ptf_tl_kwh` yoksa `ptf_tl_mwh / 1000` fallback'i |
 | 5 | Tüketim (`fetchAllConsumption`) | `ts, cn, ri, rc, gn` paginated çekilir, `endInclusive=true` |
 | 6 | PTF eşleşmeyen saatler | `skippedKwh`'a düşer; eşleşenler `billableKwh` ve `sumPtfWeighted`'e eklenir |
+| 6b | **Talep Birleştirme tahsisi** | `getFacilityAllocation` + `applyAllocationToHourlyRows` ile `totalGn`/`netPositiveDrawKwh`/`netExcessFeedKwh` efektif (tahsisli) değerlerle değiştirilir; `totalConsumptionKwh`/`Ri`/`Rc`'ye DOKUNULMAZ. Aralık tüketim fetch'iyle birebir aynı: `[ay başı, cutoff]`, `endInclusive=true`. `excludeGesMahsup=true` iken UYGULANMAZ (veriş zaten 0 kabul edilir). ⚠️ **Bilinen sapma:** metod 2/3/5 agregaları `assembleMethodInputs → loadHourlyNetAggregates` üzerinden **TAM AY** aralığıyla gelir, bu blok **kısmi ay** kullanır; `toplam_oransal` modunda pay tabanı (`T_i`) iki pencerede farklı olduğundan m1 ile m2/3/5 cari-ay tahsisi bir miktar sapabilir |
 | 7 | Ortalama PTF | `monthlyPTF = sumPtfWeighted / billableKwh` (tüketim ağırlıklı) |
 | 8 | Tesis ayarları | `subscription_settings`'tan `kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis, unit_price_adjustment` (`calculateInvoiceToDate.ts:403`) |
 | 9 | Multiplier + BTV | `owner_subscriptions.multiplier`, `btv_enabled` (`uid` filtresi başarısızsa fallback olarak yalnızca serno) |
@@ -273,6 +274,35 @@ Veri akışı: `Dashboard.tsx` Effect 5 ile **birebir aynı pipeline**. Tek fark
 
 - **`GesUretimSatisiCard`** (`src/components/dashboard/shared/GesUretimSatisiCard.tsx`): "Fatura Kalemleri" altında ayrı bir kart; `calculateGesUretimSatisi(...)` (`src/lib/ges/gesUretimSatisi.ts`) sonucunu alır ve brüt gelir / dağıtım kesintisi / net tutarı gösterir (`InvoiceDetail.tsx:1547-1553`). **Bu tutar fatura toplamına girmez** — müşterinin devlete kendi kestiği faturadır. Brüt: USD modunda `satisKwh × 0.133 × usd_kur`, aksi halde `satisKwh × perakende_enerji_bedeli`. Kesinti oranı `lisansli_satis`'a göre `dagitim_uretici_1/2`; snapshot görünümünde `ges_satis_dagitim_bedeli` donmuş oranı, yoksa `resolveGesSatisDagitimRate` canlı fallback'i kullanılır.
 - **`GesOlmasaydiPanel`** (`src/components/dashboard/GesOlmasaydiPanel.tsx`): `calculateGesOlmasaydi(...)` (`InvoiceDetail.tsx:1029`) sonucunu 4 kartla sunar — **1) Mevcut Faturanız** (pass-through), **2) Satılan Enerji** (satış kWh > 0 ise), **3) GES Olmasaydı Faturanız** (karşı-olgu), **4) GES Tasarrufu** (= Kart 3 − Kart 1 + Kart 2). Hesap dört ayrı dala ayrılır: alıcı (receiver), lisanslı satış, arazi GES (`anlik_uretim_kullanimi === false`) ve öz tüketim (behind-the-meter; saatlik + günlük fallback). `subscription_settings.anlik_uretim_kullanimi` **nullable boolean**'dır (üç durum): `null`/`true` → öz tüketim varsayımı, `false` → arazi GES dalı (`20260710_001_add_anlik_uretim_kullanimi.sql`).
+### 7.2 Metot 7 — Meram (MEPAŞ)
+
+Niğde As Beton Ağustos 2026 MEPAŞ faturalarıyla (10126953 / 10128583 / 9062757) kuruşuna çözülen
+fatura metodu. Saatlik-net ailesindedir (`isNetInvoiceMethod` = 2|3|5|7); motor
+`calculateInvoiceNetMethods.ts` iskeletini paylaşır (`calculateInvoiceMethod7`), m7'ye özgü
+kalemler sparse `breakdown.meram` nesnesindedir — UI m7 sunumunu bu anahtarla kapılar.
+
+Saatlik (Europe/Istanbul dönemi): `cons(h) = cn(h) + t` (t = `subscription_settings.trafo_kaybi_saatlik`,
+dönemin her saatine, satırı eksik saatler dahil), `eff(h)` = tahsis varsa havuz tahsisi, yoksa kendi gn,
+`mahsup(h) = min(cons, eff)`, `net(h) = cons − mahsup`. Toplamlar C / M / N; `wNet = wPos`,
+`wM = wMahsup` (hourlyNetAggregates — PTF tam kapsamada tanım birebir), `G_own` = tesisin kendi ham verişi.
+
+| Kalem | Formül |
+| --- | --- |
+| Enerji | `N × U`, `U = (wNet + Y) × KBK + unit_price_adjustment`; Y = aynı ayın `yekdem_final`'ı, yoksa `yekdem_value` ("tahmini YEKDEM" etiketi) |
+| YEKDEM Mahsup + GDDK + Mahsuplaşma Farkı | `F + GDDK`, `F = M × ((wM + Y) × KBK − perakende)`; GDDK = override `yekdem_gddk` (aylık elle, yoksa 0) |
+| Dağıtım | `G_own > C ? D × C / 2 : D × C − D × G_own / 2` (havuz tahsisi dağıtıma girmez) |
+| Reaktif / Güç | Metot 1 mantığı |
+| BTV (ETV) | `oran × (Enerji + Satır 2)` |
+| KDV | `oran × (Enerji + Satır 2 + Dağıtım + Reaktif + Güç + BTV)` |
+
+Sonraki ay YEKDEM mahsubu (`has_yekdem_mahsup`) ve aylık `trafo_degeri` bu metotta yoktur.
+Lisanslı satış tesisi dispatcher'da Metot 1'e yönlenir; `methodInputs.meram` olmadan m7 çağrısı
+uyarı + Metot 1'e düşer. Trafo kaybı ön-dönüşümü `src/components/utils/trafoKaybi.ts`'tedir
+(tahsis serisine ve tesisin saatlik satırlarına; t yoksa girdi aynen döner). Girdiler
+`assembleMethodInputs({ invoiceMethodId: 7 })` ile kurulur (t, adj, Y, GDDK tek noktada).
+Snapshot replay alanları için bkz. §12 (`20260930_003`). GES Olmasaydı karşı-olgusu aynı m7 motoruyla:
+mahsup 0, G_own 0, t / Y / GDDK iki dünyada aynı. Kabul testi: `npm run check:invoice-methods` (F12);
+canlı salt-okunur karşılaştırma: `npm run compare:meram-m7 -- 2026-08`.
 
 ## 8. InvoiceHistory Sayfası
 
@@ -332,6 +362,7 @@ Dosya adı tipik olarak `<tesis>_<ay>_<yıl>.xlsx` formatındadır (örn. `12345
 | `20260603_002_add_ges_satis_dagitim_bedeli.sql` | 2026-06-03 | `ges_satis_dagitim_bedeli` — donmuş dağıtım kesinti oranı |
 | `20260617_003_add_hourly_net_to_snapshots.sql` | 2026-06-17 | `net_positive_draw_kwh`, `net_excess_feed_kwh` + Europe/Istanbul ay sınırıyla `consumption_hourly`'den bir kerelik backfill |
 | `20260705_002_add_allocated_ges_kwh_to_snapshots.sql` | 2026-07-05 | `allocated_ges_kwh` — talep birleştirme tahsis audit'i |
+| `20260930_003_invoice_method_7_meram.sql` | 2026-09-30 | Metot 7 replay: `trafo_kaybi_saatlik`, `trafo_kaybi_kwh` (C = total_consumption_kwh + bu), `own_gn_kwh`, `yekdem_gddk`, `yekdem_is_final` (yalnız m7 damgalar; U/F türetilir). Ayrıca `subscription_settings.trafo_kaybi_saatlik`, `invoice_methods` id 7, override anahtarı `yekdem_gddk` |
 
 > 2026-04 öncesi snapshot'lar bu alanları içermez; `recomputeSnapshotTotalWithMahsup()` eksik alanları `0` veya varsayılan değerle tamamlayıp güncel formülle hesaplar. 2026-06-02 backfill'i, eski `billed` satırların saklı toplamlarını da güncel formülle eşitlemiştir.
 

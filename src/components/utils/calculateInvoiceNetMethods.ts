@@ -11,10 +11,18 @@ import type {
 } from "@/components/utils/invoiceOverrides";
 
 /**
- * Metod 2 (Uedaş), Metod 3 (Tredaş) ve Metod 5 (İpragaz) fatura motorları — Aşama 2B.
+ * Metod 2 (Uedaş), Metod 3 (Tredaş), Metod 5 (İpragaz) ve Metod 7 (Meram / MEPAŞ)
+ * fatura motorları — Aşama 2B.
  *
  * Metod 5, Metod 2'nin birebir kopyasıdır; TEK FARK BTV matrahı:
  *   m2: enerji (+ trafo) · m5: enerji + YEK bedeli (+ trafo) — tümü NET taban.
+ *
+ * Metod 7 (Meram) aynı iskeleti paylaşır; farklar `method === 7` dallarında
+ * (Niğde As Beton Ağustos 2026 faturalarıyla kuruşuna çözüldü):
+ *   U = (wPos + Y)×KBK + adj · Enerji = N×U (YEK ayrı satır değil)
+ *   Satır 2 = F + GDDK, F = M × ((wM + Y)×KBK − perakende) = −M × mahsuplaşmaBirim
+ *   Dağıtım = G_own > C ? D×C/2 : D×C − D×G_own/2   (C = trafo dahil brüt)
+ *   BTV = oran × (Enerji + Satır 2) · trafo_degeri ve önceki dönem YEK farkı YOK.
  *
  * Metod 1 (calculateInvoice.ts) AYLIK netleşmeye dayanır; bu metodlar ise
  * SAATLİK net agregalara dayanır:
@@ -65,6 +73,54 @@ export type InvoiceMethodInputs = {
   prevGerceklesenYekdem?: number | null;
   /** Metod 3 muhtelif-2 kredisi birim fiyatı. Yoksa T-0 enerji fiyatı kullanılır. */
   mahsuplasmaUnitPrice?: number | null;
+  /** Metod 7 (Meram) girdileri. Diğer metodlarda anahtar YOK (sparse).
+   *  m7'de `tahminiYekdem` = Y = dönemin yekdem_final'ı (yoksa yekdem_value) ve
+   *  sumCn/sumPos/sumMahsup trafo kaybı DAHİL (C/N/M). */
+  meram?: MeramMethodInputs;
+};
+
+/** Metod 7 (Meram) — hourlyNetAggregates.assembleMethodInputs kurar; snapshot replay
+ *  invoiceSnapshots.methodInputsFromSnapshotRow kolonlardan yeniden kurar. */
+export type MeramMethodInputs = {
+  /** G_own: tesisin KENDİ sayacının dönem verişi (ham Σgn). Dağıtıma yalnız bu girer
+   *  (havuz tahsisi dağıtıma GİRMEZ). */
+  ownGnTotal: number;
+  /** t (kWh/saat); 0 = kural kapalı. Karşı-olgu (GES Olmasaydı) saatlik ağırlık için. */
+  trafoKaybiSaatlik: number;
+  /** t × saat (kWh) — sumCn'e zaten dahil; gösterim + snapshot. */
+  trafoKaybiKwh: number;
+  /** subscription_settings.unit_price_adjustment (TL/kWh) — U'ya eklenir. */
+  unitPriceAdjustment: number;
+  /** Y = yekdem_final mı? false → "tahmini YEKDEM" (yekdem_value). */
+  yekdemIsFinal: boolean;
+  /** YEKDEM GDDK (TL, işaretli). 'yekdem_gddk' override'ı motorda önceliklidir; null → 0. */
+  gddk: number | null;
+};
+
+/** Metod 7 çıktısının kendine özgü kalemleri (breakdown.meram). */
+export type MeramBreakdown = {
+  /** F — mahsuplaşma farkı (TL, işaretli) = M × ((wM + Y)×KBK − perakende) */
+  mahsuplasmaFarki: number;
+  /** F / M = (wM + Y)×KBK − perakende (override varsa −override) */
+  mahsuplasmaBirimFiyat: number;
+  /** YEKDEM GDDK (TL, efektif) */
+  gddk: number;
+  /** "YEKDEM Mahsup + GDDK + Mahsuplaşma Farkı" = F + GDDK */
+  satir2: number;
+  /** Y (TL/kWh) */
+  yekdem: number;
+  yekdemIsFinal: boolean;
+  /** C — trafo dahil brüt tüketim (dağıtım kWh'ı) */
+  consKwh: number;
+  /** M — mahsup kWh */
+  mahsupKwh: number;
+  /** G_own */
+  ownGnKwh: number;
+  trafoKaybiSaatlik: number;
+  trafoKaybiKwh: number;
+  /** G_own > C → dağıtım D×C/2 */
+  dagitimYarim: boolean;
+  wMahsup: number;
 };
 
 export type MethodInvoiceInput = InvoiceInput & {
@@ -73,7 +129,28 @@ export type MethodInvoiceInput = InvoiceInput & {
    *  öncesi) tutarı, enerji birim fiyatına gömülür. Yalnız Metod 6 okur;
    *  diğer metodlar YOK SAYAR. Yok/0 → Metod 1 ile bit-identik. */
   embeddedYekdemAdderTL?: number | null;
+  /** İpragaz 2026-08+ fatura formatı: "YEK Bedeli" ayrı satır DEĞİL, enerji birim
+   *  fiyatına gömülü ((PTF + YEKDEM) × KBK). KAPI ÇAĞIRANDA çözülür
+   *  (`methodId === 5 && isIpragazYekBirlesikPeriod(yıl, ay)`); motor dönem bilmez
+   *  (2K `applyVerisMahsupPerakendeCap` deseni). YALNIZ Metod 5 okur; m2/m3 YOK SAYAR.
+   *  Bayrak kapalıyken çıktı bit-identiktir. Toplam/BTV/KDV değişmez — yalnız satır yapısı. */
+  ipragazYekBirlesik?: boolean;
 };
+
+/** İpragaz'ın YEK bedelini enerji birim fiyatına gömdüğü ilk dönem (fatura formatı
+ *  değişikliği). Bu dönemden itibaren Metod 5 çıktısında ayrı "YEK Bedeli" satırı
+ *  üretilmez; < bu dönem davranış BİREBİR eski. TEK kaynak. */
+export const IPRAGAZ_YEK_BIRLESIK_BASLANGIC = { year: 2026, month: 8 } as const;
+
+/** Dönem İpragaz birleşik-YEK formatında mı? (y×12+m ordinal — isM1MahsupCapPeriod
+ *  deseni. Geçersiz/eksik girdi → false, fail-safe: eski satır yapısı.) */
+export function isIpragazYekBirlesikPeriod(periodYear: number, periodMonth: number): boolean {
+  if (!Number.isFinite(periodYear) || !Number.isFinite(periodMonth)) return false;
+  return (
+    periodYear * 12 + periodMonth >=
+    IPRAGAZ_YEK_BIRLESIK_BASLANGIC.year * 12 + IPRAGAZ_YEK_BIRLESIK_BASLANGIC.month
+  );
+}
 
 /** Metod 2/3/5'e özgü OPSİYONEL kalemler. Metod 1 çıktısında bu anahtarlar hiç bulunmaz. */
 export type MethodInvoiceBreakdown = InvoiceBreakdown & {
@@ -92,8 +169,18 @@ export type MethodInvoiceBreakdown = InvoiceBreakdown & {
   wPosApplied?: number;
   /** Metod 6 (Kepsaş): enerji birim fiyatına gömülen çıplak YEKDEM mahsup tutarı (TL). */
   embeddedYekdemAdderTL?: number;
-  /** Metod 6: enerji satırında gösterilecek birim fiyat = energyCharge / brütKwh. */
+  /** Metod 6: enerji satırında gösterilecek birim fiyat = energyCharge / brütKwh.
+   *  Metod 5 birleşik (2026-08+): = energyCharge (YEK dahil) / netKwh. */
   energyUnitPriceShown?: number;
+  /** Metod 5 birleşik-YEK (İpragaz 2026-08+): true ise "YEK Bedeli" enerji satırına
+   *  katlanmıştır (yekTahminiCharge = 0, energyCharge YEK dahil). Aksi halde anahtar HİÇ yok. */
+  yekEnerjiyeGomulu?: true;
+  /** Metod 5 birleşik: enerjiye katlanan EFEKTİF YEK tutarı (TL). Okuyucular çıplak
+   *  enerjiyi `energyCharge − yekGomuluTutar` ile geri ayırır (muhasebe). */
+  yekGomuluTutar?: number;
+  /** Metod 7 (Meram): varsa m7 yerleşimi (Satır 2, yarım dağıtım, trafo kaybı notu).
+   *  Diğer metodlarda anahtar HİÇ yok → UI kapıları bunu okur. */
+  meram?: MeramBreakdown;
 };
 
 /**
@@ -236,7 +323,7 @@ export function resolveYekFarkiWithOverride(p: {
   return { amount: base * diff * kbk, overridden: true, excluded: false };
 }
 
-type NetMethodId = 2 | 3 | 5;
+type NetMethodId = 2 | 3 | 5 | 7;
 
 function calculateNetMethod(
   method: NetMethodId,
@@ -254,8 +341,16 @@ function calculateNetMethod(
   const sumExcess = num(m.sumExcess);
   const kbk = num(m.kbk);
 
+  // Metod 7 (Meram): m.tahminiYekdem = Y (final varsa final); m.meram yoksa
+  // G_own/t/adj 0 kabul edilir (dispatcher m7'yi meram'sız çağırmaz).
+  const isMeram = method === 7;
+  const mr = isMeram ? m.meram : undefined;
+
   // ── Birim fiyatlar (öncelik: calculateInvoice.ts:142-152 ile aynı — override girişte gölgeler)
-  const naturalEnergyUnitPrice = num(m.wPos) * kbk; // T-0
+  // m7: U = (wPos + Y)×KBK + adj — YEKDEM enerji fiyatının içinde, ayrı YEK satırı yok.
+  const naturalEnergyUnitPrice = isMeram
+    ? (num(m.wPos) + num(m.tahminiYekdem)) * kbk + num(mr?.unitPriceAdjustment)
+    : num(m.wPos) * kbk; // T-0
   const enerjiUnitOv = ov?.enerji?.unitPriceOverride;
   const energyUnitPrice = isFin(enerjiUnitOv) ? Number(enerjiUnitOv) : naturalEnergyUnitPrice;
 
@@ -268,7 +363,8 @@ function calculateNetMethod(
   let energyCharge = sumPos * energyUnitPrice;
 
   // Trafo: kural setinde geçmiyor; metod 1 semantiği korunuyor (VARSAYIM, 2C'de teyit).
-  const trafoKwh = isFin(input.trafoDegeri) && Number(input.trafoDegeri) > 0
+  // m7: aylık trafo_degeri KULLANILMAZ — trafo kaybı saatlik t ile tüketimin içinde.
+  const trafoKwh = !isMeram && isFin(input.trafoDegeri) && Number(input.trafoDegeri) > 0
     ? Number(input.trafoDegeri)
     : 0;
   let trafoCharge = energyUnitPrice * trafoKwh;
@@ -285,31 +381,53 @@ function calculateNetMethod(
   const yekBase = sumPos;
   const yekOv = ov?.yek;
   const yekUnitOv = yekOv?.unitPriceOverride;
-  const yekTahminiNatural = yekBase * (num(m.tahminiYekdem) * kbk);
+  // m7: YEKDEM enerji birim fiyatında (U) → ayrı YEK kalemi yok, 'yek' override'ı etkisiz.
+  const yekTahminiNatural = isMeram ? 0 : yekBase * (num(m.tahminiYekdem) * kbk);
   // Öncelik: isExcluded > amountOverride > unitPriceOverride > doğal.
-  const yekTahminiEffective = yekOv?.isExcluded
+  const yekTahminiEffective = isMeram
     ? 0
-    : isFin(yekOv?.amountOverride)
-      ? Number(yekOv!.amountOverride)
-      : isFin(yekUnitOv)
-        ? yekBase * Number(yekUnitOv)
-        : yekTahminiNatural;
+    : yekOv?.isExcluded
+      ? 0
+      : isFin(yekOv?.amountOverride)
+        ? Number(yekOv!.amountOverride)
+        : isFin(yekUnitOv)
+          ? yekBase * Number(yekUnitOv)
+          : yekTahminiNatural;
   let yekTahminiCharge = yekTahminiNatural;
 
   // ── 3) Önceki dönem farkı — iki metodda da taban NET (ortak fonksiyon).
   // 2C: manuel YEKDEM override'ı ("yekdem_mahsup") bu kaleme köprülenir; MANUEL KAZANIR.
-  const yekFarkiResolved = resolveYekFarkiWithOverride({
-    prevSumPos: m.prevSumPos,
-    prevTahminiYekdem: m.prevTahminiYekdem,
-    prevGerceklesenYekdem: m.prevGerceklesenYekdem,
-    kbk,
-    override: ov?.yekdem_mahsup,
-  });
+  // m7: sonraki ay YEKDEM mahsubu bu metotta KAPALI → kalem 0, override etkisiz.
+  const yekFarkiResolved = isMeram
+    ? { amount: 0, overridden: false, excluded: false }
+    : resolveYekFarkiWithOverride({
+        prevSumPos: m.prevSumPos,
+        prevTahminiYekdem: m.prevTahminiYekdem,
+        prevGerceklesenYekdem: m.prevGerceklesenYekdem,
+        kbk,
+        override: ov?.yekdem_mahsup,
+      });
   const yekFarkiCharge = yekFarkiResolved.amount;
 
   // ── 4) Dağıtım — m3 taban NET, m2/m5 taban BRÜT (muhtelif yok, tek satır)
   const distributionBaseKwh = method === 3 ? sumPos : sumCn;
   let distributionCharge = distributionBaseKwh * unitPriceDistribution;
+  // m7 (Meram): taban C (trafo dahil brüt); YALNIZ tesisin kendi verişi (G_own) düşer,
+  // havuz tahsisi dağıtıma GİRMEZ. Gerçek faturada saatlik-net değil aylık kural:
+  //   G_own > C → D×C/2 · aksi hâlde D×C − D×G_own/2
+  let meramDagitimYarim = false;
+  let meramDistributionAdjustment = 0;
+  if (isMeram) {
+    const ownGn = num(mr?.ownGnTotal);
+    meramDagitimYarim = ownGn > sumCn;
+    distributionCharge = meramDagitimYarim
+      ? (unitPriceDistribution * sumCn) / 2
+      : unitPriceDistribution * sumCn - (unitPriceDistribution * ownGn) / 2;
+    meramDistributionAdjustment = unitPriceDistribution * sumCn - distributionCharge;
+  }
+  // Açıklama birimi: m7'de efektif birim = doğal tutar / C (override öncesi).
+  const meramEffectiveDistributionUnitPrice =
+    isMeram && sumCn > 0 ? distributionCharge / sumCn : unitPriceDistribution;
 
   // ── 5) Muhtelif-2 (YALNIZ m3): +mahsup×dağıtım ve −mahsup×mahsuplaşmaFiyatı
   // NOT: Gerçek Trepaş faturası mahsuplaşmada 1,82375 kullanmıştı; bu değerin
@@ -339,6 +457,26 @@ function calculateNetMethod(
     muhtelif2MahsupKredisi = sumMahsup * mahsuplasmaUnitPrice;
   }
 
+  // ── 5b) m7 "YEKDEM Mahsup + GDDK + Mahsuplaşma Farkı" (tek satır) = F + GDDK.
+  // F, m3 mahsuplaşma kredisinin AYNI birim zinciriyle (override > snapshot > formül)
+  // ters işaretlisidir: F = M × ((wM + Y)×KBK − perakende) = −M × mahsuplaşmaBirim.
+  // GDDK: 'yekdem_gddk' override'ı (isExcluded → 0) > girdideki meram.gddk > 0.
+  let meramF = 0;
+  let meramGddk = 0;
+  let meramSatir2 = 0;
+  const gddkOv = isMeram ? ov?.yekdem_gddk : undefined;
+  if (isMeram) {
+    meramF = sumMahsup > 0 ? -(sumMahsup * mahsuplasmaUnitPrice) : 0;
+    meramGddk = gddkOv?.isExcluded
+      ? 0
+      : isFin(gddkOv?.amountOverride)
+        ? Number(gddkOv!.amountOverride)
+        : isFin(mr?.gddk)
+          ? Number(mr!.gddk)
+          : 0;
+    meramSatir2 = meramF + meramGddk;
+  }
+
   // ── 6) Reaktif — brüt bazlı ceza dışarıda hesaplanıp geçilir (metod 1 ile aynı)
   let reactivePenaltyCharge = isFin(input.reactivePenaltyCharge)
     ? Number(input.reactivePenaltyCharge)
@@ -358,12 +496,15 @@ function calculateNetMethod(
   // Enerji/trafo için mevcut kural sürer: yalnız birim fiyat zinciri matraha akar,
   // exclude/tutar override'ları akmaz (admin isterse BTV'yi ayrıca override eder).
   const btvRate = num(input.btvRate);
+  // m7 (Meram): ETV = %1 × (Enerji + Satır 2) — GDDK dahil (gerçek faturayla doğrulandı).
   const btvEnergyBase =
     method === 3
       ? energyCharge + yekTahminiNatural - muhtelif2MahsupKredisi
       : method === 5
         ? energyCharge + yekTahminiEffective
-        : energyCharge;
+        : isMeram
+          ? energyCharge + meramSatir2
+          : energyCharge;
   let btvCharge = (btvEnergyBase + trafoCharge) * btvRate;
 
   // ── Güç — kural setinde geçmiyor; metod 1 semantiği (yalnız çift terim). VARSAYIM.
@@ -397,7 +538,8 @@ function calculateNetMethod(
   };
 
   energyCharge = applyItem("enerji", energyCharge);
-  trafoCharge = applyItem("trafo", trafoCharge);
+  // m7: trafo kalemi yok — başıboş bir 'trafo' override'ı tutar EKLEYEMESİN.
+  if (!isMeram) trafoCharge = applyItem("trafo", trafoCharge);
   distributionCharge = applyItem("dagitim", distributionCharge);
   btvCharge = applyItem("btv", btvCharge);
   reactivePenaltyCharge = applyItem("reaktif", reactivePenaltyCharge);
@@ -421,8 +563,25 @@ function calculateNetMethod(
   // yekTahminiCharge da applyItem'dan geçmez: efektif değer BTV'den ÖNCE çözüldü
   // (m5 matrahı ona bağlı). Satır kalemi + KDV matrahı her metodda efektifi kullanır.
   yekTahminiCharge = yekTahminiEffective;
-  if (yekOv?.isExcluded) excludedItems.push("yek");
-  else if (isFin(yekOv?.amountOverride)) amountOverriddenItems.push("yek");
+  if (!isMeram) {
+    if (yekOv?.isExcluded) excludedItems.push("yek");
+    else if (isFin(yekOv?.amountOverride)) amountOverriddenItems.push("yek");
+  }
+  if (gddkOv?.isExcluded) excludedItems.push("yekdem_gddk");
+  else if (isFin(gddkOv?.amountOverride)) amountOverriddenItems.push("yekdem_gddk");
+
+  // ── m5 birleşik-YEK (İpragaz 2026-08+): tüm override çözümlemesi YUKARIDA aynen
+  // bitti; şimdi efektif YEK tutarı enerji SATIRINA katlanır. Enerji ve YEK aynı
+  // tabana (sumPos) dayandığından toplam/BTV/KDV özdeş kalır — yalnız satır yapısı
+  // değişir. energyUnitPrice (çıplak) DEĞİŞMEZ: trafo, verisMahsupBedeli,
+  // netEnergyCharge çıplak fiyatla sürer. Gösterim fiyatı energyUnitPriceShown'da.
+  const yekBirlesik = method === 5 && input.ipragazYekBirlesik === true;
+  let yekGomuluTutar = 0;
+  if (yekBirlesik) {
+    yekGomuluTutar = yekTahminiCharge;
+    energyCharge += yekGomuluTutar;
+    yekTahminiCharge = 0;
+  }
 
   const muhtelif2Net = muhtelif2Dagitim - muhtelif2MahsupKredisi;
 
@@ -445,6 +604,7 @@ function calculateNetMethod(
     yekFarkiCharge +
     distributionCharge +
     muhtelif2Net +
+    meramSatir2 +
     powerTotalCharge +
     reactivePenaltyCharge +
     btvCharge;
@@ -459,14 +619,14 @@ function calculateNetMethod(
     isFin(enerjiUnitOv) ||
     isFin(dagitimUnitOv) ||
     isFin(mahsuplasmaUnitOv) ||
-    isFin(yekUnitOv)
+    (!isMeram && isFin(yekUnitOv))
       ? {
           excludedItems,
           amountOverriddenItems,
           unitPriceEnergyOverridden: isFin(enerjiUnitOv),
           unitPriceDistributionOverridden: isFin(dagitimUnitOv),
           unitPriceMahsuplasmaOverridden: isFin(mahsuplasmaUnitOv),
-          unitPriceYekOverridden: isFin(yekUnitOv),
+          unitPriceYekOverridden: !isMeram && isFin(yekUnitOv),
         }
       : null;
 
@@ -476,11 +636,13 @@ function calculateNetMethod(
     distributionCharge,
     distributionBaseKwh,
     // Metod 2/3'te dağıtım düz tarifeden hesaplanır; metod 1'deki "mahsup indirimi"
-    // kavramı yoktur → düzeltme 0.
-    distributionAdjustment: 0,
+    // kavramı yoktur → düzeltme 0. m7: kendi-veriş yarım kredisi (D×C − tutar).
+    distributionAdjustment: isMeram ? meramDistributionAdjustment : 0,
     distributionChargeKwh: distributionBaseKwh,
     verisKwh: sumGn,
-    effectiveDistributionUnitPrice: unitPriceDistribution,
+    effectiveDistributionUnitPrice: isMeram
+      ? meramEffectiveDistributionUnitPrice
+      : unitPriceDistribution,
     netEnergyKwh: sumPos,
     netEnergyCharge: sumPos * energyUnitPrice,
     btvCharge,
@@ -511,6 +673,37 @@ function calculateNetMethod(
     energyUnitPriceApplied: energyUnitPrice,
     wPosApplied: num(m.wPos),
 
+    // m5 birleşik: sparse — bayrak kapalıyken anahtarlar HİÇ eklenmez (bit-identik çıktı).
+    ...(yekBirlesik
+      ? {
+          yekEnerjiyeGomulu: true as const,
+          yekGomuluTutar,
+          energyUnitPriceShown:
+            sumPos > 0 ? energyCharge / sumPos : energyUnitPrice + num(m.tahminiYekdem) * kbk,
+        }
+      : {}),
+
+    // m7: sparse — diğer metodlarda anahtar HİÇ eklenmez (bit-identik çıktı).
+    ...(isMeram
+      ? {
+          meram: {
+            mahsuplasmaFarki: meramF,
+            mahsuplasmaBirimFiyat: -mahsuplasmaUnitPrice,
+            gddk: meramGddk,
+            satir2: meramSatir2,
+            yekdem: num(m.tahminiYekdem),
+            yekdemIsFinal: mr?.yekdemIsFinal === true,
+            consKwh: sumCn,
+            mahsupKwh: sumMahsup,
+            ownGnKwh: num(mr?.ownGnTotal),
+            trafoKaybiSaatlik: num(mr?.trafoKaybiSaatlik),
+            trafoKaybiKwh: num(mr?.trafoKaybiKwh),
+            dagitimYarim: meramDagitimYarim,
+            wMahsup: num(m.wMahsup),
+          },
+        }
+      : {}),
+
     ...(appliedOverrides ? { appliedOverrides } : {}),
   };
 }
@@ -531,6 +724,17 @@ export function calculateInvoiceMethod3(
   methodInputs?: InvoiceMethodInputs
 ): MethodInvoiceBreakdown {
   return calculateNetMethod(3, input, overrides, methodInputs);
+}
+
+/** Metod 7 — Meram (MEPAŞ). Enerji N×U, U = (wPos + Y)×KBK + adj; "YEKDEM Mahsup +
+ *  GDDK + Mahsuplaşma Farkı" tek satır; dağıtım kendi verişiyle aylık yarım kural;
+ *  BTV = oran × (Enerji + Satır 2). Girdiler trafo kaybı dahil (methodInputs.meram). */
+export function calculateInvoiceMethod7(
+  input: MethodInvoiceInput,
+  overrides?: InvoiceOverrides | null,
+  methodInputs?: InvoiceMethodInputs
+): MethodInvoiceBreakdown {
+  return calculateNetMethod(7, input, overrides, methodInputs);
 }
 
 /** Metod 5 — İpragaz. Metod 2'nin birebir kopyası; TEK FARK BTV matrahına

@@ -8,7 +8,13 @@
 //
 // Not: bu iki motor dosyası yalnız `import type` yaptığı için tsx altında relative
 // import ile sorunsuz yüklenir (@/lib/supabase zincirine girmez).
+//
+// F12 (Metot 7 · Meram) disk fixture'ları okur: docs/talep-birlestirme/Niğde As Beton.xlsx
+// + scripts/fixtures/ptf-2026-08.json. gesAllocation / hourlyNetAggregates zinciri
+// yalnız `import type` + saf modüller içerir (check-ges-allocation-modes.ts'te denendi).
 
+import { readFileSync, existsSync } from "node:fs";
+import * as XLSX from "xlsx";
 import type { InvoiceInput } from "../src/components/utils/calculateInvoice";
 import {
   calculateInvoice,
@@ -19,15 +25,31 @@ import {
   calculateInvoiceMethod2,
   calculateInvoiceMethod3,
   calculateInvoiceMethod5,
+  calculateInvoiceMethod7,
   calculateYekFarki,
   resolveYekFarkiWithOverride,
   embedYekdemMahsupIntoEnergy,
+  isIpragazYekBirlesikPeriod,
   type InvoiceMethodInputs,
   type MethodInvoiceInput,
   type MethodInvoiceBreakdown,
 } from "../src/components/utils/calculateInvoiceNetMethods";
 // type-only → tsx'te silinir, @/lib/supabase zincirine girmez.
 import type { InvoiceOverrides } from "../src/components/utils/invoiceOverrides";
+import {
+  allocateSaatlikOransal,
+  buildPoolSrcSeries,
+  type HourlySeries,
+} from "../src/components/utils/gesAllocationModes";
+import type { FacilityAllocationView } from "../src/components/utils/gesAllocation";
+import { computeHourlyNetAggregates } from "../src/components/utils/hourlyNetAggregates";
+import {
+  addTrafoKaybiToRows,
+  addTrafoKaybiToSeries,
+  hourGridKeys,
+  normalizeTrafoKaybi,
+  trafoGridCapIso,
+} from "../src/components/utils/trafoKaybi";
 
 // ── Test harness ────────────────────────────────────────────────
 let failures = 0;
@@ -242,6 +264,74 @@ console.log("\n── Metod 5 (İpragaz) · BTV matrahında YEK ──");
   );
   assertClose("m5 yek tutar override → satır", bAmt.yekTahminiCharge!, 100000, 1e-9);
   assertClose("m5 yek tutar override → BTV matraha girer", bAmt.btvCharge, (b.energyCharge + 100000) * 0.01, 0.01);
+
+  // ── İpragaz 2026-08+ birleşik-YEK formatı: YEK enerji satırına katlanır ──────
+  // Toplam/BTV/KDV bayraksızla BİT-IDENTİK; yalnız satır yapısı değişir.
+  console.log("\n── Metod 5 (İpragaz) · birleşik YEK (2026-08+) ──");
+  {
+    const okP = !isIpragazYekBirlesikPeriod(2026, 7) && isIpragazYekBirlesikPeriod(2026, 8)
+      && isIpragazYekBirlesikPeriod(2027, 1) && !isIpragazYekBirlesikPeriod(NaN, 8);
+    if (!okP) failures++;
+    console.log(`  ${okP ? "✅" : "❌"} isIpragazYekBirlesikPeriod: 2026-07 false · 2026-08 true · 2027-01 true · NaN false`);
+
+    const inputB: MethodInvoiceInput = { ...input, ipragazYekBirlesik: true };
+    const bb = calculateInvoiceMethod5(inputB, null, mi);
+    assertClose("birleşik enerji = enerji + YEK", bb.energyCharge, b.energyCharge + b.yekTahminiCharge!, 1e-9);
+    assertClose("birleşik YEK satırı = 0", bb.yekTahminiCharge!, 0, 1e-12);
+    assertClose("birleşik yekGomuluTutar = eski YEK", bb.yekGomuluTutar!, b.yekTahminiCharge!, 1e-9);
+    assertClose("birleşik BTV ≡ eski BTV", bb.btvCharge, b.btvCharge, 1e-9);
+    assertClose("birleşik KDV hariç ≡ eski", bb.subtotalBeforeVat, b.subtotalBeforeVat, 1e-9);
+    assertClose("birleşik KDV ≡ eski", bb.vatCharge, b.vatCharge, 1e-9);
+    assertClose("birleşik toplam ≡ eski", bb.totalInvoice, b.totalInvoice, 1e-9);
+    assertClose("birleşik trafo ≡ eski (çıplak fiyat)", bb.trafoCharge, b.trafoCharge, 1e-12);
+    assertClose("birleşik verisMahsupBedeli ≡ eski", bb.verisMahsupBedeli, b.verisMahsupBedeli, 1e-9);
+    assertClose("birleşik energyUnitPriceApplied çıplak", bb.energyUnitPriceApplied!, b.energyUnitPriceApplied!, 1e-12);
+    assertClose("birleşik energyUnitPriceShown = (PTF+YEKDEM)×KBK", bb.energyUnitPriceShown!, (mi.wPos + mi.tahminiYekdem) * mi.kbk, 1e-9);
+    {
+      const ok = bb.yekEnerjiyeGomulu === true && !("yekEnerjiyeGomulu" in b) && !("yekGomuluTutar" in b) && !("energyUnitPriceShown" in b);
+      if (!ok) failures++;
+      console.log(`  ${ok ? "✅" : "❌"} bayrak alanları sparse: birleşikte var, bayraksızda HİÇ yok`);
+    }
+
+    // Bayrak m2'de ETKİSİZ (yalnız m5 okur).
+    const b2b = calculateInvoiceMethod2(inputB, null, mi);
+    assertClose("m2 bayrağı yok sayar → enerji", b2b.energyCharge, b2.energyCharge, 1e-12);
+    assertClose("m2 bayrağı yok sayar → YEK", b2b.yekTahminiCharge!, b2.yekTahminiCharge!, 1e-12);
+    {
+      const ok = !("yekEnerjiyeGomulu" in b2b);
+      if (!ok) failures++;
+      console.log(`  ${ok ? "✅" : "❌"} m2 bayrakla → yekEnerjiyeGomulu anahtarı yok`);
+    }
+
+    // Override etkileşimi: çözümleme aynen, sonra katlama.
+    const bbEx = calculateInvoiceMethod5(
+      inputB,
+      { yek: { isExcluded: true, unitPriceOverride: null, amountOverride: null, payload: null, note: null } },
+      mi
+    );
+    assertClose("birleşik yek exclude → enerji çıplak", bbEx.energyCharge, b.energyCharge, 1e-9);
+    assertClose("birleşik yek exclude → BTV = enerji × %1", bbEx.btvCharge, bEx.btvCharge, 1e-9);
+    assertClose("birleşik yek exclude → toplam ≡ bayraksız exclude", bbEx.totalInvoice, bEx.totalInvoice, 1e-9);
+    const bbAmt = calculateInvoiceMethod5(
+      inputB,
+      { yek: { isExcluded: false, unitPriceOverride: null, amountOverride: 100000, payload: null, note: null } },
+      mi
+    );
+    assertClose("birleşik yek tutar override → enerji + 100000", bbAmt.energyCharge, b.energyCharge + 100000, 1e-9);
+    assertClose("birleşik yek tutar override → toplam ≡ bayraksız", bbAmt.totalInvoice, bAmt.totalInvoice, 1e-9);
+    const bbEn = calculateInvoiceMethod5(
+      inputB,
+      { enerji: { isExcluded: false, unitPriceOverride: null, amountOverride: 1000000, payload: null, note: null } },
+      mi
+    );
+    const bEn = calculateInvoiceMethod5(
+      input,
+      { enerji: { isExcluded: false, unitPriceOverride: null, amountOverride: 1000000, payload: null, note: null } },
+      mi
+    );
+    assertClose("birleşik enerji tutar override → 1.000.000 + YEK", bbEn.energyCharge, 1000000 + b.yekTahminiCharge!, 1e-9);
+    assertClose("birleşik enerji tutar override → toplam ≡ bayraksız", bbEn.totalInvoice, bEn.totalInvoice, 1e-9);
+  }
 }
 
 // ── FIXTURE 3 (SENTETİK): Önceki YEKDEM Mahsup / YEK Farkı aritmetiği ─────
@@ -776,6 +866,337 @@ console.log("\n── FIXTURE 11 (2L-R): Metod 6 (Kepsaş) — m4 tabanı + göm
     const dropped = (embNeg.energyUnitPriceShown ?? Infinity) < base6.energyCharge / grossKwh;
     if (!dropped) failures++;
     console.log(`  ${dropped ? "✅" : "❌"} (T4) negatif mahsupta birim fiyat düştü`);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
+// F12) Metot 7 (Meram / MEPAŞ) — Niğde As Beton, 2026-08
+// ════════════════════════════════════════════════════════════════
+// Üç gerçek MEPAŞ faturası (docs/talep-birlestirme/MEP2026001103027/105368/106751)
+// + Meram mahsup exceli ("Niğde As Beton.xlsx") + epias_ptf_hourly 2026-08
+// (scripts/fixtures/ptf-2026-08.json, bir kez export). Excel'de H ve K kolonları
+// trafo kaybı DAHİL, E'de trafo yok → fixture t=0, değerler cons olarak verilir.
+// Zincir üretimdekiyle aynı SAF fonksiyonlar: allocateSaatlikOransal (havuz) →
+// computeHourlyNetAggregates → calculateInvoiceMethod7. Tutarlar ±0,20 TL, U 6 hane.
+console.log("\n── F12) Metot 7 · Niğde As Beton 2026-08 (3 MEPAŞ faturası) ──");
+{
+  const AB_FIXTURE = "docs/talep-birlestirme/Niğde As Beton.xlsx";
+  const PTF_FIXTURE = "scripts/fixtures/ptf-2026-08.json";
+  const HOUR = 3_600_000;
+  const TOL_TL = 0.2;
+
+  const assertEq6 = (label: string, actual: number, expected: number) => {
+    const ok = Math.abs(actual - expected) <= 5e-7;
+    if (!ok) failures++;
+    console.log(
+      `  ${ok ? "✅" : "❌"} ${label.padEnd(34)} = ${actual.toFixed(6).padStart(16)}   (beklenen ${expected.toFixed(6)})`
+    );
+  };
+  const assertTrue = (label: string, cond: boolean) => {
+    if (!cond) failures++;
+    console.log(`  ${cond ? "✅" : "❌"} ${label}`);
+  };
+
+  if (!existsSync(AB_FIXTURE) || !existsSync(PTF_FIXTURE)) {
+    failures++;
+    console.log(`  ❌ Fixture bulunamadı: ${AB_FIXTURE} / ${PTF_FIXTURE}`);
+  } else {
+    const ptfFx = JSON.parse(readFileSync(PTF_FIXTURE, "utf8")) as {
+      startTs: string;
+      hours: number;
+      ptf_tl_mwh: number[];
+    };
+    const t0 = new Date(ptfFx.startTs).getTime();
+    const tsAt = (i: number) => new Date(t0 + i * HOUR).toISOString();
+    const keyAt = (i: number) => tsAt(i).slice(0, 13);
+    const ptfMap = new Map<string, number>();
+    ptfFx.ptf_tl_mwh.forEach((mwh, i) => ptfMap.set(keyAt(i), mwh / 1000));
+    assertTrue(`PTF fixture 744 saat (gerçek: ${ptfFx.ptf_tl_mwh.length})`, ptfFx.ptf_tl_mwh.length === 744);
+
+    const wb = XLSX.read(readFileSync(AB_FIXTURE), { type: "buffer", cellDates: false });
+    const ws = wb.Sheets["NİĞDE AS BETON"] as Record<string, { v?: unknown }>;
+    const col = (c: string): number[] => {
+      const out: number[] = [];
+      for (let r = 2; r <= 745; r++) {
+        const v = Number(ws[c + r]?.v);
+        out.push(Number.isFinite(v) ? v : 0);
+      }
+      return out;
+    };
+    // A2 = Excel seri tarihi 2026-08-01 00:00 (TR) = startTs (UTC 21:00, önceki gün).
+    const a2Ms = Math.round((Number(ws.A2?.v) - 25569) * 86_400_000) - 3 * HOUR;
+    assertTrue("Excel A2 ≡ PTF startTs (saat hizası)", a2Ms === t0);
+
+    const zeros = new Array<number>(744).fill(0);
+    const FAC = [
+      {
+        serno: 10126953, prio: 1, cons: col("H"), gn: col("C"), gddk: 82.26,
+        exp: { C: 46225.1971, N: 30509.33, G: 4967.52, U: 3.661029, enerji: 111695.54, F: -87.72,
+          satir2: -5.46, dagitim: 51722.39, etv: 1116.9, matrah: 164529.37, kdv: 32905.87, toplam: 197435.24, yarim: false },
+      },
+      {
+        serno: 10128583, prio: 2, cons: col("E"), gn: col("B"), gddk: 1180.11,
+        exp: { C: 243564.3042, N: 240504.24, G: 452604.6, U: 3.62191, enerji: 871084.7, F: 1261.63,
+          satir2: 2441.74, dagitim: 144002.28, etv: 8735.26, matrah: 1026263.98, kdv: 205252.8, toplam: 1231516.78, yarim: true },
+      },
+      {
+        serno: 9062757, prio: 3, cons: col("K"), gn: zeros, gddk: 51.54,
+        exp: { C: 13160.5208, N: 3145.67, G: 0, U: 3.680513, enerji: 11577.7, F: -2223.21,
+          satir2: -2171.67, dagitim: 15561.75, etv: 94.06, matrah: 25061.84, kdv: 5012.37, toplam: 30074.21, yarim: false },
+      },
+    ];
+
+    const Y = 0.395303;
+    const KBK = 0.952;
+    const PERAKENDE = 2.909687;
+    const D = 1.182457;
+
+    type Fac = (typeof FAC)[number];
+    const seriesOf = (cons: number[], gn: number[]): HourlySeries => {
+      const m: HourlySeries = new Map();
+      cons.forEach((c, i) => m.set(keyAt(i), { cn: c, gn: gn[i] }));
+      return m;
+    };
+    const rowsOf = (cons: number[], gn: number[]) =>
+      cons.map((c, i) => ({ ts: tsAt(i), cn: c, gn: gn[i] }));
+    const runPool = (seriesBySerno: Map<number, HourlySeries>) => {
+      const assignments = FAC.map((f) => ({ subscription_serno: f.serno, priority: f.prio }));
+      const listed = new Set(FAC.map((f) => f.serno));
+      return allocateSaatlikOransal({
+        assignments,
+        seriesBySerno,
+        srcSeries: buildPoolSrcSeries({ assignments, seriesBySerno }),
+        isSourceSerno: (s) => listed.has(s),
+      });
+    };
+    const viewOf = (f: Fac, res: ReturnType<typeof runPool>): FacilityAllocationView => {
+      const a = res.perSerno.get(f.serno)!;
+      return {
+        role: "assigned",
+        priority: f.prio,
+        allocByHour: a.allocByHour,
+        allocTotal: a.allocTotal,
+        excessTotal: f.prio === 1 ? res.excessTotal : 0,
+        isSource: true, // havuz modu: listedeki herkes (own_gn=0)
+        mode: "saatlik_oransal",
+        ownGnTotal: f.gn.reduce((s, x) => s + x, 0),
+      };
+    };
+    const meramInputs = (
+      agg: ReturnType<typeof computeHourlyNetAggregates>,
+      gddk: number | null,
+      extra?: Partial<NonNullable<InvoiceMethodInputs["meram"]>>
+    ): InvoiceMethodInputs => ({
+      sumCn: agg.sumCn,
+      sumGn: agg.sumGn,
+      sumPos: agg.sumPos,
+      sumMahsup: agg.sumMahsup,
+      sumExcess: agg.sumExcess,
+      wPos: agg.wPos,
+      wMahsup: agg.wMahsup,
+      kbk: KBK,
+      tahminiYekdem: Y,
+      prevSumPos: null,
+      prevTahminiYekdem: null,
+      prevGerceklesenYekdem: null,
+      mahsuplasmaUnitPrice: null,
+      meram: {
+        ownGnTotal: agg.sumOwnGn,
+        trafoKaybiSaatlik: 0,
+        trafoKaybiKwh: agg.trafoKaybiKwh,
+        unitPriceAdjustment: 0,
+        yekdemIsFinal: true,
+        gddk,
+        ...extra,
+      },
+    });
+    const m7Input = (agg: ReturnType<typeof computeHourlyNetAggregates>, over?: Partial<MethodInvoiceInput>): MethodInvoiceInput => ({
+      ...baseInput({
+        totalConsumptionKwh: agg.sumCn,
+        unitPriceDistribution: D,
+        perakendeEnerjiBedeli: PERAKENDE,
+      }),
+      ...over,
+    });
+
+    const pool = runPool(new Map(FAC.map((f) => [f.serno, seriesOf(f.cons, f.gn)])));
+    assertClose("havuz tahsisi 10126953 (Excel I)", pool.perSerno.get(10126953)!.allocTotal, 15715.88, 0.01);
+    assertClose("havuz tahsisi 10128583 (Excel F)", pool.perSerno.get(10128583)!.allocTotal, 3060.06, 0.01);
+    assertClose("havuz tahsisi 9062757 (Excel L)", pool.perSerno.get(9062757)!.allocTotal, 10014.85, 0.01);
+
+    const natural = new Map<number, MethodInvoiceBreakdown>();
+    const aggBySerno = new Map<number, ReturnType<typeof computeHourlyNetAggregates>>();
+
+    for (const f of FAC) {
+      console.log(`\n  ▸ ${f.serno}`);
+      const agg = computeHourlyNetAggregates({ rows: rowsOf(f.cons, f.gn), view: viewOf(f, pool), ptfMap });
+      aggBySerno.set(f.serno, agg);
+
+      // wNet / wM kimliği: spec tanımıyla bağımsız hesap (eff = havuz tahsisi).
+      const alloc = pool.perSerno.get(f.serno)!.allocByHour;
+      let vN = 0, N = 0, vM = 0, M = 0;
+      for (let i = 0; i < 744; i++) {
+        const eff = alloc.get(keyAt(i)) ?? 0;
+        const mah = Math.min(f.cons[i], eff);
+        const net = f.cons[i] - mah;
+        const p = ptfMap.get(keyAt(i))!;
+        N += net; M += mah; vN += net * p; vM += mah * p;
+      }
+      assertEq6("wPos ≡ Σ net·PTF / N (wNet)", agg.wPos, vN / N);
+      assertEq6("wMahsup ≡ Σ mahsup·PTF / M (wM)", agg.wMahsup, vM / M);
+      assertClose("ptfMissingPosKwh = 0", agg.ptfMissingPosKwh, 0, 1e-9);
+      assertClose("ptfCoveredMahsupKwh = M", agg.ptfCoveredMahsupKwh, agg.sumMahsup, 1e-6);
+      assertClose("Σ mahsup_h = M (kimlik)", M, agg.sumMahsup, 1e-6);
+      assertClose("C (dağıtım kWh)", agg.sumCn, f.exp.C, 0.01);
+      assertClose("N (enerji kWh)", agg.sumPos, f.exp.N, 0.01);
+      assertClose("G_own (sumOwnGn)", agg.sumOwnGn, f.exp.G, 0.01);
+
+      const b = calculateInvoiceMethod7(m7Input(agg), null, meramInputs(agg, f.gddk));
+      natural.set(f.serno, b);
+      assertEq6("U (6 hane)", Math.round((b.energyUnitPriceApplied ?? 0) * 1e6) / 1e6, f.exp.U);
+      assertClose("Enerji (N × U)", b.energyCharge, f.exp.enerji, TOL_TL);
+      assertClose("F (mahsuplaşma farkı)", b.meram!.mahsuplasmaFarki, f.exp.F, TOL_TL);
+      assertClose("Satır 2 (F + GDDK)", b.meram!.satir2, f.exp.satir2, TOL_TL);
+      assertClose("Dağıtım", b.distributionCharge, f.exp.dagitim, TOL_TL);
+      assertClose("ETV (BTV)", b.btvCharge, f.exp.etv, TOL_TL);
+      assertClose("KDV matrahı", b.subtotalBeforeVat, f.exp.matrah, TOL_TL);
+      assertClose("KDV", b.vatCharge, f.exp.kdv, TOL_TL);
+      assertClose("Toplam", b.totalInvoice, f.exp.toplam, TOL_TL);
+      assertTrue(`dağıtım yarım kuralı = ${f.exp.yarim}`, b.meram!.dagitimYarim === f.exp.yarim);
+      assertClose("distributionChargeKwh = C", b.distributionChargeKwh, agg.sumCn, 1e-9);
+      assertClose("trafo kalemi 0", b.trafoCharge, 0, 0);
+      assertClose("YEK / YEK Farkı 0", (b.yekTahminiCharge ?? 0) + (b.yekFarkiCharge ?? 0), 0, 0);
+    }
+
+    // ── Trafo kaybı t: ham (t'siz) seri + ön-dönüşüm ≡ Excel'in trafo-dahil değerleri.
+    console.log("\n  ▸ trafo kaybı t = 1,12 (10126953, 9062757) — ön-dönüşüm eşdeğerliği");
+    {
+      const T = 1.12;
+      const keys = hourGridKeys(tsAt(0), tsAt(744));
+      assertTrue(`Ağustos ızgarası 744 saat (gerçek: ${keys.length})`, keys.length === 744);
+      const tOf = (serno: number) => (serno === 10128583 ? 0 : T);
+      const rawCons = (f: Fac) => f.cons.map((c) => c - tOf(f.serno));
+
+      const tSeries = new Map<number, HourlySeries>();
+      for (const f of FAC) {
+        tSeries.set(f.serno, addTrafoKaybiToSeries(seriesOf(rawCons(f), f.gn), tOf(f.serno), keys));
+      }
+      const tPool = runPool(tSeries);
+      for (const f of FAC) {
+        assertClose(
+          `tahsis t'li ≡ fixture (${f.serno})`,
+          tPool.perSerno.get(f.serno)!.allocTotal,
+          pool.perSerno.get(f.serno)!.allocTotal,
+          1e-6
+        );
+        const aug = addTrafoKaybiToRows(rowsOf(rawCons(f), f.gn), tOf(f.serno), keys);
+        const agg = computeHourlyNetAggregates({
+          rows: aug.rows,
+          view: viewOf(f, tPool),
+          ptfMap,
+          trafoKaybiKwh: aug.trafoKwh,
+        });
+        if (tOf(f.serno) > 0) {
+          // Faturadaki TRFKYB toplamı: 381,92 + 173,60 + 277,76 = 833,28 = 1,12 × 744
+          assertClose(`trafo kWh = TRFKYB 833,28 (${f.serno})`, agg.trafoKaybiKwh, 833.28, 1e-6);
+        }
+        const b = calculateInvoiceMethod7(
+          m7Input(agg),
+          null,
+          meramInputs(agg, f.gddk, { trafoKaybiSaatlik: tOf(f.serno) })
+        );
+        assertClose(`toplam t'li ≡ fixture (${f.serno})`, b.totalInvoice, natural.get(f.serno)!.totalInvoice, 1e-6);
+      }
+    }
+
+    // ── trafoKaybi.ts birimleri
+    console.log("\n  ▸ trafoKaybi.ts birimleri");
+    {
+      const r = addTrafoKaybiToRows(
+        [
+          { ts: tsAt(0), cn: 5, gn: 1 },
+          { ts: tsAt(0), cn: 2, gn: 0 }, // aynı saatin 2. satırı → t EKLENMEZ
+          { ts: tsAt(2), cn: 3, gn: 0 },
+          { ts: tsAt(9), cn: 4, gn: 0 }, // ızgara dışı → aynen
+        ],
+        1,
+        [keyAt(0), keyAt(1), keyAt(2)]
+      );
+      const sumCn = r.rows.reduce((s, x) => s + Number(x.cn), 0);
+      assertTrue("eksik saat açıldı (5 satır)", r.rows.length === 5);
+      assertClose("Σcn = 14 + 3×t (çift satıra tek ekleme)", sumCn, 17, 1e-12);
+      assertClose("trafoKwh = t × saat", r.trafoKwh, 3, 1e-12);
+      const filled = r.rows.find((x) => String(x.ts).slice(0, 13) === keyAt(1));
+      assertTrue("eksik saat {cn: t, gn: 0}", filled != null && Number(filled.cn) === 1 && Number(filled.gn) === 0);
+      const same = addTrafoKaybiToRows([{ ts: tsAt(0), cn: 5, gn: 1 }], 0, [keyAt(0), keyAt(1)]);
+      assertTrue("t = 0 → satırlar aynen, trafoKwh 0", same.rows.length === 1 && Number(same.rows[0].cn) === 5 && same.trafoKwh === 0);
+      const s0: HourlySeries = new Map([[keyAt(0), { cn: 2, gn: 7 }]]);
+      assertTrue("seri: t = 0 → aynı örnek", addTrafoKaybiToSeries(s0, 0, [keyAt(0)]) === s0);
+      const s1 = addTrafoKaybiToSeries(s0, 1.5, [keyAt(0), keyAt(1)]);
+      assertTrue(
+        "seri: cn += t, eksik saat {t, 0}, gn aynen, girdi değişmez",
+        s1.get(keyAt(0))!.cn === 3.5 && s1.get(keyAt(0))!.gn === 7 && s1.get(keyAt(1))!.cn === 1.5 &&
+          s1.get(keyAt(1))!.gn === 0 && s0.get(keyAt(0))!.cn === 2
+      );
+      assertTrue("ızgara kapağı (capIso) 10 saat", hourGridKeys(tsAt(0), tsAt(744), { capIso: tsAt(10) }).length === 10);
+      assertTrue("endInclusive ızgara 745 saat", hourGridKeys(tsAt(0), tsAt(744), { endInclusive: true }).length === 745);
+      assertTrue(
+        "tamamlanmış dönem → kapak yok",
+        trafoGridCapIso({ startIso: tsAt(0), endIso: tsAt(744), lastTs: tsAt(700), nowMs: t0 + 800 * HOUR }) === null
+      );
+      assertTrue(
+        "cari dönem → son veri saati + 1",
+        trafoGridCapIso({ startIso: tsAt(0), endIso: tsAt(744), lastTs: tsAt(5), nowMs: t0 + 7.5 * HOUR }) === tsAt(6)
+      );
+      assertTrue(
+        "cari dönem, veri yok → ızgara boş",
+        trafoGridCapIso({ startIso: tsAt(0), endIso: tsAt(744), lastTs: null, nowMs: t0 + 7 * HOUR }) === tsAt(0)
+      );
+      assertTrue("normalizeTrafoKaybi(null/−1/'1,12'/1.12)",
+        normalizeTrafoKaybi(null) === 0 && normalizeTrafoKaybi(-1) === 0 && normalizeTrafoKaybi("x") === 0 &&
+          normalizeTrafoKaybi("1.12") === 1.12);
+    }
+
+    // ── Override öncelikleri ve m7'de etkisiz kalemler (10126953 üzerinden)
+    console.log("\n  ▸ override öncelikleri (10126953)");
+    {
+      const agg = aggBySerno.get(10126953)!;
+      const nat = natural.get(10126953)!;
+      const line = (o: Partial<{ isExcluded: boolean; unitPriceOverride: number | null; amountOverride: number | null }>) => ({
+        isExcluded: false, unitPriceOverride: null, amountOverride: null, payload: null, note: null, ...o,
+      });
+      const run = (ov: InvoiceOverrides | null, over?: Partial<MethodInvoiceInput>, extra?: Partial<NonNullable<InvoiceMethodInputs["meram"]>>) =>
+        calculateInvoiceMethod7(m7Input(agg, over), ov, meramInputs(agg, 82.26, extra));
+
+      const gOv = run({ yekdem_gddk: line({ amountOverride: 100 }) });
+      assertClose("GDDK override kazanır (satır2 = F + 100)", gOv.meram!.satir2, nat.meram!.mahsuplasmaFarki + 100, 1e-9);
+      assertTrue("appliedOverrides: yekdem_gddk", gOv.appliedOverrides?.amountOverriddenItems.includes("yekdem_gddk") === true);
+      assertClose("GDDK override BTV'ye akar", gOv.btvCharge, (gOv.energyCharge + gOv.meram!.satir2) * 0.01, 1e-9);
+      const gEx = run({ yekdem_gddk: line({ isExcluded: true }) });
+      assertClose("GDDK isExcluded → 0", gEx.meram!.gddk, 0, 0);
+      const gNone = calculateInvoiceMethod7(m7Input(agg), null, meramInputs(agg, null));
+      assertClose("GDDK yok → 0", gNone.meram!.gddk, 0, 0);
+
+      const eOv = run({ enerji: line({ unitPriceOverride: 3.5 }) });
+      assertClose("enerji birim override (N × 3,5)", eOv.energyCharge, agg.sumPos * 3.5, 1e-6);
+      const dOv = run({ dagitim: line({ unitPriceOverride: 1 }) });
+      assertClose("dağıtım birim override (C − G_own/2)", dOv.distributionCharge, agg.sumCn - agg.sumOwnGn / 2, 1e-6);
+      const mOv = run({ mahsuplasma: line({ unitPriceOverride: 0.5 }) });
+      assertClose("mahsuplaşma birim override (F = −M × 0,5)", mOv.meram!.mahsuplasmaFarki, -agg.sumMahsup * 0.5, 1e-6);
+      const adj = run(null, undefined, { unitPriceAdjustment: 0.1 });
+      assertClose("unit_price_adjustment U'ya eklenir", adj.energyUnitPriceApplied ?? 0, (nat.energyUnitPriceApplied ?? 0) + 0.1, 1e-12);
+
+      const ignored = run(
+        {
+          trafo: line({ amountOverride: 999 }),
+          yek: line({ amountOverride: 999 }),
+          yekdem_mahsup: { ...line({}), payload: { total_kwh: 1000, diff_yekdem: 1 } },
+        },
+        { trafoDegeri: 833 }
+      );
+      assertClose("trafo/yek/yekdem_mahsup override + trafo_degeri etkisiz", ignored.totalInvoice, nat.totalInvoice, 1e-9);
+      assertTrue("etkisiz kalemler appliedOverrides'ta yok", ignored.appliedOverrides == null);
+    }
   }
 }
 

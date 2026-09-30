@@ -184,8 +184,10 @@ export default function BackdatedInvoiceModal({ uid, onClose, onCreated }: Props
   // Alanın bu method için ANLAMLI olup olmadığı (salt okunur gösterim de buna bağlı).
   const relevance = useMemo(() => {
     if (!form) return null;
+    // Metod 7 (Meram): önceki dönem YEKDEM mahsubu yok → prev alanları anlamsız.
     const needsPrev =
       (form.methodId === 1 || form.methodId === 6 || isNetInvoiceMethod(form.methodId)) &&
+      form.methodId !== 7 &&
       !form.lisansliSatis &&
       form.prevConsumptionExists;
     return {
@@ -494,6 +496,7 @@ export default function BackdatedInvoiceModal({ uid, onClose, onCreated }: Props
                 ))}
 
               {(form.methodId === 1 || form.methodId === 6 || isNetInvoiceMethod(form.methodId)) &&
+                form.methodId !== 7 &&
                 !form.lisansliSatis &&
                 !form.prevConsumptionExists && (
                   <p className="text-xs text-neutral-500">

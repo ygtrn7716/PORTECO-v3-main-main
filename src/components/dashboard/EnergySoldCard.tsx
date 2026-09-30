@@ -324,6 +324,8 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
               priority: allocView.priority,
               allocatedKwh,
               isSource: allocView.isSource,
+              mode: allocView.mode,
+              ownGnTotal: allocView.ownGnTotal,
             };
           } else {
             alloc = { role: "source" };
@@ -495,8 +497,8 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
                     </div>
                   </div>
                   <p className="mt-4 text-xs text-neutral-400">
-                    Metot 2: mahsup faturada ayrı satır değil — enerji bedeli saatlik
-                    mahsup sonrası net tüketim üzerinden hesaplanır.
+                    Bu metotta mahsup faturada ayrı satır olarak gösterilmez — enerji bedeli
+                    saatlik mahsup sonrası net tüketim üzerinden hesaplanır.
                   </p>
                 </>
               ) : derived.mahsup.kind === "info-only" ? (
