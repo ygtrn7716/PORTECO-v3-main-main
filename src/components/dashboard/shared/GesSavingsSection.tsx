@@ -32,9 +32,13 @@ import {
   resolveUnitPriceOverride,
 } from "@/components/utils/invoiceOverrides";
 import { coerceInvoiceMethodId } from "@/lib/invoiceMethods";
-import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
+import { calculateGesUretimSatisi, gesSatisKesintiArgs, parseGesSaleDistBasis } from "@/lib/ges/gesUretimSatisi";
 import { deriveGesSatisMahsup } from "@/lib/ges/gesSatisMahsup";
 import { resolveGesSatisDagitimRate } from "@/lib/ges/gesSatisDagitimRate";
+import {
+  loadMedasVerisKesintisiSafe,
+  medasHostKatkiFromBreakdown,
+} from "@/lib/ges/medasVerisKesinti";
 import GesSavingsCard from "@/components/dashboard/shared/GesSavingsCard";
 
 interface Props {
@@ -196,10 +200,15 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
           let verisMahsupKwh = 0;
           let satisKwh = 0;
           let satisNetGelir = 0;
+          // MEDAŞ usulü (dagitim_kendi_veris damgalı) → karşı-olgu da aynı dağıtım kuralı.
+          let snapKendiVeris: { ureticiBirim: number } | null = null;
           try {
             const bd = buildSnapshotBreakdown(snap);
             verisMahsupKwh = bd.verisMahsupKwh;
             satisKwh = bd.verisFazlaKwh;
+            if (bd.dagitimKendiVeris) {
+              snapKendiVeris = { ureticiBirim: bd.dagitimKendiVeris.medasBirim };
+            }
             if (satisKwh > 0) {
               const dagitimRate = await resolveGesSatisDagitimRate({
                 supabase,
@@ -208,12 +217,29 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
                 storedRate: snap.ges_satis_dagitim_bedeli,
                 lisansliSatis: snap.lisansli_satis,
               });
+              // MEDAŞ usulü kesinti: satışa akan bayraklı tesislerin veriş faturaları.
+              const medasKesinti = bd.dagitimKendiVeris
+                ? await loadMedasVerisKesintisiSafe({
+                    supabase,
+                    userId,
+                    hostSerno: subscriptionSerno,
+                    periodYear,
+                    periodMonth,
+                    prefer: "snapshot",
+                    host: medasHostKatkiFromBreakdown(bd),
+                  })
+                : null;
               satisNetGelir = calculateGesUretimSatisi({
                 satisKwh,
                 onYil: snap.on_yil ?? false,
                 usdKur: Number(snap.usd_kur) || 0,
                 perakendeEnerjiBedeli: Number(snap.perakende_enerji_bedeli) || 0,
-                dagitimBedeli: dagitimRate,
+                ...gesSatisKesintiArgs(
+                  bd,
+                  dagitimRate,
+                  medasKesinti,
+                  parseGesSaleDistBasis(snap.ges_sale_dist_basis)
+                ),
               }).satisNetGelir;
             }
           } catch {
@@ -263,6 +289,7 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
             invoiceMethodId: coerceInvoiceMethodId(snap.invoice_method),
             // Metod 2/3: karşı-olgusalın önceki dönem YEKDEM alanları snapshot'tan.
             methodInputs: methodInputsFromSnapshotRow(snap) ?? null,
+            dagitimKendiVeris: snapKendiVeris,
           });
         } else {
           // ── CANLI FALLBACK (snapshot yok — fatura sayfasının canlı pipeline'ı) ──
@@ -287,6 +314,21 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
             lineOverrides?.enerji
           );
 
+          // MEDAŞ usulü kesinti (bayraklı m1, satış varsa) — canlı kaynak.
+          const medasKesinti =
+            built.breakdown.dagitimKendiVeris && built.breakdown.verisFazlaKwh > 0
+              ? await loadMedasVerisKesintisiSafe({
+                  supabase,
+                  userId,
+                  hostSerno: subscriptionSerno,
+                  periodYear,
+                  periodMonth,
+                  prefer: "live",
+                  host: medasHostKatkiFromBreakdown(built.breakdown),
+                })
+              : null;
+          if (cancel) return;
+
           // Mahsup/satış ayrımı fatura sayfasıyla ortak türeticiden (Metod 4
           // satış kuralı dahil — snapshot yolundaki verisFazlaKwh kısıtı yok).
           const derived = deriveGesSatisMahsup({
@@ -299,6 +341,8 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
             perakendeEnerjiBedeli: inputs.perakendeEnerjiBedeli,
             dagitimBedeli: inputs.dagitimUreticiBedeli,
             unitPriceEnergy: effUnitPriceEnergy,
+            medasKesinti,
+            gesSaleDistBasis: inputs.gesSaleDistBasis,
           });
 
           const allocatedKwh = inputs.allocatedGesKwh;
@@ -340,6 +384,9 @@ export default function GesSavingsSection({ userId, subscriptionSerno, hasGesApi
             perakendeEnerjiBedeli: inputs.perakendeEnerjiBedeli,
             invoiceMethodId: inputs.invoiceMethodId,
             methodInputs: inputs.methodInputs,
+            dagitimKendiVeris: inputs.dagitimKendiVeris
+              ? { ureticiBirim: inputs.dagitimKendiVeris.ureticiBirim }
+              : null,
           });
         }
 

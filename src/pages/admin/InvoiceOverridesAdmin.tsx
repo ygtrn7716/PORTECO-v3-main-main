@@ -7,7 +7,7 @@
 // birim fiyat, tutar sabitleme, kalemi faturadan çıkarma, reaktif Ri/Rc değeri.
 // Kaydetmeden önce "Doğal vs Düzenlenmiş" canlı önizleme gösterilir.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { dayjsTR } from "@/lib/dayjs";
 import { Search, ChevronLeft, ChevronRight, RotateCcw } from "lucide-react";
@@ -96,6 +96,8 @@ type FacilityRow = {
   provider: string | null;
   terim: string | null;
   trafo_degeri: number | null;
+  /** Saatlik trafo kaybı (kWh/saat) — Metot 1/7'de doluysa trafo = t × dönem saati. */
+  trafo_kaybi_saatlik: number | null;
 };
 
 /** Form satırı — string'ler kontrollü input için (boş ≠ 0). */
@@ -277,6 +279,24 @@ export default function InvoiceOverridesAdmin() {
     [draft, savedDraft]
   );
 
+  /*
+   * Yazım anahtarı kapısı (Ağu 2026 10128583 snapshot hatası): tesis/dönem değişince
+   * girdiler async yüklenirken eski tesisin `inputs`/taslağı ekranda kalıyordu ve
+   * "Kaydet + Snapshot'ı Yeniden Yaz" YENİ serno + ESKİ girdilerle yazıyordu.
+   * `loadedKey` girdilerle AYNI anda set edilir; yazıcılar yalnız `ready` iken çalışır.
+   * `keyRef` await sonrası setter'ların başka bir tesise düşmesini engeller.
+   */
+  const currentKey =
+    selectedUserId && selectedSerno != null
+      ? `${selectedUserId}|${selectedSerno}|${periodYear}|${periodMonth}`
+      : null;
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
+  const keyRef = useRef<string | null>(currentKey);
+  useEffect(() => {
+    keyRef.current = currentKey;
+  }, [currentKey]);
+  const ready = !inputsLoading && currentKey != null && loadedKey === currentKey;
+
   /* ---------- 1) Kullanıcılar ---------- */
   useEffect(() => {
     let mounted = true;
@@ -336,13 +356,18 @@ export default function InvoiceOverridesAdmin() {
       const sernos = (osData ?? []).map((r) => r.subscription_serno);
       const settingsMap = new Map<
         number,
-        { nickname: string | null; terim: string | null; trafo_degeri: number | null }
+        {
+          nickname: string | null;
+          terim: string | null;
+          trafo_degeri: number | null;
+          trafo_kaybi_saatlik: number | null;
+        }
       >();
 
       if (sernos.length > 0) {
         const { data: ssData } = await supabase
           .from("subscription_settings")
-          .select("subscription_serno, nickname, terim, trafo_degeri")
+          .select("subscription_serno, nickname, terim, trafo_degeri, trafo_kaybi_saatlik")
           .eq("user_id", selectedUserId)
           .in("subscription_serno", sernos);
         for (const r of ssData ?? []) {
@@ -350,6 +375,7 @@ export default function InvoiceOverridesAdmin() {
             nickname: r.nickname,
             terim: r.terim,
             trafo_degeri: r.trafo_degeri,
+            trafo_kaybi_saatlik: r.trafo_kaybi_saatlik,
           });
         }
       }
@@ -366,6 +392,7 @@ export default function InvoiceOverridesAdmin() {
             nickname: s?.nickname ?? null,
             terim: s?.terim ?? null,
             trafo_degeri: s?.trafo_degeri ?? null,
+            trafo_kaybi_saatlik: s?.trafo_kaybi_saatlik ?? null,
           };
         })
       );
@@ -386,10 +413,19 @@ export default function InvoiceOverridesAdmin() {
       setDraft(emptyDraft());
       setSavedDraft(emptyDraft());
       setHasSnapshot(false);
+      setLoadedKey(null);
       return;
     }
 
     let mounted = true;
+    const key = `${selectedUserId}|${selectedSerno}|${periodYear}|${periodMonth}`;
+    // Eşzamanlı sıfırlama: önceki tesisin girdisi/taslağı yükleme boyunca EKRANDA
+    // kalmasın ve hiçbir yazıcıya ulaşmasın.
+    setInputs(null);
+    setHasSnapshot(false);
+    setDraft(emptyDraft());
+    setSavedDraft(emptyDraft());
+    setLoadedKey(null);
     setInputsLoading(true);
     setInputsErr(null);
     setNoDataReason(null);
@@ -442,9 +478,14 @@ export default function InvoiceOverridesAdmin() {
           setInputs(null);
           setNoDataReason(res.reason);
         }
+        // "Veri yok" (ok:false) da hazır sayılır: override yine kaydedilebilir.
+        setLoadedKey(key);
       } catch (e: unknown) {
         if (!mounted) return;
         setInputs(null);
+        // Hata dalında anahtar set EDİLMEZ (yazıcılar kapalı kalır); taslak bayat olmasın.
+        setDraft(emptyDraft());
+        setSavedDraft(emptyDraft());
         setInputsErr(e instanceof Error ? e.message : "Fatura girdileri yüklenemedi.");
       } finally {
         if (mounted) setInputsLoading(false);
@@ -489,9 +530,15 @@ export default function InvoiceOverridesAdmin() {
    */
   const visibleItems = useMemo<InvoiceOverrideItemKey[]>(() => {
     if (!selectedFacility) return [];
-    const trafo = Number(selectedFacility.trafo_degeri ?? 0);
+    // Metot 1: saatlik trafo (t) doluysa trafo kalemi t × saat ile oluşur (trafo_degeri yok sayılır).
+    const trafo =
+      Number(selectedFacility.trafo_degeri ?? 0) + Number(selectedFacility.trafo_kaybi_saatlik ?? 0);
     const m7 = inputs?.invoiceMethodId === 7;
+    const m8 = inputs?.invoiceMethodId === 8;
     return ITEM_ORDER.filter((key) => {
+      // Metod 8 (Kayseri OSB): yalnız enerji (P birim / tutar), ETV (btv) ve reaktif anlamlı;
+      // YEKDEM fiyat farkı aşağıdaki kartta. Diğer anahtarları motor yok sayar.
+      if (m8) return key === "enerji" || key === "btv" || key === "reaktif";
       // Metod 7 (Meram): aylık trafo_degeri kullanılmaz (saatlik t tüketimde).
       if (key === "trafo") return trafo > 0 && !m7;
       if (key === "dagitim") return selectedFacility.provider !== "vhs_kayseri";
@@ -536,6 +583,8 @@ export default function InvoiceOverridesAdmin() {
     inputs != null && isEmbeddedYekdemMethod(inputs.invoiceMethodId);
   // Metod 7 (Meram): sonraki ay YEKDEM mahsubu yok → manuel mahsup kartı gizli.
   const isMeram = inputs?.invoiceMethodId === 7;
+  // Metod 8 (Kayseri OSB): 'yekdem_mahsup' override'ı YEKDEM fiyat farkı kalemine köprülenir.
+  const isOsb = inputs?.invoiceMethodId === 8;
 
   const showVerisWarning =
     draft.enerji.isExcluded && (naturalResult?.breakdown.verisMahsupKwh ?? 0) > 0;
@@ -544,6 +593,8 @@ export default function InvoiceOverridesAdmin() {
 
   /* ---------- Kirli değişiklik guard'ı ---------- */
   const guardSwitch = (fn: () => void) => {
+    // Yazım sürerken tesis/dönem değişmesin (await sonrası setter'lar yeni seçime düşerdi).
+    if (saving) return;
     if (dirty && !window.confirm("Kaydedilmemiş değişiklikler var. Devam edilsin mi?")) return;
     fn();
   };
@@ -552,8 +603,8 @@ export default function InvoiceOverridesAdmin() {
     setDraft((p) => ({ ...p, [key]: { ...p[key], ...patch } }));
 
   /* ---------- Kaydet ---------- */
-  const persistOverrides = async () => {
-    if (!selectedUserId || selectedSerno == null) return;
+  const persistOverrides = async (key: string) => {
+    if (!selectedUserId || selectedSerno == null || key !== currentKey) return;
     for (const key of ITEM_ORDER) {
       // Görünmeyen kalem hiç yazılmaz (guard'lı kalemler).
       if (!visibleItems.includes(key)) continue;
@@ -601,14 +652,16 @@ export default function InvoiceOverridesAdmin() {
       });
     }
 
-    setSavedDraft(draft);
+    if (keyRef.current === key) setSavedDraft(draft);
   };
 
   const handleSave = async () => {
+    if (!ready || currentKey == null) return;
+    const key = currentKey;
     setSaving(true);
     setMsg(null);
     try {
-      await persistOverrides();
+      await persistOverrides(key);
       setMsg({ type: "ok", text: "Kalem düzenlemeleri kaydedildi." });
     } catch (e: unknown) {
       setMsg({ type: "err", text: e instanceof Error ? e.message : "Kaydedilemedi." });
@@ -618,11 +671,13 @@ export default function InvoiceOverridesAdmin() {
 
   /** Kaydet + o dönemin snapshot'ını override'lı EFEKTİF değerlerle yeniden yaz. */
   const handleSaveAndRewriteSnapshot = async () => {
+    if (!ready || currentKey == null) return;
     if (!selectedUserId || selectedSerno == null || !inputs || !editedResult) return;
+    const key = currentKey;
     setSaving(true);
     setMsg(null);
     try {
-      await persistOverrides();
+      await persistOverrides(key);
 
       // Haritalama tek kaynaktan (snapshotParamsFromEngine): efektif birim
       // fiyatlar, efektif mahsup ve metod damgası dahil — backdated writer ile
@@ -640,7 +695,7 @@ export default function InvoiceOverridesAdmin() {
         })
       );
 
-      setHasSnapshot(true);
+      if (keyRef.current === key) setHasSnapshot(true);
       setMsg({ type: "ok", text: "Kaydedildi ve snapshot yeniden yazıldı." });
     } catch (e: unknown) {
       setMsg({ type: "err", text: e instanceof Error ? e.message : "Snapshot yazılamadı." });
@@ -649,7 +704,9 @@ export default function InvoiceOverridesAdmin() {
   };
 
   const handleResetItem = async (key: InvoiceOverrideItemKey) => {
+    if (!ready || currentKey == null) return;
     if (!selectedUserId || selectedSerno == null) return;
+    const startKey = currentKey;
     setSaving(true);
     setMsg(null);
     try {
@@ -660,8 +717,10 @@ export default function InvoiceOverridesAdmin() {
         periodMonth,
         itemKey: key,
       });
-      setDraft((p) => ({ ...p, [key]: emptyRow() }));
-      setSavedDraft((p) => ({ ...p, [key]: emptyRow() }));
+      if (keyRef.current === startKey) {
+        setDraft((p) => ({ ...p, [key]: emptyRow() }));
+        setSavedDraft((p) => ({ ...p, [key]: emptyRow() }));
+      }
       setMsg({ type: "ok", text: `${ITEM_LABELS[key]} varsayılana döndürüldü.` });
     } catch (e: unknown) {
       setMsg({ type: "err", text: e instanceof Error ? e.message : "Sıfırlanamadı." });
@@ -670,7 +729,9 @@ export default function InvoiceOverridesAdmin() {
   };
 
   const handleClearPeriod = async () => {
+    if (!ready || currentKey == null) return;
     if (!selectedUserId || selectedSerno == null) return;
+    const startKey = currentKey;
     setSaving(true);
     setMsg(null);
     try {
@@ -680,8 +741,10 @@ export default function InvoiceOverridesAdmin() {
         periodYear,
         periodMonth,
       });
-      setDraft(emptyDraft());
-      setSavedDraft(emptyDraft());
+      if (keyRef.current === startKey) {
+        setDraft(emptyDraft());
+        setSavedDraft(emptyDraft());
+      }
       setConfirmClear(false);
       setMsg({ type: "ok", text: `${n} kalem düzenlemesi silindi.` });
     } catch (e: unknown) {
@@ -696,6 +759,25 @@ export default function InvoiceOverridesAdmin() {
     const nb = naturalResult.breakdown;
     const eb = editedResult.breakdown;
     const excluded = new Set(eb.appliedOverrides?.excludedItems ?? []);
+    // Metod 8 (Kayseri OSB): OSB bildirimi kalemleri (veriş mahsup / post-total satırı yok).
+    const no = nb.osb;
+    const eo = eb.osb;
+    if (no && eo) {
+      return [
+        { label: "Aktif Enerji", natural: no.aktifEnerji, edited: eo.aktifEnerji, excluded: excluded.has("enerji") },
+        { label: "Reaktif (Endüktif + Kapasitif)", natural: nb.reactivePenaltyCharge, edited: eb.reactivePenaltyCharge, excluded: excluded.has("reaktif") },
+        { label: "YEKDEM Fiyat Fark", natural: no.yekdemFiyatFarki, edited: eo.yekdemFiyatFarki, excluded: draft.yekdem_mahsup.isExcluded },
+        { label: "İletim Bedeli", natural: no.iletim, edited: eo.iletim, excluded: false },
+        { label: "OSB Dağıtım Sistemi Kullanım Bedeli", natural: no.osbDagitim, edited: eo.osbDagitim, excluded: false },
+        { label: "Lisanssız Üretim Çekiş", natural: no.cekis, edited: eo.cekis, excluded: false },
+        { label: "Lisanssız Üretim Veriş Dağıtım", natural: no.verisDagitim, edited: eo.verisDagitim, excluded: false },
+        { label: "Elektrik Tüketim Vergisi", natural: no.etv, edited: eo.etv, excluded: excluded.has("btv") },
+        { label: "KDV Matrahı", natural: nb.subtotalBeforeVat, edited: eb.subtotalBeforeVat, excluded: false, strong: true },
+        { label: "KDV", natural: nb.vatCharge, edited: eb.vatCharge, excluded: false },
+        { label: "Toplam Tutar", natural: nb.totalInvoice, edited: eb.totalInvoice, excluded: false, strong: true },
+        { label: "Ödenecek Toplam", natural: naturalResult.totalWithMahsup, edited: editedResult.totalWithMahsup, excluded: false, strong: true },
+      ];
+    }
     const rows: {
       label: string;
       natural: number;
@@ -740,7 +822,12 @@ export default function InvoiceOverridesAdmin() {
       rows.push({ label: "Trafo Kaybı", natural: nb.trafoCharge, edited: eb.trafoCharge, excluded: excluded.has("trafo") });
     }
     if (inputs && !inputs.isKayseriOsb) {
-      rows.push({ label: "Dağıtım Bedeli", natural: nb.distributionCharge, edited: eb.distributionCharge, excluded: excluded.has("dagitim") });
+      rows.push({
+        label: nb.dagitimKendiVeris ? "Elektrik Dağıtım Bedeli (kendi veriş)" : "Dağıtım Bedeli",
+        natural: nb.distributionCharge,
+        edited: eb.distributionCharge,
+        excluded: excluded.has("dagitim"),
+      });
     }
     rows.push({ label: "BTV", natural: nb.btvCharge, edited: eb.btvCharge, excluded: excluded.has("btv") });
     if (inputs && inputs.tariffType === "dual") {
@@ -780,6 +867,15 @@ export default function InvoiceOverridesAdmin() {
       excluded: false,
       strong: true,
     });
+    // MEDAŞ usulü: ayrı veriş faturası — bilgi satırı, hiçbir toplama GİRMEZ.
+    if ((nb.dagitimKendiVeris?.medasKwh ?? 0) > 0) {
+      rows.push({
+        label: "MEDAŞ Veriş Faturası (ayrı fatura — toplama girmez, KDV hariç)",
+        natural: nb.dagitimKendiVeris?.medasBedeli ?? 0,
+        edited: eb.dagitimKendiVeris?.medasBedeli ?? 0,
+        excluded: false,
+      });
+    }
     return rows;
   }, [naturalResult, editedResult, inputs, isNetMethod, isEmbedded, draft.yekdem_mahsup.isExcluded]);
 
@@ -834,6 +930,7 @@ export default function InvoiceOverridesAdmin() {
                 <button
                   key={u.user_id}
                   onClick={() => guardSwitch(() => setSelectedUserId(u.user_id))}
+                  disabled={saving}
                   className={`w-full text-left rounded-xl px-3 py-2.5 transition-all duration-200 ${
                     selectedUserId === u.user_id ? "bg-blue-50 ring-1 ring-blue-200" : "hover:bg-neutral-50"
                   }`}
@@ -874,6 +971,7 @@ export default function InvoiceOverridesAdmin() {
                   <button
                     key={f.subscription_serno}
                     onClick={() => guardSwitch(() => setSelectedSerno(f.subscription_serno))}
+                    disabled={saving}
                     className={`w-full text-left rounded-xl px-3 py-2.5 transition-all duration-200 ${
                       selectedSerno === f.subscription_serno
                         ? "bg-blue-50 ring-1 ring-blue-200"
@@ -909,6 +1007,7 @@ export default function InvoiceOverridesAdmin() {
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => guardSwitch(() => setPeriodYear((y) => y - 1))}
+                    disabled={saving}
                     className="rounded-lg p-1.5 hover:bg-neutral-100 transition-colors"
                   >
                     <ChevronLeft size={18} />
@@ -918,6 +1017,7 @@ export default function InvoiceOverridesAdmin() {
                   </span>
                   <button
                     onClick={() => guardSwitch(() => setPeriodYear((y) => Math.min(y + 1, dayjsTR().year())))}
+                    disabled={saving}
                     className="rounded-lg p-1.5 hover:bg-neutral-100 transition-colors"
                   >
                     <ChevronRight size={18} />
@@ -927,6 +1027,7 @@ export default function InvoiceOverridesAdmin() {
                 <select
                   className="rounded-lg border px-3 py-2 text-sm"
                   value={periodMonth}
+                  disabled={saving}
                   onChange={(e) => {
                     const v = Number(e.target.value);
                     guardSwitch(() => setPeriodMonth(v));
@@ -1006,7 +1107,9 @@ export default function InvoiceOverridesAdmin() {
                       const disabled = row.isExcluded;
                       const naturalUnit =
                         key === "enerji"
-                          ? inputs?.unitPriceEnergy
+                          ? inputs?.methodInputs?.osb
+                            ? inputs.methodInputs.osb.enerjiFiyati
+                            : inputs?.unitPriceEnergy
                           : key === "dagitim"
                             ? inputs?.unitPriceDistribution
                             : null;
@@ -1068,6 +1171,7 @@ export default function InvoiceOverridesAdmin() {
                               type="checkbox"
                               checked={!row.isExcluded}
                               onChange={(e) => setRow(key, { isExcluded: !e.target.checked })}
+                              disabled={!ready}
                               className="rounded border-neutral-300"
                             />
                           </td>
@@ -1077,7 +1181,7 @@ export default function InvoiceOverridesAdmin() {
                               <input
                                 type="number"
                                 step="any"
-                                disabled={disabled}
+                                disabled={disabled || !ready}
                                 value={row.unitPrice}
                                 onChange={(e) => setRow(key, { unitPrice: e.target.value })}
                                 placeholder={naturalUnit != null ? `Doğal: ${fmtUnit(naturalUnit)}` : "—"}
@@ -1092,7 +1196,7 @@ export default function InvoiceOverridesAdmin() {
                             <input
                               type="number"
                               step="any"
-                              disabled={disabled}
+                              disabled={disabled || !ready}
                               value={row.amount}
                               onChange={(e) => setRow(key, { amount: e.target.value })}
                               placeholder={naturalAmount != null ? `Doğal: ${fmtMoney2(naturalAmount)}` : "—"}
@@ -1105,6 +1209,7 @@ export default function InvoiceOverridesAdmin() {
                               type="text"
                               value={row.note}
                               onChange={(e) => setRow(key, { note: e.target.value })}
+                              disabled={!ready}
                               placeholder="Not"
                               className="w-40 rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
                             />
@@ -1113,7 +1218,7 @@ export default function InvoiceOverridesAdmin() {
                           <td className="py-2 pr-3">
                             <button
                               onClick={() => handleResetItem(key)}
-                              disabled={saving}
+                              disabled={saving || !ready}
                               title="Bu kalemi varsayılana döndür"
                               className="rounded-lg p-1.5 text-neutral-500 hover:bg-neutral-100 disabled:opacity-50 transition-colors"
                             >
@@ -1134,6 +1239,7 @@ export default function InvoiceOverridesAdmin() {
                     <span className="text-xs font-medium text-neutral-700">Reaktif Değerleri</span>
                     <button
                       onClick={() => setRow("reaktif", { riKwh: "0", rcKwh: "0" })}
+                      disabled={!ready}
                       className="rounded-lg bg-neutral-200 px-2.5 py-1 text-[11px] font-medium text-neutral-700 hover:bg-neutral-300 transition-colors"
                     >
                       Reaktifi Sıfırla
@@ -1147,6 +1253,7 @@ export default function InvoiceOverridesAdmin() {
                         step="any"
                         value={draft.reaktif.riKwh}
                         onChange={(e) => setRow("reaktif", { riKwh: e.target.value })}
+                        disabled={!ready}
                         placeholder={inputs ? `Doğal: ${fmtKwh(inputs.totalRi)}` : "—"}
                         className="w-40 rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
                       />
@@ -1158,6 +1265,7 @@ export default function InvoiceOverridesAdmin() {
                         step="any"
                         value={draft.reaktif.rcKwh}
                         onChange={(e) => setRow("reaktif", { rcKwh: e.target.value })}
+                        disabled={!ready}
                         placeholder={inputs ? `Doğal: ${fmtKwh(inputs.totalRc)}` : "—"}
                         className="w-40 rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
                       />
@@ -1177,7 +1285,79 @@ export default function InvoiceOverridesAdmin() {
 
               {/* YEKDEM Mahsubu (Manuel) — kalem DEĞİL, ayrı kart. Metod 7'de (Meram)
                   sonraki ay YEKDEM mahsubu yok → kart gizli (motor override'ı yok sayar). */}
-              {!isMeram && (
+              {/* Metod 8 (Kayseri OSB): YEKDEM Fiyat Farkı = önceki ay net tüketim × fark birimi.
+                  'yekdem_mahsup' payload köprüsü: total_kwh = önceki ay N, diff_yekdem = birim. */}
+              {isOsb && (
+              <div className="mt-4 rounded-xl border border-neutral-200 bg-neutral-50 p-3">
+                <span className="text-xs font-medium text-neutral-700">YEKDEM Fiyat Farkı (Manuel)</span>
+                <label className="mt-2 flex items-center gap-2 text-xs text-neutral-700">
+                  <input
+                    type="checkbox"
+                    checked={draft.yekdem_mahsup.isExcluded}
+                    onChange={(e) => setRow("yekdem_mahsup", { isExcluded: e.target.checked })}
+                    disabled={!ready}
+                    className="h-4 w-4 rounded border-neutral-300"
+                  />
+                  Bu ay bu kalemi faturadan çıkar
+                </label>
+                <div className="mt-3 flex flex-wrap gap-3">
+                  <label className="block">
+                    <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                      Önceki Ay Net Tüketim (kWh)
+                    </span>
+                    <input
+                      type="number"
+                      step="any"
+                      disabled={draft.yekdem_mahsup.isExcluded || !ready}
+                      value={draft.yekdem_mahsup.totalKwh}
+                      onChange={(e) => setRow("yekdem_mahsup", { totalKwh: e.target.value })}
+                      placeholder={
+                        inputs?.methodInputs?.prevSumPos != null
+                          ? `Doğal: ${fmtKwh(inputs.methodInputs.prevSumPos)}`
+                          : "Veri yok"
+                      }
+                      className="w-56 rounded-lg border border-neutral-300 px-3 py-2 text-sm disabled:bg-neutral-100 disabled:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                      YEKDEM Fark Birim Fiyatı (TL/kWh)
+                    </span>
+                    <input
+                      type="number"
+                      step="any"
+                      disabled={draft.yekdem_mahsup.isExcluded || !ready}
+                      value={draft.yekdem_mahsup.diffYekdem}
+                      onChange={(e) => setRow("yekdem_mahsup", { diffYekdem: e.target.value })}
+                      placeholder={
+                        inputs?.methodInputs?.osb
+                          ? `Doğal: ${fmtUnit(inputs.methodInputs.osb.yekdemFarkBirim)}`
+                          : "Veri yok"
+                      }
+                      className="w-56 rounded-lg border border-neutral-300 px-3 py-2 text-sm disabled:bg-neutral-100 disabled:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-blue-200"
+                    />
+                  </label>
+                </div>
+                {editedResult && (
+                  <div className="mt-2 text-[11px] text-neutral-600">
+                    Hesaplanan kalem:{" "}
+                    <span className="font-semibold">
+                      {fmtMoney2(editedResult.breakdown.osb?.yekdemFiyatFarki ?? 0)} ₺
+                    </span>{" "}
+                    <span className="text-neutral-400">
+                      (doğal: {fmtMoney2(naturalResult?.breakdown.osb?.yekdemFiyatFarki ?? 0)} ₺) — KDV
+                      matrahına girer, ETV'ye girmez
+                    </span>
+                  </div>
+                )}
+                <div className="mt-1 text-[10px] text-neutral-400">
+                  Birim fiyat normalde Admin › OSB Aylık Fiyatları'ndan gelir; buradaki değer yalnız bu
+                  tesisin bu ayını ezer.
+                </div>
+              </div>
+              )}
+
+              {!isMeram && !isOsb && (
               <div className="mt-4 rounded-xl border border-neutral-200 bg-neutral-50 p-3">
                 <div className="flex items-center justify-between mb-1">
                   <span className="text-xs font-medium text-neutral-700">
@@ -1207,6 +1387,7 @@ export default function InvoiceOverridesAdmin() {
                         onChange={(e) =>
                           setRow("yekdem_mahsup", { isExcluded: e.target.checked })
                         }
+                        disabled={!ready}
                         className="h-4 w-4 rounded border-neutral-300"
                       />
                       {isNetMethod
@@ -1224,7 +1405,7 @@ export default function InvoiceOverridesAdmin() {
                         <input
                           type="number"
                           step="any"
-                          disabled={draft.yekdem_mahsup.isExcluded}
+                          disabled={draft.yekdem_mahsup.isExcluded || !ready}
                           value={draft.yekdem_mahsup.totalKwh}
                           onChange={(e) =>
                             setRow("yekdem_mahsup", { totalKwh: e.target.value })
@@ -1252,7 +1433,7 @@ export default function InvoiceOverridesAdmin() {
                         <input
                           type="number"
                           step="any"
-                          disabled={draft.yekdem_mahsup.isExcluded}
+                          disabled={draft.yekdem_mahsup.isExcluded || !ready}
                           value={draft.yekdem_mahsup.diffYekdem}
                           onChange={(e) =>
                             setRow("yekdem_mahsup", { diffYekdem: e.target.value })
@@ -1409,7 +1590,7 @@ export default function InvoiceOverridesAdmin() {
               <div className="mt-5 flex flex-wrap items-center gap-2">
                 <button
                   onClick={handleSave}
-                  disabled={saving || !dirty}
+                  disabled={saving || !ready || !dirty}
                   className="rounded-lg bg-black px-4 py-2 text-sm text-white font-medium disabled:opacity-50 transition-opacity"
                 >
                   {saving ? "Kaydediliyor..." : "Kaydet"}
@@ -1417,9 +1598,11 @@ export default function InvoiceOverridesAdmin() {
 
                 <button
                   onClick={handleSaveAndRewriteSnapshot}
-                  disabled={saving || !inputs || !hasSnapshot}
+                  disabled={saving || !ready || !inputs || !hasSnapshot}
                   title={
-                    !hasSnapshot
+                    !ready
+                      ? "Tesis girdileri yükleniyor…"
+                      : !hasSnapshot
                       ? "Bu dönem için kayıtlı snapshot yok — yalnız mevcut snapshot yeniden yazılabilir."
                       : "Kaydet ve bu dönemin snapshot'ını efektif değerlerle yeniden yaz"
                   }
@@ -1430,7 +1613,7 @@ export default function InvoiceOverridesAdmin() {
 
                 <button
                   onClick={() => setConfirmClear(true)}
-                  disabled={saving || overrideCount === 0}
+                  disabled={saving || !ready || overrideCount === 0}
                   className="rounded-lg border border-red-300 px-4 py-2 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 transition-opacity"
                 >
                   Bu Ayın Tüm Düzenlemelerini Sil
@@ -1461,7 +1644,7 @@ export default function InvoiceOverridesAdmin() {
             </button>
             <button
               onClick={handleClearPeriod}
-              disabled={saving}
+              disabled={saving || !ready}
               className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
             >
               {saving ? "Siliniyor..." : "Evet, sil"}

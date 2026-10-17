@@ -25,11 +25,13 @@ import {
   calculateInvoiceForMethod,
   DEFAULT_INVOICE_METHOD,
   isNetInvoiceMethod,
+  isOsbInvoiceMethod,
   type InvoiceMethodId,
   type MethodInvoiceBreakdown,
 } from "@/lib/invoiceMethods";
 import {
   isIpragazYekBirlesikPeriod,
+  isTredasDagitimBolunmusPeriod,
   type InvoiceMethodInputs,
 } from "@/components/utils/calculateInvoiceNetMethods";
 import { computeHourlyNetAggregates } from "@/components/utils/hourlyNetAggregates";
@@ -134,6 +136,11 @@ export interface GesOlmasaydiParams {
    *  adj ve GDDK iki dünyada AYNI (GES'ten bağımsız); yalnız G_own = 0 (GES yok →
    *  kendi veriş yok → dağıtım D×C tam) ve mahsup 0. */
   methodInputs?: InvoiceMethodInputs | null;
+  /** Metot 1 "dağıtım kendi verişiyle" (MEDAŞ usulü) bayraklı tesis: karşı-olgusal fatura
+   *  da aynı dağıtım kuralıyla — GES yok → kendi veriş G = 0 → dağıtım round2(C × round6(D)),
+   *  C trafo dahil (lisanslı dahil; gerçek faturayla aynı trafo muamelesi). null/undefined
+   *  → bugünkü davranış. Dispatcher m1 dışında yok sayar. */
+  dagitimKendiVeris?: { ureticiBirim: number } | null;
 }
 
 /**
@@ -162,6 +169,30 @@ function meramCounterfactualRows<R extends { ts?: string | number | Date; cn?: u
     nowMs: Date.now(),
   });
   return addTrafoKaybiToRows(rows, t, hourGridKeys(startIso, endIso, { capIso }));
+}
+
+/**
+ * Metod 8 (Kayseri OSB) karşı-olgusu: GES yok → mahsup 0, N = C, G = 0 (üretim tesisi değil →
+ * OSB dağıtım uygulanır, lisanssız çekiş/veriş 0). P, ek bedeller, RI/RC ve önceki ay YEKDEM farkı
+ * iki dünyada AYNI (GES'ten bağımsız) → mevcut girdiden taşınır; saatlik yeniden okuma gerekmez.
+ * `hamKwh` verilirse (öz tüketim dalı: çekiş + üretim − veriş) C onun yerine geçer.
+ * Mevcut girdide `osb` yoksa null → çağıran "yaklaşık" rozetine düşer.
+ */
+function osbCounterfactualMi(
+  prev: InvoiceMethodInputs | null | undefined,
+  hamKwh: number | null
+): InvoiceMethodInputs | null {
+  if (!prev?.osb) return null;
+  const C = hamKwh ?? prev.sumCn;
+  return {
+    ...prev,
+    sumCn: C,
+    sumGn: 0,
+    sumPos: C,
+    sumMahsup: 0,
+    sumExcess: 0,
+    osb: { ...prev.osb, ownGnTotal: 0 },
+  };
 }
 
 /** Metod 7 karşı-olgu `meram` bloğu: G_own = 0, trafo kWh karşı-olgu satırlarından. */
@@ -212,11 +243,13 @@ function assembleResult(args: {
   // (hamBirimFiyat = (PTF+YEKDEM)×KBK, YEK dahil) düşer — Metod 1/4 ile aynı görünüm.
   const mb = breakdown as MethodInvoiceBreakdown;
   // m7 (Meram): YEKDEM zaten enerji birim fiyatında (U) → ayrışım yok, tek satır.
+  // m8 (Kayseri OSB): OSB aylık fiyatı tek birim → ayrışım yok.
   const splitOk =
     mb.energyUnitPriceApplied != null &&
     mb.netEnergyKwh > 0 &&
     !mb.yekEnerjiyeGomulu &&
-    !mb.meram;
+    !mb.meram &&
+    !mb.osb;
   const gesOlmasaydiEnerjiBirim = splitOk ? mb.energyUnitPriceApplied : undefined;
   const gesOlmasaydiYekBirim = splitOk
     ? (mb.yekTahminiCharge ?? 0) / mb.netEnergyKwh
@@ -315,6 +348,7 @@ async function buildNoGesCounterfactualMi(p: {
     prevTahminiYekdem: p.prev?.prevTahminiYekdem ?? null,
     prevGerceklesenYekdem: p.prev?.prevGerceklesenYekdem ?? null,
     mahsuplasmaUnitPrice: null,
+    ownGnTotal: 0, // GES yok → m3 bölünmüş dağıtım tabanı tam C
     ...(meramRows && p.prev
       ? { meram: meramCounterfactualBlock(p.prev, meramRows.trafoKwh) }
       : {}),
@@ -448,6 +482,13 @@ export async function calculateGesOlmasaydi(
   // İpragaz 2026-08+ (m5): karşı-olgusal fatura da YEK'i enerji satırına gömer
   // (ana faturayla aynı kapı; yalnız m5 okur, diğer metodlar yok sayar).
   const ipragazYekBirlesik = methodId === 5 && isIpragazYekBirlesikPeriod(periodYear, periodMonth);
+  // Trepaş 2026-09+ (m3): karşı-olgu da bölünmüş dağıtım kuralıyla (kendi veriş 0 → D×C).
+  const tredasDagitimBolunmus =
+    methodId === 3 && isTredasDagitimBolunmusPeriod(periodYear, periodMonth);
+  // Dağıtım kendi verişiyle (MEDAŞ): karşı-olguda G = 0 (GES yok). Dört kurucuya da girer.
+  const cfKendiVeris = params.dagitimKendiVeris
+    ? { dagitimKendiVeris: { ownGnKwh: 0, ureticiBirim: params.dagitimKendiVeris.ureticiBirim } }
+    : {};
 
   // ── Receiver modu: Talep Birleştirme ile mahsup alan üretimsiz tesis ──────
   // Üretim/veriş yok → ham tüketim = çekiş; DB fetch gerekmez. "GES olmasaydı
@@ -457,8 +498,9 @@ export async function calculateGesOlmasaydi(
     // 2C: karşı-olgusal = "tahsis hiç uygulanmasaydı" → efektif gn=0.
     // Saatlik tüketim + PTF'den gerçek metod 2/3 girdileri kurulur; veri yoksa
     // Metod 1 yaklaşımı korunur ve kart "yaklaşık" rozeti gösterir.
-    const cfMi =
-      isNetInvoiceMethod(methodId)
+    const cfMi = isOsbInvoiceMethod(methodId)
+      ? osbCounterfactualMi(params.methodInputs, null)
+      : isNetInvoiceMethod(methodId)
         ? await buildNoGesCounterfactualMi({
             supabase,
             userId,
@@ -488,6 +530,8 @@ export async function calculateGesOlmasaydi(
       // netPositiveDraw/netExcessFeed bilinçli geçilmiyor → aylık davranış (mahsup 0)
       methodInputs: cfMi ?? undefined,
       ipragazYekBirlesik,
+      tredasDagitimBolunmus,
+      ...cfKendiVeris,
     });
 
     return assembleResult({
@@ -497,7 +541,7 @@ export async function calculateGesOlmasaydi(
       hamTuketimKwh: params.mevcutTuketimKwh,
       gesUretimKwh: 0,
       hamBirimFiyat: params.mevcutBirimFiyat,
-      approximate: (isNetInvoiceMethod(methodId)) && cfMi == null,
+      approximate: (isNetInvoiceMethod(methodId) || isOsbInvoiceMethod(methodId)) && cfMi == null,
     });
   }
 
@@ -542,6 +586,8 @@ export async function calculateGesOlmasaydi(
       // aynen kullanılması demektir — ek fetch YOK, Metod 1 yaklaşımından kesin daha doğru.
       methodInputs: params.methodInputs ?? undefined,
       ipragazYekBirlesik,
+      tredasDagitimBolunmus,
+      ...cfKendiVeris,
     });
 
     return assembleResult({
@@ -586,8 +632,9 @@ export async function calculateGesOlmasaydi(
     // 2C: arazi GES → üretim tesisin anlık tüketimini beslemez; karşı-olgusalda
     // efektif gn=0 (tesis tahsis alıcısı olsa bile mahsup kalkar). Receiver
     // dalıyla aynı yardımcı; veri yoksa Metod 1 yaklaşımı + "yaklaşık" rozeti.
-    const cfMi =
-      isNetInvoiceMethod(methodId)
+    const cfMi = isOsbInvoiceMethod(methodId)
+      ? osbCounterfactualMi(params.methodInputs, null)
+      : isNetInvoiceMethod(methodId)
         ? await buildNoGesCounterfactualMi({
             supabase,
             userId,
@@ -617,6 +664,8 @@ export async function calculateGesOlmasaydi(
       // netPositiveDraw/netExcessFeed bilinçli geçilmiyor → aylık davranış (mahsup 0)
       methodInputs: cfMi ?? undefined,
       ipragazYekBirlesik,
+      tredasDagitimBolunmus,
+      ...cfKendiVeris,
     });
 
     return assembleResult({
@@ -627,7 +676,7 @@ export async function calculateGesOlmasaydi(
       gesUretimKwh: totalGesKwh,
       hamBirimFiyat: params.mevcutBirimFiyat,
       anlikUretimKullanimi: false,
-      approximate: (isNetInvoiceMethod(methodId)) && cfMi == null,
+      approximate: (isNetInvoiceMethod(methodId) || isOsbInvoiceMethod(methodId)) && cfMi == null,
     });
   }
 
@@ -774,8 +823,9 @@ export async function calculateGesOlmasaydi(
   // 8b) Metod 2/3 karşı-olgusal girdiler: GES yok → gn=0 ⇒ pos=cn=ham,
   // mahsup/excess=0, wPos = ham-ağırlıklı ÇIPLAK PTF (zaten hesaplandı).
   // Önceki dönem alanları mevcut dünyadan aynen taşınır (gerçekleşmiş veri).
-  const counterfactualMi: InvoiceMethodInputs | undefined =
-    isNetInvoiceMethod(methodId)
+  const counterfactualMi: InvoiceMethodInputs | undefined = isOsbInvoiceMethod(methodId)
+    ? osbCounterfactualMi(params.methodInputs, totalHamKwh) ?? undefined
+    : isNetInvoiceMethod(methodId)
       ? {
           sumCn: totalHamKwh,
           sumGn: 0,
@@ -789,6 +839,7 @@ export async function calculateGesOlmasaydi(
           prevTahminiYekdem: params.methodInputs?.prevTahminiYekdem ?? null,
           prevGerceklesenYekdem: params.methodInputs?.prevGerceklesenYekdem ?? null,
           mahsuplasmaUnitPrice: null, // mahsup 0 → muhtelif-2 zaten 0
+          ownGnTotal: 0, // GES yok → m3 bölünmüş dağıtım tabanı tam C
           ...(meramRows && params.methodInputs
             ? { meram: meramCounterfactualBlock(params.methodInputs, meramRows.trafoKwh) }
             : {}),
@@ -813,6 +864,8 @@ export async function calculateGesOlmasaydi(
     // on_yil ve perakende irrelevant — veriş 0
     methodInputs: counterfactualMi,
     ipragazYekBirlesik,
+    tredasDagitimBolunmus,
+    ...cfKendiVeris,
   });
 
   return assembleResult({

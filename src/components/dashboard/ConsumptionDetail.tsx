@@ -11,12 +11,13 @@ import { dayjsTR } from "@/lib/dayjs";
 import { computeMonthInvoiceToDate } from "@/components/utils/calculateInvoiceToDate";
 import type { MethodInvoiceBreakdown } from "@/components/utils/calculateInvoiceNetMethods";
 import GesUretimSatisiCard from "@/components/dashboard/shared/GesUretimSatisiCard";
+import { OsbInvoiceRows } from "@/components/dashboard/shared/OsbInvoiceRows";
 import {
   MERAM_BTV_TEXT,
   MeramSatir2Row,
   MeramYekdemBadge,
 } from "@/components/dashboard/shared/MeramInvoiceParts";
-import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
+import { calculateGesUretimSatisi, gesSatisKesintiArgs } from "@/lib/ges/gesUretimSatisi";
 
 import { ChevronDown } from "lucide-react";
 import { fetchAllConsumption } from "@/lib/paginatedFetch";
@@ -186,6 +187,8 @@ export default function ConsumptionDetail() {
   );
   // Metod 7 (Meram) tahmini: m7 motoru çıktısıysa kendi kalemleri (Satır 2, tahmini YEKDEM).
   const estimateMeram = (invoiceToDate?.breakdown as MethodInvoiceBreakdown | undefined)?.meram;
+  // Metod 8 (Kayseri OSB) tahmini: OSB bildirimi gövdesi (tahmini fiyat rozeti dahil).
+  const estimateOsb = (invoiceToDate?.breakdown as MethodInvoiceBreakdown | undefined)?.osb;
   // ─────────────────────────────
   // 0) Tesis listesini yükle
   // ─────────────────────────────
@@ -598,7 +601,9 @@ useEffect(() => {
 
       <div className="flex items-center gap-3">
         <div className="text-right">
-          <div className="text-xs text-neutral-500">Genel Toplam (YEKDEM Mahsubu Dahil)</div>
+          <div className="text-xs text-neutral-500">
+            {estimateOsb ? "Genel Toplam (Ödenecek)" : "Genel Toplam (YEKDEM Mahsubu Dahil)"}
+          </div>
           <div className="mt-1 text-2xl font-semibold text-neutral-900">
             {invoiceToDateLoading ? "…" : fmtMoney2(invoiceToDate?.totalWithMahsup)} TL
           </div>
@@ -642,6 +647,17 @@ useEffect(() => {
                 </thead>
 
                 <tbody>
+                  {estimateOsb ? (
+                    <OsbInvoiceRows
+                      osb={estimateOsb}
+                      subtotalBeforeVat={invoiceToDate.breakdown.subtotalBeforeVat}
+                      vatCharge={invoiceToDate.breakdown.vatCharge}
+                      totalInvoice={invoiceToDate.breakdown.totalInvoice}
+                      btvRate={invoiceToDate.btvRate}
+                      vatRate={invoiceToDate.vatRate}
+                    />
+                  ) : (
+                  <>
                   {!estimateExcludedItems.has("enerji") && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Enerji Bedeli</td>
@@ -690,7 +706,12 @@ useEffect(() => {
 
                   {!estimateExcludedItems.has("dagitim") && (
                     <tr className="border-b border-neutral-100">
-                      <td className="py-2 pr-4">Dağıtım Bedeli</td>
+                      <td className="py-2 pr-4">
+                        {/* MEDAŞ usulü (dağıtım kendi verişiyle): C (trafo dahil) × birim_eff */}
+                        {invoiceToDate.breakdown.dagitimKendiVeris
+                          ? "Elektrik Dağıtım Bedeli"
+                          : "Dağıtım Bedeli"}
+                      </td>
                       <td className="py-2 pr-4 text-neutral-600">
                         {fmtUnit6(invoiceToDate.breakdown.effectiveDistributionUnitPrice)} TL/kWh ×{" "}
                         <span className="font-medium text-amber-600">
@@ -816,6 +837,9 @@ useEffect(() => {
                   </tr>
                   )}
 
+                  </>
+                  )}
+
                   {invoiceToDate.digerDegerler !== 0 && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4 font-semibold">Diğer Bedeller</td>
@@ -831,7 +855,7 @@ useEffect(() => {
 
                   <tr>
                     <td className="py-3 pr-4 font-semibold text-neutral-900">
-                      Genel Toplam (YEKDEM Mahsubu Dahil)
+                      {estimateOsb ? "Genel Toplam (Ödenecek)" : "Genel Toplam (YEKDEM Mahsubu Dahil)"}
                     </td>
                     <td className="py-3 pr-4 text-neutral-600">Ödenecek toplam</td>
                     <td className="py-3 pr-4 text-right text-lg font-semibold text-neutral-900">
@@ -856,7 +880,12 @@ useEffect(() => {
                   onYil: invoiceToDate.onYil,
                   usdKur: invoiceToDate.monthlyUsdKur,
                   perakendeEnerjiBedeli: invoiceToDate.perakendeEnerjiBedeli,
-                  dagitimBedeli: invoiceToDate.dagitimUreticiBedeli,
+                  ...gesSatisKesintiArgs(
+                    invoiceToDate.breakdown,
+                    invoiceToDate.dagitimUreticiBedeli,
+                    null,
+                    invoiceToDate.gesSaleDistBasis
+                  ),
                 })}
                 lisansliSatis={invoiceToDate.lisansliSatis}
               />

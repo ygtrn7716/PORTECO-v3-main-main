@@ -14,6 +14,8 @@ export type ColumnOptionSource = {
   /** Sıralama kolonu; verilmezse labelKey ASC */
   orderBy?: string;
   limit?: number;
+  /** Opsiyonel eşitlik filtresi (`.match`), örn. { is_active: true }. */
+  filter?: Record<string, string | number | boolean>;
 };
 
 type LookupOption = { value: string; label: string };
@@ -199,7 +201,7 @@ export default function TableManager({ cfg }: { cfg: TableConfig }) {
         .filter((c) => c.type === "enum" && c.optionsFrom)
         .map(
           (c) =>
-            `${c.key}:${c.optionsFrom!.table}:${c.optionsFrom!.valueKey}:${c.optionsFrom!.labelKey}:${c.optionsFrom!.orderBy ?? ""}`
+            `${c.key}:${c.optionsFrom!.table}:${c.optionsFrom!.valueKey}:${c.optionsFrom!.labelKey}:${c.optionsFrom!.orderBy ?? ""}:${JSON.stringify(c.optionsFrom!.filter ?? null)}`
         )
         .join("|"),
     [cfg.columns]
@@ -213,9 +215,8 @@ export default function TableManager({ cfg }: { cfg: TableConfig }) {
       const next: Record<string, LookupOption[]> = {};
       for (const c of cols) {
         const src = c.optionsFrom!;
-        const { data, error } = await supabase
-          .from(src.table)
-          .select(`${src.valueKey},${src.labelKey}`)
+        const base = supabase.from(src.table).select(`${src.valueKey},${src.labelKey}`);
+        const { data, error } = await (src.filter ? base.match(src.filter) : base)
           .order(src.orderBy ?? src.labelKey, { ascending: true })
           .limit(src.limit ?? 1000);
         if (error) {

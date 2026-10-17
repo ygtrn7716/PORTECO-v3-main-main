@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import { Search, ChevronLeft, ChevronRight, Check } from "lucide-react";
+import { clearInvoiceMethodCache } from "@/lib/invoiceMethods";
+import { clearGesAllocationCache } from "@/components/utils/gesAllocation";
+import { clearHourlyNetAggregatesCache } from "@/components/utils/hourlyNetAggregates";
+import { clearMedasVerisKesintiCache } from "@/lib/ges/medasVerisKesinti";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -27,7 +31,8 @@ type SettingsForm = {
   gerilim: string | null;
   guc_bedel_limit: number | null;
   trafo_degeri: number | null;
-  // Metot 7 (Meram): saatlik trafo kaybı (kWh/saat) — dönemin her saatine eklenir.
+  // Saatlik trafo kaybı (kWh/saat). Metot 7: dönemin her saatine tüketime eklenir.
+  // Metot 1: doluysa trafo = t × dönem saati (trafo_degeri yok sayılır).
   trafo_kaybi_saatlik: number | null;
   nickname: string | null;
   on_yil: boolean;
@@ -40,6 +45,12 @@ type SettingsForm = {
   muhasebe_excel_enabled: boolean;
   // Muhasebe Excel çıktı formatı: 'standard' | 'penguen_tahakkuk' (müşteri bazlı sunum varyantı).
   muhasebe_excel_format: string;
+  // Metot 1/7 "dağıtım kendi verişiyle" (MEPAŞ/MEDAŞ usulü) — 20261010201938.
+  dagitim_kendi_veris: boolean;
+  // Aboneliğe özel fatura metodu (invoice_methods.id) — null = şirket metodu. 20261014075946.
+  invoice_method_override: number | null;
+  // GES Üretim Satışı kartı kesinti tabanı (yalnız Metot 3 Trepaş 2026-09+).
+  ges_sale_dist_basis: string;
 };
 
 type YekdemMonth = {
@@ -81,6 +92,9 @@ const EMPTY_SETTINGS: SettingsForm = {
   anlik_uretim_kullanimi: null,
   muhasebe_excel_enabled: false,
   muhasebe_excel_format: "standard",
+  dagitim_kendi_veris: false,
+  invoice_method_override: null,
+  ges_sale_dist_basis: "total_veris",
 };
 
 const MONTH_NAMES = [
@@ -125,6 +139,11 @@ export default function AdminUsersPage() {
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsMsg, setSettingsMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+  // Ayar yüklemesi başarısızsa kaydet KİLİTLİ: boş form `update(...settings)` ile tüm
+  // alanları (ör. dagitim_kendi_veris → false) sessizce ezerdi.
+  const [settingsLoadFailed, setSettingsLoadFailed] = useState(false);
+  // "Fatura metodu (aboneliğe özel)" seçenekleri — yalnız aktif metotlar.
+  const [methodOptions, setMethodOptions] = useState<{ id: number; name: string }[]>([]);
 
   // YEKDEM
   const [yekdemYear, setYekdemYear] = useState(new Date().getFullYear());
@@ -228,6 +247,32 @@ export default function AdminUsersPage() {
     return () => { mounted = false; };
   }, [selectedUserId]);
 
+  // 2b. Aktif fatura metotları (abonelik override select'i)
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      const { data, error } = await supabase
+        .from("invoice_methods")
+        .select("id, name")
+        .eq("is_active", true)
+        .order("id", { ascending: true });
+      if (!mounted) return;
+      if (error) {
+        console.error("invoice_methods load error:", error.message);
+        return;
+      }
+      setMethodOptions(
+        ((data ?? []) as { id: number; name: string }[]).map((m) => ({
+          id: Number(m.id),
+          name: String(m.name),
+        }))
+      );
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   // 3. Load settings when subscription selected
   useEffect(() => {
     if (!selectedUserId || selectedSerno == null) return;
@@ -235,17 +280,27 @@ export default function AdminUsersPage() {
     let mounted = true;
     setSettingsLoading(true);
     setSettingsMsg(null);
+    setSettingsLoadFailed(false);
 
     (async () => {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from("subscription_settings")
-        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, trafo_kaybi_saatlik, nickname, on_yil, satis_hakki, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi, muhasebe_excel_enabled, muhasebe_excel_format")
+        .select("kbk, terim, tarife, gerilim, guc_bedel_limit, trafo_degeri, trafo_kaybi_saatlik, nickname, on_yil, satis_hakki, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi, muhasebe_excel_enabled, muhasebe_excel_format, dagitim_kendi_veris, invoice_method_override, ges_sale_dist_basis")
         .eq("user_id", selectedUserId)
         .eq("subscription_serno", selectedSerno)
         .maybeSingle();
 
       if (!mounted) return;
-      setSettings(data ?? { ...EMPTY_SETTINGS });
+      if (error) {
+        setSettings({ ...EMPTY_SETTINGS });
+        setSettingsLoadFailed(true);
+        setSettingsMsg({
+          type: "err",
+          text: `Ayarlar yüklenemedi (${error.message}) — kaydetme kilitlendi.`,
+        });
+      } else {
+        setSettings(data ?? { ...EMPTY_SETTINGS });
+      }
       setSettingsLoading(false);
     })();
 
@@ -307,7 +362,7 @@ export default function AdminUsersPage() {
   /* ================================================================ */
 
   const handleSettingsSave = async () => {
-    if (!selectedUserId || selectedSerno == null) return;
+    if (!selectedUserId || selectedSerno == null || settingsLoadFailed) return;
     setSettingsSaving(true);
     setSettingsMsg(null);
 
@@ -331,6 +386,13 @@ export default function AdminUsersPage() {
         if (insErr) throw insErr;
       }
 
+      // Metot / tahsis / agrega / MEDAŞ cache'leri bu (admin) oturumda hemen tazelensin —
+      // override veya trafo/bayrak değişince eski hesap TTL boyunca servis edilmesin.
+      // (Müşteri tarayıcısında cache TTL 5 dk.)
+      clearInvoiceMethodCache();
+      clearGesAllocationCache();
+      clearHourlyNetAggregatesCache();
+      clearMedasVerisKesintiCache();
       setSettingsMsg({ type: "ok", text: "Kaydedildi." });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Hata oluştu.";
@@ -711,10 +773,10 @@ export default function AdminUsersPage() {
                       />
                     </label>
 
-                    {/* Trafo kaybı saatlik — yalnız Metot 7 (Meram) */}
+                    {/* Trafo kaybı saatlik — Metot 1 ve Metot 7 */}
                     <label className="block">
                       <span className="text-xs font-medium text-neutral-600 mb-1 block">
-                        Trafo kaybı (kWh/saat) — Meram
+                        Trafo kaybı (kWh/saat)
                       </span>
                       <input
                         type="number"
@@ -725,8 +787,10 @@ export default function AdminUsersPage() {
                         className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
                       />
                       <span className="mt-1 block text-[10px] text-neutral-400">
-                        Yalnız Metot 7: dönemin her saatine tüketime eklenir (AG ölçümlüde ör. 1,12;
-                        OG'de boş). Bu metotta yukarıdaki aylık Trafo Kaybı kullanılmaz.
+                        Doluysa yukarıdaki aylık Trafo Kaybı yok sayılır (AG ölçümlüde ör. 1,12; OG'de
+                        boş). Metot 1: trafo = t × dönem saati (Eylül 720, Ağustos 744). Metot 7: dönemin
+                        her saatine tüketime eklenir. "Dağıtım kendi verişiyle" açık tesiste havuz
+                        tahsisine girmez.
                       </span>
                     </label>
 
@@ -792,6 +856,62 @@ export default function AdminUsersPage() {
                       </span>
                     </label>
 
+                    {/* Fatura metodu (aboneliğe özel) — boş = şirket metodu */}
+                    <label className="block mt-1">
+                      <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                        Fatura metodu (aboneliğe özel)
+                      </span>
+                      <select
+                        value={settings.invoice_method_override ?? ""}
+                        onChange={(e) =>
+                          setSettings((p) => ({
+                            ...p,
+                            invoice_method_override: e.target.value === "" ? null : Number(e.target.value),
+                          }))
+                        }
+                        className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                      >
+                        <option value="">Şirket metodu (varsayılan)</option>
+                        {methodOptions.map((m) => (
+                          <option key={m.id} value={m.id}>
+                            {m.name}
+                          </option>
+                        ))}
+                        {settings.invoice_method_override != null &&
+                          !methodOptions.some((m) => m.id === settings.invoice_method_override) && (
+                            <option value={settings.invoice_method_override}>
+                              #{settings.invoice_method_override} (pasif / listede yok)
+                            </option>
+                          )}
+                      </select>
+                      <span className="mt-1 block text-[10px] text-neutral-400">
+                        Boş = tedarik şirketinin metodu. Doluysa yalnız bu abonelik için şirket metodunun
+                        yerine geçer (ör. Niğde As Beton → Metod 7, aynı şirketteki diğer abonelikler
+                        şirket metodunda kalır). Başlangıç dönemi yoktur: geçmiş ayların yeniden hesabı da
+                        bu metotla yapılır.
+                      </span>
+                    </label>
+
+                    {/* Dağıtım kendi verişiyle (MEPAŞ/MEDAŞ usulü) — Metot 1 ve 7 */}
+                    <div className="mt-1">
+                      <label className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={settings.dagitim_kendi_veris ?? false}
+                          onChange={(e) => setSettings((p) => ({ ...p, dagitim_kendi_veris: e.target.checked }))}
+                          className="rounded border-neutral-300"
+                        />
+                        <span className="text-xs font-medium text-neutral-600">
+                          Dağıtım kendi verişiyle (MEPAŞ/MEDAŞ usulü)
+                        </span>
+                      </label>
+                      <span className="mt-1 block text-[10px] text-neutral-400">
+                        Metot 1 ve 7: dağıtım = D × (C − min(G, C)/2); C = ham çekiş + trafo, G = tesisin
+                        kendi ham verişi (havuz tahsisi etkilemez). G &gt; C ise ayrı MEDAŞ veriş faturası
+                        (G − C) × üretici birimi; GES satış kartında kesinti olur. Metot 1'de lisanslı dahil.
+                      </span>
+                    </div>
+
                     {/* Muhasebe Excel (Girdi/Çıktı Raporu) — tesis bazlı opt-in */}
                     <div className="mt-1">
                       <label className="flex items-center gap-2">
@@ -831,6 +951,26 @@ export default function AdminUsersPage() {
                           müşteri için kullanılır; hesaplama değişmez.
                         </span>
                       </label>
+
+                      {/* GES Üretim Satışı kartı kesinti tabanı */}
+                      <label className="block mt-2">
+                        <span className="text-xs font-medium text-neutral-600 mb-1 block">
+                          GES Satış Dağıtım Kesintisi Tabanı
+                        </span>
+                        <select
+                          value={settings.ges_sale_dist_basis ?? "total_veris"}
+                          onChange={(e) =>
+                            setSettings((p) => ({ ...p, ges_sale_dist_basis: e.target.value }))
+                          }
+                          className="w-full rounded-lg border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                        >
+                          <option value="total_veris">Toplam veriş (satılan + mahsup) — varsayılan</option>
+                          <option value="sold_only">Yalnız satılan veriş</option>
+                        </select>
+                        <span className="mt-1 block text-[10px] text-neutral-400">
+                          Yalnız Metot 3 Trepaş 2026-09+ GES Üretim Satışı kartında etkili.
+                        </span>
+                      </label>
                     </div>
 
                     {/* GES Anlık Üretim Kullanımı (üç durumlu: NULL / true / false) */}
@@ -867,7 +1007,7 @@ export default function AdminUsersPage() {
 
                     {/* Save */}
                     <button
-                      disabled={settingsSaving}
+                      disabled={settingsSaving || settingsLoadFailed}
                       onClick={handleSettingsSave}
                       className="rounded-lg bg-black px-4 py-2 text-sm text-white font-medium disabled:opacity-50 transition-opacity"
                     >

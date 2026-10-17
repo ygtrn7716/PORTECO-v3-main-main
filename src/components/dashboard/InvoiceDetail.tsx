@@ -39,9 +39,25 @@ import {
   MeramSatir2Row,
   MeramYekdemBadge,
 } from "@/components/dashboard/shared/MeramInvoiceParts";
+import {
+  OsbInvoiceNotes,
+  OsbInvoiceRows,
+} from "@/components/dashboard/shared/OsbInvoiceRows";
 import TalepBirlestirmeBanner from "@/components/dashboard/shared/TalepBirlestirmeBanner";
-import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
+import {
+  calculateGesUretimSatisi,
+  gesSatisKesintiArgs,
+  parseGesSaleDistBasis,
+  type GesSaleDistBasis,
+  type MedasKesinti,
+} from "@/lib/ges/gesUretimSatisi";
 import { deriveGesSatisMahsup } from "@/lib/ges/gesSatisMahsup";
+import {
+  loadMedasVerisKesintisiSafe,
+  medasHostKatkiFromBreakdown,
+} from "@/lib/ges/medasVerisKesinti";
+import MedasVerisFaturasiCard from "@/components/dashboard/shared/MedasVerisFaturasiCard";
+import { resolveTrafoKwh } from "@/components/utils/trafoKaybi";
 
 import {
   isM1MahsupCapPeriod,
@@ -51,9 +67,11 @@ import {
 import {
   calculateInvoiceForMethod,
   isNetInvoiceMethod,
+  isOsbInvoiceMethod,
+  skipsNextMonthYekdemMahsup,
   isEmbeddedYekdemMethod,
   hidesPostTotalMahsup,
-  methodForProvider,
+  methodForSubscription,
   resolveInvoiceMethods,
   type InvoiceMethodId,
 } from "@/lib/invoiceMethods";
@@ -61,6 +79,7 @@ import { assembleMethodInputs } from "@/components/utils/hourlyNetAggregates";
 import {
   embedYekdemMahsupIntoEnergy,
   isIpragazYekBirlesikPeriod,
+  isTredasDagitimBolunmusPeriod,
   type InvoiceMethodInputs,
   type MethodInvoiceBreakdown,
 } from "@/components/utils/calculateInvoiceNetMethods";
@@ -169,11 +188,20 @@ interface InvoiceViewData {
    applyVerisMahsupPerakendeCap: boolean;
    // İpragaz 2026-08+ (m5): YEK bedeli enerji satırına gömülü — AlternateTariff aynı kapıyı kullanır.
    ipragazYekBirlesik: boolean;
+   // Trepaş 2026-09+ (m3): bölünmüş dağıtım — AlternateTariff aynı kapıyı kullanır.
+   tredasDagitimBolunmus: boolean;
    // Tedarik firmasından çözülen fatura metodu.
    invoiceMethodId: InvoiceMethodId;
    // Metod 2/3 saatlik-net girdileri (AlternateTariff + GES Olmasaydı da kullanır).
    methodInputs: InvoiceMethodInputs | null;
    kayseriEkBedeller: { iletim: number; osbDagitim: number; lisanssizCekis: number } | null;
+   // Dağıtım kendi verişiyle (MEDAŞ usulü, yalnız bayraklı Metot 1): kendi ham Σgn + uretici_1.
+   // AlternateTariff aynı kuralı kullansın diye taşınır.
+   dagitimKendiVeris: { ownGnKwh: number; ureticiBirim: number } | null;
+   // MEDAŞ usulü GES satış kesintisi (satışın aktığı bayraklı tesislerin veriş faturaları).
+   medasKesinti: MedasKesinti | null;
+   // GES Üretim Satışı kartı kesinti tabanı (yalnız Metot 3 Trepaş 2026-09+).
+   gesSaleDistBasis: GesSaleDistBasis;
    // Saatlik net mahsup (net üretici): alternatif tarife karşılaştırması da bu bazı kullansın.
    netPositiveDrawKwh: number; // Σ max(0, cn − gn)
    netExcessFeedKwh: number;   // Σ max(0, gn − cn)
@@ -497,6 +525,8 @@ export default function InvoiceDetail() {
         let netPositiveDrawKwh = 0; // Σ max(0, cn − gn)
         let netExcessFeedKwh = 0;   // Σ max(0, gn − cn)
 
+        let lastTs: string | null = null;
+        let lastMs = -Infinity;
         for (const row of (hourly.data ?? []) as any[]) {
           const cnH = Number(row.cn) || 0;
           const gnH = Number(row.gn) || 0;
@@ -506,7 +536,15 @@ export default function InvoiceDetail() {
           totalGn += gnH;
           netPositiveDrawKwh += Math.max(0, cnH - gnH);
           netExcessFeedKwh += Math.max(0, gnH - cnH);
+          const ms = new Date(row.ts).getTime();
+          if (ms > lastMs) {
+            lastMs = ms;
+            lastTs = row.ts;
+          }
         }
+        // Tesisin KENDİ ham verişi — tahsis aşağıda totalGn'i ezmeden ÖNCE
+        // (dağıtım kendi verişiyle kuralı havuz tahsisini/fazlasını kullanmaz).
+        const ownGnRaw = totalGn;
 
         // Talep Birleştirme: bu tesise GES tahsisi/kaynak rolü varsa saatlik
         // seriden efektif değerleri üret (view=null → yukarıdaki toplamlar
@@ -579,7 +617,7 @@ export default function InvoiceDetail() {
         // 4) tesis ayarları (KBK + tarife + güç limit) -> SADECE subscription_settings
         const settingsRes = await supabase
           .from("subscription_settings")
-          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi, muhasebe_excel_enabled, muhasebe_excel_format")
+          .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, trafo_kaybi_saatlik, on_yil, lisansli_satis, unit_price_adjustment, anlik_uretim_kullanimi, muhasebe_excel_enabled, muhasebe_excel_format, dagitim_kendi_veris, invoice_method_override, ges_sale_dist_basis")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -628,7 +666,7 @@ export default function InvoiceDetail() {
           throw new Error(`Tesis ayarları eksik: ${missing.join(", ")} (subscription_settings doldur).`);
         }
 
-        const trafoDegeri =
+        const trafoDegeriAylik =
           settingsRes.data.trafo_degeri != null && Number.isFinite(Number(settingsRes.data.trafo_degeri))
             ? Number(settingsRes.data.trafo_degeri)
             : 0;
@@ -688,11 +726,34 @@ export default function InvoiceDetail() {
         // Fatura metodu: kullanıcının entegrasyonlarından provider ile çözülür.
         const methodMap = await resolveInvoiceMethods({ context: "self", userId: uid });
         if (cancel) return;
-        const { methodId: invoiceMethodId, invoiceFrom } = methodForProvider(methodMap, provider);
+        // Efektif metod = abonelik override'ı ?? şirket metodu (tek resolver).
+        const { methodId: invoiceMethodId, invoiceFrom } = methodForSubscription(
+          methodMap,
+          provider,
+          settingsRes.data.invoice_method_override
+        );
+
+        // Trafo kWh — Metot 1'de öncelik trafo_kaybi_saatlik (t × dönem saati) > trafo_degeri.
+        // Diğer metotlar bugünkü aylık trafo_degeri ile (m7 kendi t yolunu kullanır).
+        const trafoRes =
+          invoiceMethodId === 1
+            ? resolveTrafoKwh({
+                trafoKaybiSaatlik: settingsRes.data.trafo_kaybi_saatlik,
+                trafoDegeri: trafoDegeriAylik,
+                startIso: monthStart.toDate().toISOString(),
+                endIso: monthEndExclusive.toDate().toISOString(),
+                lastTs,
+                nowMs: Date.now(),
+              })
+            : { trafoKwh: trafoDegeriAylik, saatlik: null, saat: 0 };
+        const trafoDegeri = trafoRes.trafoKwh;
 
         // İpragaz 2026-08+: YEK bedeli enerji satırına gömülü (yalnız m5 okur; motor saf kalır).
         const ipragazYekBirlesik =
           invoiceMethodId === 5 && isIpragazYekBirlesikPeriod(periodYear, periodMonth);
+        // Trepaş 2026-09+: dağıtım ana fatura + GES üretim dağıtım faturası (yalnız m3 okur).
+        const tredasDagitimBolunmus =
+          invoiceMethodId === 3 && isTredasDagitimBolunmusPeriod(periodYear, periodMonth);
 
         // 5c) Kayseri OSB ek bedel katsayıları — kaydı olmayan tesiste kart gösterilmez.
         // Okuma hatası faturayı kırmasın (kart opsiyonel).
@@ -753,9 +814,26 @@ export default function InvoiceDetail() {
           tariffRow.perakende_enerji_bedeli != null ? Number(tariffRow.perakende_enerji_bedeli) : 0;
         // GES Üretim Satışı dağıtım kesinti oranı (lisansli_satis'e göre seçilir).
         // on_yil bu seçimi etkilemez.
-        const dagitimUreticiBedeli = lisansliSatis
-          ? (tariffRow.dagitim_uretici_1 != null ? Number(tariffRow.dagitim_uretici_1) : 0)
-          : (tariffRow.dagitim_uretici_2 != null ? Number(tariffRow.dagitim_uretici_2) : 0);
+        // Metod 8 (Kayseri OSB): veriş dağıtım bedeli zaten faturada → GES satışında kesinti YOK.
+        const dagitimUreticiBedeli =
+          isOsbInvoiceMethod(invoiceMethodId) && !lisansliSatis
+            ? 0
+            : lisansliSatis
+              ? (tariffRow.dagitim_uretici_1 != null ? Number(tariffRow.dagitim_uretici_1) : 0)
+              : (tariffRow.dagitim_uretici_2 != null ? Number(tariffRow.dagitim_uretici_2) : 0);
+        // Dağıtım kendi verişiyle (MEDAŞ usulü) — Metot 1 (lisanslı dahil) ve Metot 7
+        // (m7 G'yi kendi meram.ownGnTotal'ından okur; buradan bayrak + uretici_1).
+        const dagitimKendiVeris =
+          (invoiceMethodId === 1 || invoiceMethodId === 7) &&
+          settingsRes.data.dagitim_kendi_veris === true
+            ? {
+                ownGnKwh: ownGnRaw,
+                ureticiBirim:
+                  tariffRow.dagitim_uretici_1 != null ? Number(tariffRow.dagitim_uretici_1) : 0,
+              }
+            : null;
+        // GES Üretim Satışı kartı kesinti tabanı (yalnız Metot 3 Trepaş 2026-09+).
+        const gesSaleDistBasis = parseGesSaleDistBasis(settingsRes.data.ges_sale_dist_basis);
         const powerPrice =
           tariffRow.guc_bedeli != null ? Number(tariffRow.guc_bedeli) : 0;
         const powerExcessPrice =
@@ -845,6 +923,7 @@ export default function InvoiceDetail() {
             invoiceMethodId,
             kbk,
             tahminiYekdem: monthlyYekdem,
+            invoiceFrom,
           });
           if (cancel) return;
         }
@@ -878,6 +957,9 @@ export default function InvoiceDetail() {
             methodInputs: methodInputs ?? undefined,
             applyVerisMahsupPerakendeCap, // 2K: mahsup tavanı (Temmuz 2026+)
             ipragazYekBirlesik, // İpragaz 2026-08+: YEK enerjiye gömülü (m5)
+            tredasDagitimBolunmus, // Trepaş 2026-09+: bölünmüş dağıtım (m3)
+            // MEDAŞ usulü dağıtım (kendi ham veriş) — yalnız bayraklı m1.
+            ...(dagitimKendiVeris ? { dagitimKendiVeris } : {}),
           }, invoiceLineOverrides);
 
        //ara taşak madde ekliyom  buraya
@@ -893,7 +975,8 @@ export default function InvoiceDetail() {
         // Lisanslı Satış tesisleri için YEKDEM mahsup uygulanmaz.
         // D4: Metod 2/3'te YEKDEM farkı zaten KDV matrahındaki bir KALEM
         // (yekFarkiCharge) → toplam-sonrası mahsup 0'a zorlanır (çift sayım önlenir).
-        const isNetMethod = isNetInvoiceMethod(invoiceMethodId);
+        // Metod 8: YEKDEM fiyat farkı faturada kalem → post-total mahsup hesaplanmaz.
+        const isNetMethod = skipsNextMonthYekdemMahsup(invoiceMethodId);
         // Metod 6 (Kepsaş): mahsup HESAPLANIR (net değil) ama post-total satır
         // yerine enerji birim fiyatına GÖMÜLÜR. Çıplak adder snapshot'a, vergi-dahil
         // değer GES simetri paramına gider.
@@ -1102,11 +1185,32 @@ try {
     // Metod 6 (Kepsaş) replay: enerji fiyatına gömülen çıplak YEKDEM adder'ı
     // (diğer metodlarda 0/null → kolon boş).
     embeddedYekdemAdder: embeddedYekdemAdderTL,
+    // Metot 1 saatlik trafo (t) damgası — t yoksa null (kolona dokunulmaz).
+    trafoKaybiSaatlik: trafoRes.saatlik,
+    trafoKaybiKwh: trafoRes.saatlik != null ? trafoRes.trafoKwh : null,
+    // GES Üretim Satışı kartı kesinti tabanı — ayardan damgalanır.
+    gesSaleDistBasis,
   });
 } catch (e) {
   console.error("upsertInvoiceSnapshot error:", e);
 }
 
+
+        // MEDAŞ usulü GES satış kesintisi: satış bu tesiste görünüyorsa (verisFazla > 0)
+        // satışa akan bayraklı tesislerin veriş faturaları toplanır. Bayraksızda SORGU YOK.
+        const medasKesinti =
+          breakdown.dagitimKendiVeris && breakdown.verisFazlaKwh > 0
+            ? await loadMedasVerisKesintisiSafe({
+                supabase,
+                userId: uid,
+                hostSerno: selectedSub,
+                periodYear,
+                periodMonth,
+                prefer: "live",
+                host: medasHostKatkiFromBreakdown(breakdown),
+              })
+            : null;
+        if (cancel) return;
 
         if (!cancel) {
           setData({
@@ -1114,6 +1218,7 @@ try {
             isKayseriOsb,
             applyVerisMahsupPerakendeCap,
             ipragazYekBirlesik,
+            tredasDagitimBolunmus,
             invoiceMethodId,
             methodInputs,
             kayseriEkBedeller,
@@ -1149,6 +1254,9 @@ try {
             perakendeEnerjiBedeli,
             usdKur: monthlyUsdKur,
             dagitimUreticiBedeli,
+            dagitimKendiVeris,
+            medasKesinti,
+            gesSaleDistBasis,
             netPositiveDrawKwh,
             netExcessFeedKwh,
             gesAlloc: allocView
@@ -1191,7 +1299,7 @@ try {
                   onYil,
                   usdKur: monthlyUsdKur,
                   perakendeEnerjiBedeli,
-                  dagitimBedeli: dagitimUreticiBedeli,
+                  ...gesSatisKesintiArgs(breakdown, dagitimUreticiBedeli, medasKesinti),
                 })
               : null;
 
@@ -1236,6 +1344,9 @@ try {
             usdKur: monthlyUsdKur,
             invoiceMethodId,
             methodInputs,
+            dagitimKendiVeris: dagitimKendiVeris
+              ? { ureticiBirim: dagitimKendiVeris.ureticiBirim }
+              : null,
           };
 
           // Muhasebe Excel payload tabanı (gesResult render'da eklenir). Tüm
@@ -1270,6 +1381,7 @@ try {
             usdKur: monthlyUsdKur,
             perakendeEnerjiBedeli,
             dagitimUreticiBedeli,
+            gesSatisKesinti: medasKesinti,
             kbk,
             monthlyPTF,
             monthlyYekdem,
@@ -1357,6 +1469,7 @@ try {
         perakendeEnerjiBedeli: p.perakendeEnerjiBedeli,
         invoiceMethodId: p.invoiceMethodId,
         methodInputs: p.methodInputs ?? null,
+        dagitimKendiVeris: p.dagitimKendiVeris ?? null,
       });
       setGesOlmasaydiResult(result);
       gesOlmasaydiCalced.current = true;
@@ -1509,7 +1622,7 @@ const excludedItems = new Set<string>(
                 {fmtKwh(data.totalConsumptionKwh)}
               </p>
               {/* Metod 2/3: fatura NET (mahsuplu) çekiş üzerinden kesilir */}
-              {(isNetInvoiceMethod(data.invoiceMethodId)) && (
+              {(isNetInvoiceMethod(data.invoiceMethodId) || !!data.breakdown.osb) && (
                 <p className="mt-1 text-xs text-neutral-500">
                   Faturalanan (mahsuplu):{" "}
                   {fmtKwh(data.methodInputs?.sumPos ?? data.breakdown.netEnergyKwh)} kWh
@@ -1525,7 +1638,9 @@ const excludedItems = new Set<string>(
                     m5 birleşik (İpragaz 2026-08+): YEK dahil (energyUnitPriceShown);
                     Metod 1: efektif birim fiyat (PTF+YEKDEM)×KBK. */}
                 {fmtUnit(
-                  data.breakdown.yekEnerjiyeGomulu
+                  data.breakdown.osb
+                    ? data.breakdown.osb.enerjiFiyati
+                    : data.breakdown.yekEnerjiyeGomulu
                     ? data.breakdown.energyUnitPriceShown ?? data.unitPriceEnergy
                     : isNetInvoiceMethod(data.invoiceMethodId)
                       ? data.breakdown.energyUnitPriceApplied ?? data.unitPriceEnergy
@@ -1675,7 +1790,9 @@ const excludedItems = new Set<string>(
             methodInputs={data.methodInputs}
             applyVerisMahsupPerakendeCap={data.applyVerisMahsupPerakendeCap}
             ipragazYekBirlesik={data.ipragazYekBirlesik}
+            tredasDagitimBolunmus={data.tredasDagitimBolunmus}
             embeddedYekdemAdderTL={data.breakdown.embeddedYekdemAdderTL}
+            dagitimKendiVeris={data.dagitimKendiVeris}
           />
           )}
 
@@ -1699,6 +1816,18 @@ const excludedItems = new Set<string>(
                 </thead>
 
                 <tbody>
+                  {/* Metod 8 (Kayseri OSB): OSB bildirimi sırası/etiketleriyle ayrı gövde. */}
+                  {data.breakdown.osb ? (
+                    <OsbInvoiceRows
+                      osb={data.breakdown.osb}
+                      subtotalBeforeVat={data.breakdown.subtotalBeforeVat}
+                      vatCharge={data.breakdown.vatCharge}
+                      totalInvoice={data.breakdown.totalInvoice}
+                      btvRate={data.btvRate}
+                      vatRate={data.vatRate}
+                    />
+                  ) : (
+                  <>
                   {!excludedItems.has("enerji") && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Enerji Bedeli</td>
@@ -1804,11 +1933,23 @@ const excludedItems = new Set<string>(
                   {/* Kayseri OSB: dağıtım bedeli OSB'ce ayrı tahsil edilir — kalem faturada yok */}
                   {!data.isKayseriOsb && !excludedItems.has("dagitim") && (
                     <tr className="border-b border-neutral-100">
-                      <td className="py-2 pr-4">Dağıtım Bedeli</td>
+                      <td className="py-2 pr-4">
+                        {data.breakdown.dagitimKendiVeris ? "Elektrik Dağıtım Bedeli" : "Dağıtım Bedeli"}
+                      </td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {fmtUnit(data.breakdown.effectiveDistributionUnitPrice)} TL/kWh ×{" "}
-                        {fmtKwh(data.breakdown.distributionChargeKwh)} kWh
+                        {data.breakdown.dagitimKendiVeris
+                          ? `${fmtKwh(data.breakdown.distributionChargeKwh)} kWh × ${fmtUnit(data.breakdown.effectiveDistributionUnitPrice)} TL/kWh`
+                          : `${fmtUnit(data.breakdown.effectiveDistributionUnitPrice)} TL/kWh × ${fmtKwh(data.breakdown.distributionChargeKwh)} kWh`}
                         {data.breakdown.meram && <MeramDagitimNote meram={data.breakdown.meram} />}
+                        {/* m7'de MeramDagitimNote aynı açıklamayı veriyor → çift not yok. */}
+                        {data.breakdown.dagitimKendiVeris && !data.breakdown.meram && (
+                          <span className="block text-[11px] text-neutral-500">
+                            Kendi veriş {fmtKwh(data.breakdown.dagitimKendiVeris.gKwh)} kWh
+                            {data.breakdown.dagitimKendiVeris.gKwh >= data.breakdown.dagitimKendiVeris.cKwh
+                              ? " ≥ çekiş → D/2"
+                              : " → D × (1 − G/2C)"}
+                          </span>
+                        )}
                       </td>
                       <td className="py-2 pr-4 text-right">
                         {fmtMoney2(data.breakdown.distributionCharge)}
@@ -1828,7 +1969,9 @@ const excludedItems = new Set<string>(
                         Muhtelif-2
                       </td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        +{fmtMoney2(data.breakdown.muhtelif2Dagitim ?? 0)} dağıtım −{" "}
+                        {data.breakdown.tredasGesDagitim
+                          ? "Mahsuplaşma: −"
+                          : `+${fmtMoney2(data.breakdown.muhtelif2Dagitim ?? 0)} dağıtım − `}
                         {fmtMoney2(data.breakdown.muhtelif2MahsupKredisi ?? 0)} mahsuplaşma (
                         {fmtUnit(data.breakdown.mahsuplasmaUnitPriceApplied ?? 0)} TL/kWh ×{" "}
                         {fmtKwh(data.breakdown.verisMahsupKwh)} kWh)
@@ -1992,6 +2135,9 @@ const excludedItems = new Set<string>(
                   </tr>
                   )}
 
+                  </>
+                  )}
+
                   {data.digerDegerler !== 0 && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4 font-semibold">Diğer Bedeller</td>
@@ -2024,7 +2170,13 @@ const excludedItems = new Set<string>(
             {data.breakdown.meram && (
               <MeramInvoiceNotes meram={data.breakdown.meram} netKwh={data.breakdown.netEnergyKwh} />
             )}
+            {data.breakdown.osb && <OsbInvoiceNotes osb={data.breakdown.osb} />}
           </div>
+
+          {/* MEDAŞ Veriş Faturası — ayrı fatura (G > C), perakende toplamına DAHİL DEĞİL. */}
+          {data.breakdown.dagitimKendiVeris && (
+            <MedasVerisFaturasiCard kv={data.breakdown.dagitimKendiVeris} vatRate={data.vatRate} />
+          )}
 
           {/* Talep Birleştirme bilgi notu — üç durum, GES sayfasıyla ortak bileşen
               (metod 4 kapısı ve metinler bileşenin içinde). */}
@@ -2034,7 +2186,8 @@ const excludedItems = new Set<string>(
           />
 
           {/* Ek Bedeller — Kayseri OSB'nin ayrıca tahsil ettiği bedeller, faturaya dahil DEĞİL */}
-          {data.isKayseriOsb && data.kayseriEkBedeller && (
+          {/* Metod 8'de bu bedeller faturanın KALEMİ (OsbInvoiceRows) → kart gizli. */}
+          {data.isKayseriOsb && data.kayseriEkBedeller && !isOsbInvoiceMethod(data.invoiceMethodId) && (
             <KayseriEkBedellerCard
               rates={data.kayseriEkBedeller}
               totalConsumptionKwh={data.totalConsumptionKwh}
@@ -2058,6 +2211,8 @@ const excludedItems = new Set<string>(
               perakendeEnerjiBedeli: data.perakendeEnerjiBedeli,
               dagitimBedeli: data.dagitimUreticiBedeli,
               unitPriceEnergy: data.unitPriceEnergy,
+              medasKesinti: data.medasKesinti,
+              gesSaleDistBasis: data.gesSaleDistBasis,
             });
             return derived.satis ? (
               <GesUretimSatisiCard

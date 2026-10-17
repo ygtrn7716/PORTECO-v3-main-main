@@ -247,7 +247,7 @@ Admin GES üretim verisi yükleme sayfası (~1980 satır; `TableManager` kullanm
 
 `auth.users` tablosuna doğrudan SELECT yapılamadığı için (Postgres-internal şema), bu sayfa `user_integrations` tablosundan kullanıcı listesi türetir; e-posta arama `user_integrations.aril_user` üzerinde çalışır. Kullanıcı+tesis seçildikten sonra iki sekme sunar:
 
-- **Ayarlar sekmesi** — `subscription_settings` formu (`AdminUsersPage.tsx:214` select'i): KBK, terim, tarife, gerilim, güç bedel limiti, trafo, **"Trafo kaybı (kWh/saat) — Meram"** (`trafo_kaybi_saatlik`; yalnız Metot 7 — dönemin her saatine tüketime eklenir, bu metotta aylık trafo kullanılmaz), nickname, on_yil + yeni alanlar: **"Yıllık Satış Hakkı (kWh)"** (`satis_hakki`, `:643`), **"Birim Fiyat Manipülasyonu"** (`unit_price_adjustment`, `:661`), **"Lisanslı Satış Üretim Tesisi"** checkbox (`lisansli_satis`, `:688`) ve **üç durumlu `anlik_uretim_kullanimi` select'i** (`:704-713`: boş seçenek → `null`, "Evet" → `true`, "Hayır" → `false`; GES Olmasaydı hesabının arazi GES dalını kontrol eder).
+- **Ayarlar sekmesi** — `subscription_settings` formu (`AdminUsersPage.tsx:214` select'i): KBK, terim, tarife, gerilim, güç bedel limiti, trafo, **"Trafo kaybı (kWh/saat)"** (`trafo_kaybi_saatlik`; doluysa aylık trafo yok sayılır — Metot 1: trafo = t × dönem saati; Metot 7: dönemin her saatine tüketime eklenir; "dağıtım kendi verişiyle" açık tesiste havuz tahsisine girmez), **"Fatura metodu (aboneliğe özel)"** select'i (`invoice_method_override`; seçenekler yalnız `invoice_methods.is_active = true`, boş = şirket metodu; doluysa yalnız bu abonelik için şirket metodunun yerine geçer — ör. Niğde As Beton → Metod 7; başlangıç dönemi yok), **"Dağıtım kendi verişiyle (MEPAŞ/MEDAŞ usulü)"** checkbox'ı (`dagitim_kendi_veris`; Metot 1 ve 7 dağıtımı tesisin kendi ham çekiş/verişiyle, G > C ise ayrı MEDAŞ veriş faturası — bkz. porteco-05 §7.4). Kaydette metot/tahsis/agrega/MEDAŞ cache'leri admin oturumunda temizlenir. Ayar yüklemesi hata verirse kaydet kilitlenir (boş form bayrakları ezmesin), nickname, on_yil + yeni alanlar: **"Yıllık Satış Hakkı (kWh)"** (`satis_hakki`, `:643`), **"Birim Fiyat Manipülasyonu"** (`unit_price_adjustment`, `:661`), **"Lisanslı Satış Üretim Tesisi"** checkbox (`lisansli_satis`, `:688`) ve **üç durumlu `anlik_uretim_kullanimi` select'i** (`:704-713`: boş seçenek → `null`, "Evet" → `true`, "Hayır" → `false`; GES Olmasaydı hesabının arazi GES dalını kontrol eder).
 - **YEKDEM sekmesi** — ay bazlı `yekdem_value`, `yekdem_final`, `diger_degerler` ve **"USD/TL Kuru (10 yıl üstü)"** (`usd_kur`, `:869-880`) girişleri; tekil kayıt ve toplu kayıt/refresh sorgularının tümü `usd_kur`'u içerir (`:239,299-356`).
 
 **Fatura Kalem Düzenleme** (`InvoiceOverridesAdmin`, `/dashboard/admin/faturalar`) — Metot 7 (Meram) tesislerinde
@@ -255,6 +255,21 @@ Admin GES üretim verisi yükleme sayfası (~1980 satır; `TableManager` kullanm
 "YEKDEM Mahsup + YEKDEM GDDK" notundaki tutar aylık elle girilir; "YEKDEM Mahsup + GDDK + Mahsuplaşma Farkı"
 satırına eklenir ve BTV matrahına girer. m7'de `mahsuplasma` birim override'ı mahsuplaşma farkını (F = −M × birim)
 yönetir; `yek`, `trafo` kalemleri ve YEKDEM mahsup kartı gizlidir (motor bu override'ları yok sayar).
+
+**Fatura Kalem Düzenleme — yazım anahtarı kapısı:** tesis/dönem değişince girdiler ve taslak eşzamanlı
+sıfırlanır; Kaydet / "Kaydet + Snapshot'ı Yeniden Yaz" / kalem sıfırlama / dönemi temizle yalnız girdiler o
+tesis+dönem için yüklendiğinde (`loadedKey`) açılır, yazım sürerken tesis/dönem değiştirilemez ve
+`snapshotParamsFromEngine` başka tesisin girdisiyle çağrılırsa hata fırlatır (Ağustos 2026'da 10128583
+snapshot'ının 10126953 değerleriyle yazılmasının kök nedeni). Bayraklı tesiste önizlemede "MEDAŞ Veriş Faturası
+(ayrı fatura — toplama girmez)" bilgi satırı görünür.
+
+**OSB Aylık Fiyatları** (`OsbAylikFiyatlarAdmin`, `/dashboard/admin/osb-fiyatlari`, "Fatura & Hesaplama"
+menüsü) — Metot 8 (Kayseri OSB) için `osb_aylik_fiyatlar` (firma, yıl, ay, enerji birim fiyatı P, YEKDEM fark
+birim fiyatı) `TableManager` ile düzenlenir. Okuma tüm oturumlara açık (müşteri faturası tarayıcıda
+hesaplanır), yazma yalnız admin (RLS). Fatura ayı satırı yoksa önceki ayın P'si "tahmini" kullanılır; hiç yoksa
+fatura görünür hatayla hesaplanmaz. Fatura Kalem Düzenleme'de m8 tesislerinde yalnız `enerji` (P / tutar),
+`btv` (ETV) ve `reaktif` kalemleri görünür; YEKDEM mahsup kartı "YEKDEM Fiyat Farkı (Manuel)" olur
+(önceki ay net kWh × fark birimi).
 
 ### 5.4 SubscriptionYekdemAdmin (`/dashboard/admin/subscription-yekdem`)
 

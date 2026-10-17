@@ -35,8 +35,12 @@ import {
   type InvoiceOverrides,
 } from "@/components/utils/invoiceOverrides";
 import { calculateGesOlmasaydi } from "@/components/utils/calculateGesOlmasaydi";
-import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
+import { calculateGesUretimSatisi, gesSatisKesintiArgs, parseGesSaleDistBasis } from "@/lib/ges/gesUretimSatisi";
 import { resolveGesSatisDagitimRate } from "@/lib/ges/gesSatisDagitimRate";
+import {
+  loadMedasVerisKesintisiSafe,
+  medasHostKatkiFromBreakdown,
+} from "@/lib/ges/medasVerisKesinti";
 import { coerceInvoiceMethodId } from "@/lib/invoiceMethods";
 import type { TariffType } from "@/components/utils/calculateInvoice";
 import type {
@@ -70,13 +74,14 @@ export async function fetchGesTasarrufAnalizi(args: {
   // ── Batch ön-çekim (5 sorgu) — hücre döngüsüne caller sorgusu taşınmaz ──
 
   // 1) Snapshot'lar: recompute alan listesi + motorun snapshot'a özgü girdileri
-  // (allocated_ges_kwh, monthly_yekdem, ges_satis_dagitim_bedeli listede yok;
+  // (monthly_yekdem, ges_satis_dagitim_bedeli listede yok; allocated_ges_kwh artık listede —
+  // m3 replay'i okur;
   // unit_price_adjustment Metod 7 replay'i için listeye girdi).
   const { data: snapData, error: snapError } = await supabase
     .from("invoice_snapshots")
     .select(
       // period_year/period_month artık RECOMPUTE_FIELDS içinde (2K) — çift kolon olmasın.
-      `subscription_serno, invoice_type, allocated_ges_kwh, monthly_yekdem, ges_satis_dagitim_bedeli, ${INVOICE_SNAPSHOT_RECOMPUTE_FIELDS}`,
+      `subscription_serno, invoice_type, monthly_yekdem, ges_satis_dagitim_bedeli, ${INVOICE_SNAPSHOT_RECOMPUTE_FIELDS}`,
     )
     .eq("user_id", uid)
     .in("invoice_type", ["billed", "backdated"])
@@ -266,12 +271,33 @@ export async function fetchGesTasarrufAnalizi(args: {
           });
           dagitimRateCache.set(serno, rate);
         }
+        // MEDAŞ usulü (dagitim_kendi_veris damgalı host): kesinti = satışa akan bayraklı
+        // tesislerin veriş faturaları (katkıcılar aynı tip/dönem snapshot'ından; modül
+        // cache'i (host, ay) başına tek hesap). Kesinti YALNIZ host satırında → Excel
+        // TOPLAM'ında çift sayım yok (üyelerin satış kWh'ı 0).
+        const medasKesinti = breakdown?.dagitimKendiVeris
+          ? await loadMedasVerisKesintisiSafe({
+              supabase,
+              userId: uid,
+              hostSerno: serno,
+              periodYear: year,
+              periodMonth: m,
+              invoiceType: row.invoice_type === "backdated" ? "backdated" : "billed",
+              prefer: "snapshot",
+              host: medasHostKatkiFromBreakdown(breakdown),
+            })
+          : null;
         satisNetGelirTl = calculateGesUretimSatisi({
           satisKwh,
           onYil: row.on_yil ?? false,
           usdKur: Number(row.usd_kur ?? 0),
           perakendeEnerjiBedeli: Number(row.perakende_enerji_bedeli ?? 0),
-          dagitimBedeli: rate,
+          ...gesSatisKesintiArgs(
+            breakdown,
+            rate,
+            medasKesinti,
+            parseGesSaleDistBasis(row.ges_sale_dist_basis)
+          ),
         }).satisNetGelir;
       }
 
@@ -334,6 +360,9 @@ export async function fetchGesTasarrufAnalizi(args: {
           lisansliSatis: row.lisansli_satis ?? settings?.lisansli_satis ?? false,
           invoiceMethodId: coerceInvoiceMethodId(row.invoice_method),
           methodInputs: methodInputsFromSnapshotRow(row) ?? null,
+          dagitimKendiVeris: breakdown.dagitimKendiVeris
+            ? { ureticiBirim: breakdown.dagitimKendiVeris.medasBirim }
+            : null,
         });
 
         if (result) {

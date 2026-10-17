@@ -94,6 +94,7 @@ const NAV_CATEGORIES: NavCategory[] = [
     items: [
       { label: "Fatura Düzenleme", to: "/dashboard/admin/faturalar", icon: <FileText size={16} /> },
       { label: "Fatura Metodları", to: "/dashboard/admin/fatura-metodlari", icon: <SlidersHorizontal size={16} /> },
+      { label: "OSB Aylık Fiyatları", to: "/dashboard/admin/osb-fiyatlari", icon: <Calculator size={16} /> },
       { label: "Invoice Snapshots", to: "/dashboard/admin/invoice-snapshots", icon: <Receipt size={16} /> },
       { label: "Reactive Alerts", to: "/dashboard/admin/reactive-alerts", icon: <AlertTriangle size={16} /> },
       { label: "Aylık Özet", to: "/dashboard/admin/monthly-overview", icon: <Calculator size={16} /> },

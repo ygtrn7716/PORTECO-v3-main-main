@@ -277,7 +277,10 @@ Veri akışı: `Dashboard.tsx` Effect 5 ile **birebir aynı pipeline**. Tek fark
 ### 7.2 Metot 7 — Meram (MEPAŞ)
 
 Niğde As Beton Ağustos 2026 MEPAŞ faturalarıyla (10126953 / 10128583 / 9062757) kuruşuna çözülen
-fatura metodu. Saatlik-net ailesindedir (`isNetInvoiceMethod` = 2|3|5|7); motor
+fatura metodu; Eylül 2026 Meram mahsup Excel'iyle (`scripts/fixtures/meram-asbeton-2026-09.xlsx`) saatlik
+mahsup dahil birebir doğrulandı. **Geçiş abonelik bazlıdır:** `subscription_settings.invoice_method_override = 7`
+(yalnız As Beton'un 3 aboneliği); `invoice_companies.meram = 1` kalır (ODTÜ GV Niğde 9034081 ve 10124578 Metot 1).
+Efektif metot = override ?? şirket metodu — tek resolver `methodForSubscription` (`src/lib/invoiceMethods.ts`). Saatlik-net ailesindedir (`isNetInvoiceMethod` = 2|3|5|7); motor
 `calculateInvoiceNetMethods.ts` iskeletini paylaşır (`calculateInvoiceMethod7`), m7'ye özgü
 kalemler sparse `breakdown.meram` nesnesindedir — UI m7 sunumunu bu anahtarla kapılar.
 
@@ -288,9 +291,9 @@ dönemin her saatine, satırı eksik saatler dahil), `eff(h)` = tahsis varsa hav
 
 | Kalem | Formül |
 | --- | --- |
-| Enerji | `N × U`, `U = (wNet + Y) × KBK + unit_price_adjustment`; Y = aynı ayın `yekdem_final`'ı, yoksa `yekdem_value` ("tahmini YEKDEM" etiketi) |
+| Enerji | `N × U`, `U = round6((wNet + Y) × KBK + unit_price_adjustment)`; Y = aynı ayın `yekdem_final`'ı, yoksa `yekdem_value` ("tahmini YEKDEM" etiketi) |
 | YEKDEM Mahsup + GDDK + Mahsuplaşma Farkı | `F + GDDK`, `F = M × ((wM + Y) × KBK − perakende)`; GDDK = override `yekdem_gddk` (aylık elle, yoksa 0) |
-| Dağıtım | `G_own > C ? D × C / 2 : D × C − D × G_own / 2` (havuz tahsisi dağıtıma girmez) |
+| Dağıtım | `dagitimKendiVeris.ts` helper'ı: `round2(C × round6(D × (C − min(G_own, C)/2) / C))` (havuz tahsisi dağıtıma girmez; Ağustos MEPAŞ faturalarıyla kuruşu kuruşuna). `dagitim_kendi_veris` bayrağı varsa ayrıca MEDAŞ veriş bloğu (G_own > C → ayrı fatura, satış kartında kesinti; §7.4) |
 | Reaktif / Güç | Metot 1 mantığı |
 | BTV (ETV) | `oran × (Enerji + Satır 2)` |
 | KDV | `oran × (Enerji + Satır 2 + Dağıtım + Reaktif + Güç + BTV)` |
@@ -301,8 +304,86 @@ uyarı + Metot 1'e düşer. Trafo kaybı ön-dönüşümü `src/components/utils
 (tahsis serisine ve tesisin saatlik satırlarına; t yoksa girdi aynen döner). Girdiler
 `assembleMethodInputs({ invoiceMethodId: 7 })` ile kurulur (t, adj, Y, GDDK tek noktada).
 Snapshot replay alanları için bkz. §12 (`20260930_003`). GES Olmasaydı karşı-olgusu aynı m7 motoruyla:
-mahsup 0, G_own 0, t / Y / GDDK iki dünyada aynı. Kabul testi: `npm run check:invoice-methods` (F12);
-canlı salt-okunur karşılaştırma: `npm run compare:meram-m7 -- 2026-08`.
+mahsup 0, G_own 0, t / Y / GDDK iki dünyada aynı.
+
+**Havuz:** override = 7 olan tesiste t bayraktan bağımsız havuz kapasitesine girer (`fetchGesMahsupContext`
+t-kapısı `dagitim_kendi_veris = false OR invoice_method_override = 7`): saatlik_oransal'da
+`net_i = c_i × (T − V)/T` (T = Σ(cn + t) her saat, eksik saat dahil; V = Σ listedeki gn; 10128583'ün kendi gn'i
+havuza gider), fazla p1'e (satış). Bilinen sınırlar: override'ın başlangıç dönemi yok (geçmiş ayların yeniden
+hesabı da m7); lisanslı + override 7 → m1'e yönlenir; şirket düzeyinde m7 + bayrak (override'sız) bugün yok.
+Kabul testleri: `npm run check:invoice-methods` (F12 Ağustos faturaları, F14 Eylül Meram Excel'i),
+`npm run check:method-override` (resolver + dispatcher); canlı salt-okunur karşılaştırma:
+`npm run compare:meram-m7 -- 2026-09 --pending` (override 7 / KBK 0,952 / t bellek içinde; canlı beklenti
+tablosuyla otomatik karşılaştırır). Veri geçişi `supabase/data-fixes/2026-10-14_asbeton_m7_override.sql`.
+
+### 7.3 Metot 8 — Kayseri OSB
+
+AYTEKS Ağustos 2026 OSB bildirimiyle (105013200 üretim tesisi, 107183100, 107196200) kuruşuna çözülen
+metod. **Net aileye dahil DEĞİL** (`isNetInvoiceMethod` 2|3|5|7); predicate'ler `isOsbInvoiceMethod`,
+`needsMethodInputs`, `skipsNextMonthYekdemMahsup` (`src/lib/invoiceMethods.ts`). Motor saf modül
+`src/components/utils/calculateInvoiceOsb.ts` (`calculateInvoiceMethod8`); kalemler sparse
+`breakdown.osb` bloğunda, UI `OsbInvoiceRows` ile OSB bildirimi sırasında çizer.
+
+C = brüt aktif tüketim, M = tahsis edilen mahsup (görünüm yoksa kendi saatlik netleşmesi), N = C − M,
+G = ownGnTotal, P = OSB aylık enerji fiyatı (`osb_aylik_fiyatlar`), üretim tesisi = G > 0.
+
+| Kalem | Formül |
+| --- | --- |
+| Aktif Enerji | N × P |
+| Endüktif / Kapasitif | RI/C > %20 → RI × reaktif_bedel · RC/C > `OSB_KAPASITIF_SINIR_YUZDE` (20, teyit bekliyor) → RC × reaktif_bedel |
+| YEKDEM Fiyat Fark | önceki ay N × `yekdem_fark_birim_fiyati` (önceki ay N: m8 damgalı billed snapshot, yoksa aynı pipeline) |
+| İletim Bedeli (Aktif Tüketim Payı) | C × `kayseri_ek_bedeller.iletim_bedeli_aktif_tuketim` |
+| OSB Dağıtım Sistemi Kullanım Bedeli | C × `osb_dagitim_kullanim_bedeli` (yalnız üretim tesisi DEĞİLSE) |
+| Lisanssız Üretim ÇEKİŞ Dağ.Bed.(DBÇx0,5) | C × `lisanssiz_uretim_cekis_bedeli` (yalnız üretim tesisi) |
+| Lisanssız Üretim VERİŞ Dağıtım Bedeli | max(0, G − C) × `dagitim_uretici_1` (yalnız üretim tesisi) |
+| Elektrik Tüketim Vergisi | btv × C × P (brüt) |
+| KDV | kdv × (kalemler toplamı) |
+
+Trafo yok, güç 0, sonraki ay YEKDEM mahsubu yok. P önceliği: `enerji` birim override > fatura ayının
+`osb_aylik_fiyatlar` satırı > en yakın önceki ay ("tahmini fiyat", YEKDEM farkı 0) > **görünür hata**.
+`kayseri_ek_bedeller` satırı yoksa fatura hesaplanmaz (görünür hata). Girdiler
+`assembleMethodInputs({ invoiceMethodId: 8, invoiceFrom })` → `assembleOsbInputs`. GES Üretim Satışı
+kartında dağıtım kesintisi 0 (veriş dağıtım bedeli faturada); GES Olmasaydı karşı-olgusu m8 motoruyla
+(M 0, N = C, G 0). Kabul testi `check:invoice-methods` F13; canlı salt-okunur karşılaştırma
+`npm run compare:osb-m8 -- 2026-08 [--pending] [--snapshots]`.
+
+### 7.4 Metot 1 ve 7 — Dağıtım kendi verişiyle (MEPAŞ/MEDAŞ usulü)
+
+Tesis bayrağı `subscription_settings.dagitim_kendi_veris` (`20261010201938`; bugün yalnız AS İnşaat'ın
+4 tesisi). **Yalnız Metot 1** (lisanslı dahil); dispatcher `calculateInvoiceForMethod` alanı m2–m8'de girişte
+siler. Saf hesap `src/components/utils/dagitimKendiVeris.ts` (`hesaplaDagitimKendiVeris`, `roundHalfUp`):
+
+| Büyüklük | Formül |
+| --- | --- |
+| C | tesisin ham Σcn + trafo kWh (lisanslı dahil) |
+| G | tesisin KENDİ ham Σgn — tahsis/havuz/p1 fazlası/allocated_ges KULLANILMAZ |
+| birim_eff | round6(D × (C − min(G, C)/2) / C) — G ≥ C → D/2; C = 0 → 0 (half-up, epsilon-güvenli) |
+| Elektrik Dağıtım Bedeli | round2(C × birim_eff) — satır "C kWh × birim_eff" |
+| MEDAŞ veriş faturası | G > C → (G − C) × `dagitim_uretici_1` + KDV — **ayrı fatura, hiçbir toplama girmez** |
+
+Alan anlamları: `distribution_charge` = perakende dağıtım; `effective_distribution_unit_price` = birim_eff;
+`distribution_adjustment` = round2(C×D) − dağıtım (veriş kaynaklı indirim); `distributionChargeKwh` =
+`distributionBaseKwh` = C. Enerji, mahsup, BTV, satış kWh değişmez. `dagitim` birim override'ı D'ye, tutar/hariç
+override'ı sonuca uygulanır; Kayseri `excludeDistributionCharge` önceliklidir. Metot 7 (2026-10-14) aynı
+helper'ı kullanır; bayrak m7'nin GERÇEK motor çağrısına da geçer (MEDAŞ veriş kartı + satış kesintisi +
+`medas_veris_*`; G = `meram.ownGnTotal`). Eski not: Metot 7 aynı matematiği
+YUVARLAMASIZ uygular — helper'a bağlanmadı.
+
+**Trafo önceliği (yalnız Metot 1):** `trafo_kaybi_saatlik` doluysa trafo = t × pencere saati
+(`resolveTrafoKwh`, `trafoKaybi.ts`; tam ay gün×24, cari dönemde son veri saatinde kapanır, to-date'de × f) ve
+`trafo_degeri` yok sayılır; boşsa aylık `trafo_degeri` aynen. Trafo bugün nereye giriyorsa (enerji trafoCharge,
+dağıtım tabanı, BTV) oraya girer. Bayraklı tesiste t **havuz tahsisine girmez** (`fetchGesMahsupContext`
+`.eq("dagitim_kendi_veris", false)`).
+
+**UI:** dağıtım satırı "Elektrik Dağıtım Bedeli" (InvoiceDetail, InvoiceSnapshotDetail, ConsumptionDetail,
+AlternateTariff); G > C ise `MedasVerisFaturasiCard` ("MEDAŞ Veriş Faturası — Sistem Kullanım Bedeli (ayrı
+fatura)", KDV %20, toplam KDV dahil). **GES satış kartı kesintisi:** satışın aktığı kartta (havuzda
+minPriority tesis, havuz yoksa tesisin kendisi) host bayraklıysa kesinti = bayraklı katkıcıların MEDAŞ veriş
+faturaları toplamı (`src/lib/ges/medasVerisKesinti.ts` → `calculateGesUretimSatisi({ medasKesinti })`), alt
+satırlarda hangi tesisin faturası olduğu gösterilir; host bayraksızsa eski oran kesintisi. Satışsız ayda MEDAŞ
+tutarı yalnız üyenin kendi MEDAŞ kartında görünür (bilinen sınır). GES Olmasaydı karşı-olgusu da bayraklı
+kuralla (G = 0). Kabul testi `npm run check:dagitim-kv`; canlı salt-okunur doğrulama
+`npm run compare:dagitim-kv -- [YYYY-MM] [--pending]`.
 
 ## 8. InvoiceHistory Sayfası
 
@@ -362,6 +443,9 @@ Dosya adı tipik olarak `<tesis>_<ay>_<yıl>.xlsx` formatındadır (örn. `12345
 | `20260603_002_add_ges_satis_dagitim_bedeli.sql` | 2026-06-03 | `ges_satis_dagitim_bedeli` — donmuş dağıtım kesinti oranı |
 | `20260617_003_add_hourly_net_to_snapshots.sql` | 2026-06-17 | `net_positive_draw_kwh`, `net_excess_feed_kwh` + Europe/Istanbul ay sınırıyla `consumption_hourly`'den bir kerelik backfill |
 | `20260705_002_add_allocated_ges_kwh_to_snapshots.sql` | 2026-07-05 | `allocated_ges_kwh` — talep birleştirme tahsis audit'i |
+| `20261001_002_invoice_method_8_kayseri_osb.sql` | 2026-10-01 | Metot 8 replay: `osb_enerji_birim_fiyati`, `osb_fiyat_tahmini`, `osb_yekdem_fark_birim`, `osb_iletim_birim`, `osb_dagitim_birim`, `osb_cekis_birim`, `osb_veris_dagitim_birim`, `osb_reaktif_birim` (yeniden kullanılan: `own_gn_kwh`, `prev_sum_pos`, `net_positive_draw_kwh`). Ayrıca `osb_aylik_fiyatlar` tablosu, `invoice_methods` id 8 |
+| `20261014075946_add_invoice_method_override.sql` | 2026-10-14 | (snapshot kolonu değil) `subscription_settings.invoice_method_override` smallint → `invoice_methods(id)`. Snapshot `invoice_method` damgası efektif metodu (override ?? şirket) taşır; `invoice_from` şirket anahtarı kalır |
+| `20261010201938_add_dagitim_kendi_veris.sql` | 2026-10-10 | `dagitim_kendi_veris` (bool; Metot 1 motor satırlarında açık yazılır), `medas_veris_kwh`, `medas_veris_birim`, `medas_veris_bedeli` (KDV hariç, toplama girmez). Bayraklıda `own_gn_kwh` = G, t kullanıldıysa `trafo_kaybi_saatlik`/`trafo_kaybi_kwh` damgalanır (`trafo_degeri` = kullanılan kWh). Ayrıca `subscription_settings.dagitim_kendi_veris` |
 | `20260930_003_invoice_method_7_meram.sql` | 2026-09-30 | Metot 7 replay: `trafo_kaybi_saatlik`, `trafo_kaybi_kwh` (C = total_consumption_kwh + bu), `own_gn_kwh`, `yekdem_gddk`, `yekdem_is_final` (yalnız m7 damgalar; U/F türetilir). Ayrıca `subscription_settings.trafo_kaybi_saatlik`, `invoice_methods` id 7, override anahtarı `yekdem_gddk` |
 
 > 2026-04 öncesi snapshot'lar bu alanları içermez; `recomputeSnapshotTotalWithMahsup()` eksik alanları `0` veya varsayılan değerle tamamlayıp güncel formülle hesaplar. 2026-06-02 backfill'i, eski `billed` satırların saklı toplamlarını da güncel formülle eşitlemiştir.

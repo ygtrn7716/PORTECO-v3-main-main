@@ -32,6 +32,8 @@ import {
   normalizeTrafoKaybi,
   trafoGridCapIso,
 } from "@/components/utils/trafoKaybi";
+// Saf modül (yalnız import type + import'suz net-metod modülü) → tsx testinde güvenli.
+import { OsbInvoiceInputError } from "@/components/utils/calculateInvoiceOsb";
 
 const num = (v: unknown): number => {
   const n = Number(v);
@@ -70,9 +72,18 @@ export type HourlyNetAggregates = {
   sumOwnGn: number;
   /** Satırlara eklenmiş trafo kaybı (t × saat, kWh). Metot 7 dışında 0. */
   trafoKaybiKwh: number;
+  /** Ham Σri / Σrc (kVArh) — satırlarda ri/rc kolonu yoksa 0. Metot 8 reaktif kalemleri. */
+  sumRi: number;
+  sumRc: number;
 };
 
-type HourlyRow = { ts?: string | number | Date; cn?: unknown; gn?: unknown };
+type HourlyRow = {
+  ts?: string | number | Date;
+  cn?: unknown;
+  gn?: unknown;
+  ri?: unknown;
+  rc?: unknown;
+};
 
 /**
  * SAF hesap. Saatlik satırlar + tahsis görünümü + PTF map'inden agregaları üretir.
@@ -103,6 +114,8 @@ export function computeHourlyNetAggregates(p: {
   let vMahsup = 0;
   let ptfCoveredMahsupKwh = 0;
   let rawGn = 0; // ham Σgn (view yoksa G_own)
+  let sumRi = 0;
+  let sumRc = 0;
 
   // Saat başına efektif gn'i applyAllocationToHourlyRows ile AYNI kuralla türet;
   // yalnız PTF ağırlıklandırması için pos_h'ı yeniden hesapla.
@@ -114,6 +127,8 @@ export function computeHourlyNetAggregates(p: {
     const cn = num(row.cn);
     sumCn += cn;
     rawGn += num(row.gn);
+    sumRi += num(row.ri);
+    sumRc += num(row.rc);
 
     let effGn: number;
     if (isSourceRole) {
@@ -180,6 +195,8 @@ export function computeHourlyNetAggregates(p: {
     wMahsup, vMahsup, ptfCoveredMahsupKwh,
     sumOwnGn,
     trafoKaybiKwh: p.trafoKaybiKwh ?? 0,
+    sumRi,
+    sumRc,
   };
 }
 
@@ -220,7 +237,8 @@ async function loadUncached(p: {
     supabase,
     userId,
     subscriptionSerno,
-    columns: "ts, cn, gn",
+    // ri/rc yalnız toplanır (Metot 8 reaktif kalemleri); diğer agregaları etkilemez.
+    columns: "ts, cn, gn, ri, rc",
     startIso,
     endIso,
   });
@@ -288,7 +306,10 @@ export function loadHourlyNetAggregates(p: {
   trafoKaybiSaatlik?: number;
 }): Promise<HourlyNetAggregates | null> {
   const t = normalizeTrafoKaybi(p.trafoKaybiSaatlik);
-  const key = `${p.subscriptionSerno}|${p.periodYear}|${p.periodMonth}` + (t > 0 ? `|t:${t}` : "");
+  // userId anahtarda: aynı tesis birden fazla kullanıcıda kayıtlı olabilir (INCI GIDA) ve
+  // tahsis bağlamı kullanıcıya özgüdür.
+  const key =
+    `${p.userId}|${p.subscriptionSerno}|${p.periodYear}|${p.periodMonth}` + (t > 0 ? `|t:${t}` : "");
   const hit = aggCache.get(key);
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.promise;
 
@@ -380,8 +401,11 @@ export async function assembleMethodInputs(p: {
   /** Zaten hesaplanmış cari dönem agregaları (billedInvoiceInputs gibi). */
   current?: HourlyNetAggregates | null;
   ctx?: GesMahsupContext;
+  /** Metot 8: fiyatın okunacağı firma anahtarı (invoice_companies.key). Yoksa 'kayseri_osb'. */
+  invoiceFrom?: string | null;
 }): Promise<InvoiceMethodInputs | null> {
   if (p.invoiceMethodId === 7) return assembleMeramInputs(p);
+  if (p.invoiceMethodId === 8) return assembleOsbInputs(p);
 
   const cur =
     p.current ??
@@ -418,6 +442,8 @@ export async function assembleMethodInputs(p: {
     prevTahminiYekdem: prevYekdem.tahmini,
     prevGerceklesenYekdem: prevYekdem.gerceklesen,
     mahsuplasmaUnitPrice: null,
+    // m3 (Trepaş 2026-09+ bölünmüş dağıtım): ana fatura tabanı kendi sayacın verişiyle.
+    ...(p.invoiceMethodId === 3 ? { ownGnTotal: cur.sumOwnGn } : {}),
   };
 }
 
@@ -513,6 +539,184 @@ async function assembleMeramInputs(p: {
       unitPriceAdjustment,
       yekdemIsFinal: yekdem.gerceklesen != null,
       gddk,
+    },
+  };
+}
+
+// ── Metot 8 (Kayseri OSB) ────────────────────────────────────────
+
+/** Metot 8 fiyatının varsayılan firma anahtarı (bugün Metot 8'i yalnız Kayseri OSB kullanır). */
+export const OSB_DEFAULT_COMPANY_KEY = "kayseri_osb";
+
+/**
+ * Önceki ay N (YEKDEM fiyat farkı tabanı) — DETERMİNİSTİK yol:
+ *  1) önceki ayın Metot 8 ile faturalanmış (dondurulmuş) billed snapshot'ı → net_positive_draw_kwh
+ *     (m8 yazımında girdilerden damgalanır; lisanslı → m1 satırı osb_* boş olduğu için hariç);
+ *  2) yoksa AYNI pipeline ile önceki ay (güncel tahsis) → sumPos.
+ * Metod 1 damgalı snapshot'lar BİLEREK kullanılmaz (farklı/bayat tahsisle yazılmış olabilir).
+ */
+async function resolveOsbPrevNetKwh(
+  supabase: SupabaseClient,
+  userId: string,
+  serno: number,
+  prevYear: number,
+  prevMonth: number
+): Promise<number | null> {
+  const snap = await supabase
+    .from("invoice_snapshots")
+    .select("net_positive_draw_kwh")
+    .eq("user_id", userId)
+    .eq("subscription_serno", serno)
+    .eq("period_year", prevYear)
+    .eq("period_month", prevMonth)
+    .eq("invoice_type", "billed")
+    .eq("invoice_method", 8)
+    .not("osb_enerji_birim_fiyati", "is", null)
+    .maybeSingle();
+  if (snap.error) throw snap.error;
+  if (snap.data?.net_positive_draw_kwh != null) return Number(snap.data.net_positive_draw_kwh);
+  const agg = await loadHourlyNetAggregates({
+    supabase,
+    userId,
+    subscriptionSerno: serno,
+    periodYear: prevYear,
+    periodMonth: prevMonth,
+  });
+  return agg ? agg.sumPos : null;
+}
+
+/**
+ * Metot 8 (Kayseri OSB) girdileri. Yalnız m8 tesislerinde birkaç küçük sorgu:
+ *  - agregalar (C, N, M, G, artan, Σri/Σrc) — tahsis görünümü dahil, trafo yok
+ *  - osb_aylik_fiyatlar: fatura ayı veya öncesindeki EN YENİ satır. Tam ay → kesin P + YEKDEM
+ *    fark birimi; daha eski ay → P tahmini (cari ay) + fark 0; hiç yok → P null (motor hata atar)
+ *  - kayseri_ek_bedeller (yoksa null → motor hata atar; 0 VARSAYILMAZ)
+ *  - tarife: dagitim_uretici_1 (veriş dağıtım) + reaktif_bedel
+ *  - önceki ay N (resolveOsbPrevNetKwh)
+ * Cari dönem saatlik verisi yoksa null döner → dispatcher görünür hata atar.
+ */
+async function assembleOsbInputs(p: {
+  supabase: SupabaseClient;
+  userId: string;
+  subscriptionSerno: number;
+  periodYear: number;
+  periodMonth: number;
+  kbk: number;
+  tahminiYekdem: number;
+  current?: HourlyNetAggregates | null;
+  ctx?: GesMahsupContext;
+  invoiceFrom?: string | null;
+}): Promise<InvoiceMethodInputs | null> {
+  const { supabase, userId, subscriptionSerno, periodYear, periodMonth } = p;
+  const donem = `${periodYear}-${String(periodMonth).padStart(2, "0")}`;
+  const companyKey = p.invoiceFrom || OSB_DEFAULT_COMPANY_KEY;
+
+  const [cur, priceRes, ekRes, settingsRes] = await Promise.all([
+    p.current ??
+      loadHourlyNetAggregates({
+        supabase,
+        userId,
+        subscriptionSerno,
+        periodYear,
+        periodMonth,
+        ctx: p.ctx,
+      }),
+    supabase
+      .from("osb_aylik_fiyatlar")
+      .select("period_year, period_month, enerji_birim_fiyati, yekdem_fark_birim_fiyati")
+      .eq("company_key", companyKey)
+      .or(
+        `period_year.lt.${periodYear},and(period_year.eq.${periodYear},period_month.lte.${periodMonth})`
+      )
+      .order("period_year", { ascending: false })
+      .order("period_month", { ascending: false })
+      .limit(1)
+      .maybeSingle(),
+    supabase
+      .from("kayseri_ek_bedeller")
+      .select("iletim_bedeli_aktif_tuketim, osb_dagitim_kullanim_bedeli, lisanssiz_uretim_cekis_bedeli")
+      .eq("user_id", userId)
+      .eq("subscription_serno", subscriptionSerno)
+      .maybeSingle(),
+    supabase
+      .from("subscription_settings")
+      .select("terim, gerilim, tarife")
+      .eq("user_id", userId)
+      .eq("subscription_serno", subscriptionSerno)
+      .maybeSingle(),
+  ]);
+  if (priceRes.error) throw priceRes.error;
+  if (ekRes.error) throw ekRes.error;
+  if (settingsRes.error) throw settingsRes.error;
+  if (!cur) return null;
+
+  const st = settingsRes.data;
+  if (!st?.terim || !st?.gerilim || !st?.tarife) {
+    throw new OsbInvoiceInputError(`Tesis ayarları eksik (terim/gerilim/tarife) — ${donem}.`);
+  }
+  const tariffRes = await supabase
+    .from("distribution_tariff_official")
+    .select("dagitim_uretici_1, reaktif_bedel")
+    .eq("terim", st.terim)
+    .eq("gerilim", st.gerilim)
+    .eq("tarife", st.tarife)
+    .maybeSingle();
+  if (tariffRes.error) throw tariffRes.error;
+  if (!tariffRes.data) {
+    throw new OsbInvoiceInputError(`Uygun dağıtım tarifesi bulunamadı — ${donem}.`);
+  }
+
+  const prev = dayjsTR().date(1).year(periodYear).month(periodMonth - 1).subtract(1, "month");
+  const prevNetKwh = await resolveOsbPrevNetKwh(
+    supabase,
+    userId,
+    subscriptionSerno,
+    prev.year(),
+    prev.month() + 1
+  );
+
+  const price = priceRes.data;
+  const exact =
+    price != null &&
+    Number(price.period_year) === periodYear &&
+    Number(price.period_month) === periodMonth;
+  const ek = ekRes.data;
+
+  return {
+    sumCn: cur.sumCn,
+    sumGn: cur.sumGn,
+    sumPos: cur.sumPos,
+    sumMahsup: cur.sumMahsup,
+    sumExcess: cur.sumExcess,
+    wPos: cur.wPos,
+    wMahsup: cur.wMahsup,
+    kbk: p.kbk,
+    tahminiYekdem: p.tahminiYekdem,
+    prevSumPos: prevNetKwh,
+    prevTahminiYekdem: null,
+    prevGerceklesenYekdem: null,
+    mahsuplasmaUnitPrice: null,
+    osb: {
+      donem,
+      ownGnTotal: cur.sumOwnGn,
+      riKwh: cur.sumRi,
+      rcKwh: cur.sumRc,
+      enerjiFiyati: price != null ? Number(price.enerji_birim_fiyati) : null,
+      fiyatTahmini: price != null && !exact,
+      fiyatDonemi:
+        price != null
+          ? `${price.period_year}-${String(price.period_month).padStart(2, "0")}`
+          : null,
+      yekdemFarkBirim: exact ? num(price!.yekdem_fark_birim_fiyati) : 0,
+      ekBedel: ek
+        ? {
+            iletim: num(ek.iletim_bedeli_aktif_tuketim),
+            osbDagitim: num(ek.osb_dagitim_kullanim_bedeli),
+            cekis: num(ek.lisanssiz_uretim_cekis_bedeli),
+          }
+        : null,
+      verisDagitimBirim: num(tariffRes.data.dagitim_uretici_1),
+      reaktifBirim: num(tariffRes.data.reaktif_bedel),
     },
   };
 }

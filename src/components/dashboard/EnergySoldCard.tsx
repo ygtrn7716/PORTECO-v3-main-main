@@ -38,6 +38,11 @@ import {
   deriveGesSatisMahsup,
   type GesSatisMahsupResult,
 } from "@/lib/ges/gesSatisMahsup";
+import { parseGesSaleDistBasis } from "@/lib/ges/gesUretimSatisi";
+import {
+  loadMedasVerisKesintisiSafe,
+  medasHostKatkiFromBreakdown,
+} from "@/lib/ges/medasVerisKesinti";
 import { resolveGesSatisDagitimRate } from "@/lib/ges/gesSatisDagitimRate";
 import { calcYearlySatisHakkiUsage } from "@/components/utils/yearlySatisHakki";
 import { GesUretimSatisiBody } from "@/components/dashboard/shared/GesUretimSatisiCard";
@@ -251,6 +256,21 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
             if (cancel) return;
             lisansliSatis = snap.lisansli_satis ?? false;
             onYil = snap.on_yil ?? false;
+            // MEDAŞ usulü (dagitim_kendi_veris damgalı): kesinti = satışa akan bayraklı
+            // tesislerin veriş faturaları — kaynak snapshot (katkıcılar da snapshot'tan).
+            const medasKesinti =
+              breakdown.dagitimKendiVeris && breakdown.verisFazlaKwh > 0
+                ? await loadMedasVerisKesintisiSafe({
+                    supabase,
+                    userId: uid,
+                    hostSerno: selectedSerno,
+                    periodYear,
+                    periodMonth,
+                    prefer: "snapshot",
+                    host: medasHostKatkiFromBreakdown(breakdown),
+                  })
+                : null;
+            if (cancel) return;
             derived = deriveGesSatisMahsup({
               invoiceMethodId: methodId,
               breakdown,
@@ -265,6 +285,8 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
                 Number(snap.unit_price_energy ?? 0),
                 overrides?.enerji
               ),
+              medasKesinti,
+              gesSaleDistBasis: parseGesSaleDistBasis(snap.ges_sale_dist_basis),
             });
             snapshotOk = true;
           } catch (e) {
@@ -293,6 +315,19 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
             );
             lisansliSatis = res.inputs.lisansliSatis;
             onYil = res.inputs.onYil;
+            const medasKesinti =
+              breakdown.dagitimKendiVeris && breakdown.verisFazlaKwh > 0
+                ? await loadMedasVerisKesintisiSafe({
+                    supabase,
+                    userId: uid,
+                    hostSerno: selectedSerno,
+                    periodYear,
+                    periodMonth,
+                    prefer: "live",
+                    host: medasHostKatkiFromBreakdown(breakdown),
+                  })
+                : null;
+            if (cancel) return;
             derived = deriveGesSatisMahsup({
               invoiceMethodId: res.inputs.invoiceMethodId,
               breakdown,
@@ -306,6 +341,8 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
                 res.inputs.unitPriceEnergy,
                 overrides?.enerji
               ),
+              medasKesinti,
+              gesSaleDistBasis: res.inputs.gesSaleDistBasis,
             });
           }
         }
@@ -540,12 +577,14 @@ export default function EnergySoldCard({ onSernoChange }: EnergySoldCardProps = 
                       </span>
                     </div>
 
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-neutral-600">Dağıtım Bileşeni</span>
-                      <span className="text-sm font-medium text-neutral-700">
-                        +{fmtTL(derived.mahsup.dagitim)} TL
-                      </span>
-                    </div>
+                    {!derived.mahsup.dagitimAyri && (
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm text-neutral-600">Dağıtım Bileşeni</span>
+                        <span className="text-sm font-medium text-neutral-700">
+                          +{fmtTL(derived.mahsup.dagitim)} TL
+                        </span>
+                      </div>
+                    )}
 
                     <div className="border-t border-emerald-200/70 my-2" />
 

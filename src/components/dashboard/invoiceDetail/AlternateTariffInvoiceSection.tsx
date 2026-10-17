@@ -96,10 +96,15 @@ export default function AlternateTariffInvoiceSection(props: {
   /** İpragaz 2026-08+ (m5): ana faturayla aynı çözülmüş birleşik-YEK kapısı
    *  (InvoiceDetail hesaplar). Alt simülasyon da YEK'i enerji satırına gömer. */
   ipragazYekBirlesik?: boolean;
+  /** Trepaş 2026-09+ (m3) bölünmüş dağıtım kapısı — ana faturayla aynı. */
+  tredasDagitimBolunmus?: boolean;
   /** Metod 6 (Kepsaş): ana faturanın enerji fiyatına gömülen ÇIPLAK YEKDEM adder'ı.
    *  Tarifeden bağımsız (fark×kbk×prevKwh) → alt simülasyonda da aynen gömülür
    *  (alt tarifenin BTV/KDV oranıyla). Diğer metodlarda 0/null. */
   embeddedYekdemAdderTL?: number | null;
+  /** Dağıtım kendi verişiyle (MEDAŞ usulü, yalnız bayraklı Metot 1): ana faturayla aynı
+   *  kendi ham Σgn. MEDAŞ birimi alternatif tarifenin dagitim_uretici_1'inden. */
+  dagitimKendiVeris?: { ownGnKwh: number; ureticiBirim: number } | null;
 }) {
   const {
     uid,
@@ -128,7 +133,9 @@ export default function AlternateTariffInvoiceSection(props: {
     methodInputs = null,
     applyVerisMahsupPerakendeCap,
     ipragazYekBirlesik = false,
+    tredasDagitimBolunmus = false,
     embeddedYekdemAdderTL = 0,
+    dagitimKendiVeris = null,
   } = props;
 
   const [loading, setLoading] = useState(false);
@@ -201,7 +208,7 @@ export default function AlternateTariffInvoiceSection(props: {
         const { data: tariffRow, error: tariffErr } = await supabase
           .from("distribution_tariff_official")
           .select(
-            "dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel"
+            "dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, dagitim_uretici_1"
           )
           .eq("terim", altTerm)
           .eq("gerilim", altGerilim)
@@ -311,8 +318,19 @@ export default function AlternateTariffInvoiceSection(props: {
           methodInputs: methodInputs ?? undefined,
           applyVerisMahsupPerakendeCap, // 2K: ana faturayla aynı kapı
           ipragazYekBirlesik, // İpragaz 2026-08+: ana faturayla aynı kapı (m5)
+          tredasDagitimBolunmus, // Trepaş 2026-09+: ana faturayla aynı kapı (m3)
           // Metod 6 (Kepsaş): çıplak adder alt tarifenin BTV/KDV oranıyla gömülür.
           embeddedYekdemAdderTL: embeddedYekdemAdderTL ?? undefined,
+          // MEDAŞ usulü dağıtım: aynı kendi veriş, alternatif tarifenin D'si ve uretici_1'i.
+          ...(dagitimKendiVeris
+            ? {
+                dagitimKendiVeris: {
+                  ownGnKwh: dagitimKendiVeris.ownGnKwh,
+                  ureticiBirim:
+                    tariffRow.dagitim_uretici_1 != null ? Number(tariffRow.dagitim_uretici_1) : 0,
+                },
+              }
+            : {}),
         });
 
         if (cancel) return;
@@ -358,7 +376,9 @@ export default function AlternateTariffInvoiceSection(props: {
     methodInputs,
     applyVerisMahsupPerakendeCap, // 2K
     ipragazYekBirlesik, // İpragaz 2026-08+ (m5)
+    tredasDagitimBolunmus, // Trepaş 2026-09+ (m3)
     embeddedYekdemAdderTL, // 2L: metod 6 adder'ı değişirse alt breakdown yeniden gömülmeli
+    dagitimKendiVeris, // MEDAŞ usulü dağıtım (kendi veriş)
   ]);
 
   // 2H — Ana faturanın dış mahsup kalemleri karş-olgusala AYNEN taşınır (yeniden hesap YOK):
@@ -618,7 +638,9 @@ export default function AlternateTariffInvoiceSection(props: {
                 )}
 
                 <tr className="border-b border-neutral-100">
-                  <td className="py-2 pr-4">Dağıtım Bedeli</td>
+                  <td className="py-2 pr-4">
+                    {altBreakdown.dagitimKendiVeris ? "Elektrik Dağıtım Bedeli" : "Dağıtım Bedeli"}
+                  </td>
                   <td className="py-2 pr-4 text-neutral-600">
                     {/* Efektif birim × mahsup bazı — tutarla uzlaşır (m1 saatlik-net gate dahil) */}
                     {fmtUnit(altBreakdown.effectiveDistributionUnitPrice)} TL/kWh ×{" "}
@@ -640,7 +662,9 @@ export default function AlternateTariffInvoiceSection(props: {
                       Muhtelif-2
                     </td>
                     <td className="py-2 pr-4 text-neutral-600">
-                      +{fmtMoney2(altBreakdown.muhtelif2Dagitim ?? 0)} dağıtım −{" "}
+                      {altBreakdown.tredasGesDagitim
+                        ? "Mahsuplaşma: −"
+                        : `+${fmtMoney2(altBreakdown.muhtelif2Dagitim ?? 0)} dağıtım − `}
                       {fmtMoney2(altBreakdown.muhtelif2MahsupKredisi ?? 0)} mahsuplaşma (
                       {fmtUnit(altBreakdown.mahsuplasmaUnitPriceApplied ?? 0)} TL/kWh ×{" "}
                       {fmtKwh(altBreakdown.verisMahsupKwh)} kWh)

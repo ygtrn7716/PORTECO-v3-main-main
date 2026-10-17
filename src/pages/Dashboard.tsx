@@ -20,13 +20,15 @@ import {
 } from "@/components/utils/calculateInvoice";
 import {
   calculateInvoiceForMethod,
-  isNetInvoiceMethod,
-  methodForProvider,
+  needsMethodInputs,
+  skipsNextMonthYekdemMahsup,
+  methodForSubscription,
   resolveInvoiceMethods,
 } from "@/lib/invoiceMethods";
 import { assembleMethodInputs } from "@/components/utils/hourlyNetAggregates";
 import {
   isIpragazYekBirlesikPeriod,
+  isTredasDagitimBolunmusPeriod,
   type InvoiceMethodInputs,
 } from "@/components/utils/calculateInvoiceNetMethods";
 import {
@@ -40,6 +42,7 @@ import {
 } from "@/components/utils/invoiceOverrides";
 import { fetchHiddenSernos, resolveSelectedSub } from "@/lib/subscriptionVisibility";
 import { fetchAllConsumption } from "@/lib/paginatedFetch";
+import { resolveTrafoKwh } from "@/components/utils/trafoKaybi";
 import {
   fetchGesMahsupContext,
   getFacilityAllocation,
@@ -384,6 +387,8 @@ export default function Dashboard() {
   const [prevMonthRi, setPrevMonthRi] = useState<number | null>(null);
   const [prevMonthRc, setPrevMonthRc] = useState<number | null>(null);
   const [prevMonthGn, setPrevMonthGn] = useState<number | null>(null);
+  // Tesisin KENDİ ham verişi (tahsis öncesi) — dağıtım kendi verişiyle (MEDAŞ usulü).
+  const [prevMonthOwnGn, setPrevMonthOwnGn] = useState<number | null>(null);
   // Saatlik net mahsup (net üretici): Σ max(0,cn−gn) ve Σ max(0,gn−cn).
   const [prevMonthNetPos, setPrevMonthNetPos] = useState<number | null>(null);
   const [prevMonthNetExcess, setPrevMonthNetExcess] = useState<number | null>(null);
@@ -607,6 +612,8 @@ export default function Dashboard() {
           sumNetPos += Math.max(0, cnH - gnH);
           sumNetExcess += Math.max(0, gnH - cnH);
         }
+        // Kendi ham veriş — tahsis aşağıda sumGn'i ezmeden ÖNCE.
+        const sumOwnGn = sumGn;
 
         // Talep Birleştirme: tesise GES tahsisi/kaynak rolü varsa efektif
         // gn/net değerleri kullan (view=null → yukarıdaki toplamlar aynen kalır).
@@ -629,6 +636,7 @@ export default function Dashboard() {
         setPrevMonthRi(sumRi);
         setPrevMonthRc(sumRc);
         setPrevMonthGn(sumGn);
+        setPrevMonthOwnGn(sumOwnGn);
         setPrevMonthNetPos(sumNetPos);
         setPrevMonthNetExcess(sumNetExcess);
       } catch (e: any) {
@@ -639,6 +647,7 @@ export default function Dashboard() {
           setPrevMonthRi(null);
           setPrevMonthRc(null);
           setPrevMonthGn(null);
+          setPrevMonthOwnGn(null);
           setPrevMonthNetPos(null);
           setPrevMonthNetExcess(null);
         }
@@ -922,7 +931,7 @@ export default function Dashboard() {
         // 5.1) settings
         const { data: settings, error: settingsErr } = await supabase
           .from("subscription_settings")
-          .select("terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis")
+          .select("terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, trafo_kaybi_saatlik, on_yil, lisansli_satis, dagitim_kendi_veris, invoice_method_override")
           .eq("user_id", uid)
           .eq("subscription_serno", selectedSub)
           .maybeSingle();
@@ -942,7 +951,7 @@ export default function Dashboard() {
         const onYil = settings.on_yil ?? false;
         const lisansliSatis = settings.lisansli_satis ?? false;
 
-        const trafoDegeri =
+        const trafoDegeriAylik =
           settings.trafo_degeri != null && Number.isFinite(Number(settings.trafo_degeri))
             ? Number(settings.trafo_degeri)
             : 0;
@@ -960,7 +969,7 @@ export default function Dashboard() {
         // 5.2) tariff (+ reaktif_bedel)
         const { data: tariffRow, error: tariffErr } = await supabase
           .from("distribution_tariff_official")
-          .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, perakende_enerji_bedeli")
+          .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, perakende_enerji_bedeli, dagitim_uretici_1")
           .eq("terim", terim)
           .eq("gerilim", gerilim)
           .eq("tarife", tarife)
@@ -993,10 +1002,37 @@ export default function Dashboard() {
         // Fatura metodu: kullanıcının entegrasyonlarından provider ile çözülür.
         const methodMap = await resolveInvoiceMethods({ context: "self", userId: uid });
         if (cancel) return;
-        const { methodId: invoiceMethodId } = methodForProvider(
+        // Efektif metod = abonelik override'ı ?? şirket metodu (tek resolver).
+        const { methodId: invoiceMethodId, invoiceFrom } = methodForSubscription(
           methodMap,
-          subRow?.provider ?? null
+          subRow?.provider ?? null,
+          settings.invoice_method_override
         );
+
+        // Trafo kWh — Metot 1'de öncelik trafo_kaybi_saatlik (t × M-1 saat sayısı) >
+        // trafo_degeri; tamamlanmış dönem → ızgara kapaksız (lastTs gerekmez).
+        const trafoDegeri =
+          invoiceMethodId === 1
+            ? resolveTrafoKwh({
+                trafoKaybiSaatlik: settings.trafo_kaybi_saatlik,
+                trafoDegeri: trafoDegeriAylik,
+                startIso: prev.startOf("month").toDate().toISOString(),
+                endIso: prev.startOf("month").add(1, "month").toDate().toISOString(),
+                lastTs: null,
+                nowMs: Date.now(),
+              }).trafoKwh
+            : trafoDegeriAylik;
+        // Dağıtım kendi verişiyle (MEDAŞ usulü) — Metot 1 (lisanslı dahil) ve Metot 7.
+        const dagitimKendiVeris =
+          (invoiceMethodId === 1 || invoiceMethodId === 7) && settings.dagitim_kendi_veris === true
+            ? {
+                ownGnKwh: prevMonthOwnGn ?? 0,
+                ureticiBirim:
+                  tariffRow.dagitim_uretici_1 != null
+                    ? Number(tariffRow.dagitim_uretici_1)
+                    : 0,
+              }
+            : null;
 
         // 5.4) demand (geçen ay)
         const { data: demandRow, error: demandErr } = await supabase
@@ -1076,6 +1112,7 @@ export default function Dashboard() {
             invoiceMethodId,
             kbk: monthlyKbk,
             tahminiYekdem: monthlyYekdem,
+            invoiceFrom,
           });
           if (cancel) return;
         }
@@ -1108,13 +1145,19 @@ export default function Dashboard() {
           // İpragaz 2026-08+: YEK bedeli enerji satırına gömülü (yalnız m5 okur).
           ipragazYekBirlesik:
             invoiceMethodId === 5 && isIpragazYekBirlesikPeriod(periodYear, periodMonth),
+          // Trepaş 2026-09+: dağıtım ana fatura + GES üretim dağıtım faturası (yalnız m3 okur).
+          tredasDagitimBolunmus:
+            invoiceMethodId === 3 && isTredasDagitimBolunmusPeriod(periodYear, periodMonth),
+          // MEDAŞ usulü dağıtım (kendi ham veriş) — yalnız bayraklı m1.
+          ...(dagitimKendiVeris ? { dagitimKendiVeris } : {}),
         }, lineOverrides);
 
         // ✅ YEKDEM mahsup (M-1)
         // Lisanslı Satış tesisleri için YEKDEM mahsup uygulanmaz.
         // D4: Metod 2/3/5'te fark KDV matrahındaki kalem (yekFarkiCharge) → toplam
         // sonrası mahsup 0'a zorlanır (çift sayım önlenir).
-        const isNetMethod = isNetInvoiceMethod(invoiceMethodId);
+        // Metod 8: YEKDEM fiyat farkı faturada kalem → post-total mahsup hesaplanmaz.
+        const isNetMethod = skipsNextMonthYekdemMahsup(invoiceMethodId);
         let yekdemMahsupValue = 0;
         let has = false;
         let missing: "none" | "value" | "final" | "both" =
@@ -1235,6 +1278,7 @@ export default function Dashboard() {
     prevMonthRi,
     prevMonthRc,
     prevMonthGn,
+    prevMonthOwnGn,
     prevMonthNetPos,
     prevMonthNetExcess,
     monthlyPTF,
@@ -1334,6 +1378,8 @@ export default function Dashboard() {
             subNetExcess += Math.max(0, gnH - cnH);
           }
           grandTotalKwh += subKwh;
+          // Kendi ham veriş — tahsis aşağıda subGn'i ezmeden ÖNCE (MEDAŞ usulü dağıtım).
+          const subOwnGn = subGn;
 
           // Talep Birleştirme: tahsis/kaynak rolü varsa efektif gn/net değerleri.
           // Kaynak sayaç (efektif gn=0) aşağıdaki subKwh===0 && subGn===0
@@ -1416,7 +1462,7 @@ export default function Dashboard() {
           // KBK
           const { data: kbkData } = await supabase
             .from("subscription_settings")
-            .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis, unit_price_adjustment")
+            .select("kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, trafo_kaybi_saatlik, on_yil, lisansli_satis, unit_price_adjustment, dagitim_kendi_veris, invoice_method_override")
             .eq("user_id", uid)
             .eq("subscription_serno", serno)
             .maybeSingle();
@@ -1436,7 +1482,7 @@ export default function Dashboard() {
           const tarife = kbkData.tarife ?? null;
           if (!terim || !gerilim || !tarife) continue;
 
-          const trafoDegeri = kbkData.trafo_degeri != null && Number.isFinite(Number(kbkData.trafo_degeri)) ? Number(kbkData.trafo_degeri) : 0;
+          const trafoDegeriAylik = kbkData.trafo_degeri != null && Number.isFinite(Number(kbkData.trafo_degeri)) ? Number(kbkData.trafo_degeri) : 0;
           const subOnYil = kbkData.on_yil ?? false;
           const subLisansliSatis = kbkData.lisansli_satis ?? false;
           const gucLimit = kbkData.guc_bedel_limit != null ? Number(kbkData.guc_bedel_limit) : 0;
@@ -1444,7 +1490,7 @@ export default function Dashboard() {
           // Tariff
           const { data: tariffRow } = await supabase
             .from("distribution_tariff_official")
-            .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, perakende_enerji_bedeli")
+            .select("dagitim_bedeli, guc_bedeli, guc_bedeli_asim, kdv, btv, reaktif_bedel, perakende_enerji_bedeli, dagitim_uretici_1")
             .eq("terim", terim)
             .eq("gerilim", gerilim)
             .eq("tarife", tarife)
@@ -1462,10 +1508,36 @@ export default function Dashboard() {
           if (cancel) return;
           const multiplier = subRow?.multiplier != null ? Number(subRow.multiplier) : 1;
           const btvEnabled = subRow?.btv_enabled ?? true;
-          const { methodId: subInvoiceMethodId } = methodForProvider(
+          // Efektif metod = abonelik override'ı ?? şirket metodu (tek resolver).
+          const { methodId: subInvoiceMethodId, invoiceFrom: subInvoiceFrom } = methodForSubscription(
             methodMap,
-            subRow?.provider ?? null
+            subRow?.provider ?? null,
+            kbkData.invoice_method_override
           );
+          // Trafo kWh — Metot 1'de öncelik trafo_kaybi_saatlik (t × M-1 saat) > trafo_degeri.
+          const trafoDegeri =
+            subInvoiceMethodId === 1
+              ? resolveTrafoKwh({
+                  trafoKaybiSaatlik: kbkData.trafo_kaybi_saatlik,
+                  trafoDegeri: trafoDegeriAylik,
+                  startIso: start.toDate().toISOString(),
+                  endIso: end.toDate().toISOString(),
+                  lastTs: null,
+                  nowMs: Date.now(),
+                }).trafoKwh
+              : trafoDegeriAylik;
+          // Dağıtım kendi verişiyle (MEDAŞ usulü) — Metot 1 (lisanslı dahil) ve Metot 7.
+          const subKendiVeris =
+            (subInvoiceMethodId === 1 || subInvoiceMethodId === 7) &&
+            kbkData.dagitim_kendi_veris === true
+              ? {
+                  ownGnKwh: subOwnGn,
+                  ureticiBirim:
+                    tariffRow.dagitim_uretici_1 != null
+                      ? Number(tariffRow.dagitim_uretici_1)
+                      : 0,
+                }
+              : null;
 
           // Demand
           const { data: demandRow } = await supabase
@@ -1513,10 +1585,14 @@ export default function Dashboard() {
           // Tesis x ay için USD kur (subscription_yekdem.usd_kur'dan, subYek satırında zaten geldi)
           const subUsdKur = subYek?.usd_kur != null ? Number(subYek.usd_kur) : 0;
 
-          // Metod 2/3/5 saatlik-net girdileri (yalnız ilgili metotta).
+          // Metod 2/3/5/7 saatlik-net + Metod 8 (Kayseri OSB) girdileri (yalnız ilgili metotta).
           // Metod 4 düz fatura (metod-1 motoru) → net-girdi montajını atlar (metod 1 gibi).
+          // Bir tesisin girdi/fatura hatası (ör. m8'de OSB fiyatı yok) YALNIZ o tesisi atlar —
+          // tüm tesislerin toplamı boşalmaz.
           let subMethodInputs: InvoiceMethodInputs | null = null;
-          if (isNetInvoiceMethod(subInvoiceMethodId)) {
+          let breakdown: ReturnType<typeof calculateInvoiceForMethod>;
+          try {
+          if (needsMethodInputs(subInvoiceMethodId)) {
             subMethodInputs = await assembleMethodInputs({
               supabase,
               userId: uid,
@@ -1526,11 +1602,12 @@ export default function Dashboard() {
               invoiceMethodId: subInvoiceMethodId,
               kbk: subKbk,
               tahminiYekdem: subYekdem,
+              invoiceFrom: subInvoiceFrom,
             });
             if (cancel) return;
           }
 
-          const breakdown = calculateInvoiceForMethod(subInvoiceMethodId, {
+          breakdown = calculateInvoiceForMethod(subInvoiceMethodId, {
             totalConsumptionKwh: subKwh,
             unitPriceEnergy,
             unitPriceDistribution,
@@ -1558,11 +1635,21 @@ export default function Dashboard() {
             // İpragaz 2026-08+: YEK bedeli enerji satırına gömülü (yalnız m5 okur).
             ipragazYekBirlesik:
               subInvoiceMethodId === 5 && isIpragazYekBirlesikPeriod(pYear, pMonth),
+            // Trepaş 2026-09+: dağıtım ana fatura + GES üretim dağıtım faturası (yalnız m3 okur).
+            tredasDagitimBolunmus:
+              subInvoiceMethodId === 3 && isTredasDagitimBolunmusPeriod(pYear, pMonth),
+            // MEDAŞ usulü dağıtım (kendi ham veriş) — yalnız bayraklı m1.
+            ...(subKendiVeris ? { dagitimKendiVeris: subKendiVeris } : {}),
           }, subLineOverrides);
+          } catch (e) {
+            console.warn(`all subs totals: tesis ${serno} atlandı (fatura hesaplanamadı):`, e);
+            continue;
+          }
 
           // YEKDEM Mahsup (M-1) — Lisanslı Satış tesisleri için atlanır.
           // D4: Metod 2/3/5'te fark KDV matrahındaki kalem → toplam sonrası mahsup 0.
-          const subIsNetMethod = isNetInvoiceMethod(subInvoiceMethodId);
+          // Metod 8: YEKDEM fiyat farkı faturada kalem → aynı şekilde 0.
+          const subIsNetMethod = skipsNextMonthYekdemMahsup(subInvoiceMethodId);
           let yekdemMahsupVal = 0;
           if (!subLisansliSatis && !subIsNetMethod) try {
             const billingMonth = dayjsTR().year(pYear).month(pMonth - 1);

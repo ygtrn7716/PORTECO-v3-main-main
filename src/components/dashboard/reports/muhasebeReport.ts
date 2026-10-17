@@ -23,7 +23,7 @@
 
 import type { MethodInvoiceBreakdown } from "@/components/utils/calculateInvoiceNetMethods";
 import type { GesOlmasaydiResult } from "@/components/utils/calculateGesOlmasaydi";
-import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
+import { calculateGesUretimSatisi, type MedasKesinti } from "@/lib/ges/gesUretimSatisi";
 
 // buildMuhasebeReport'un desteklediği fatura metotları. null → 1 muamelesi (çağıran).
 // Metot 2 (Uedaş net) ve Metot 5 (İpragaz — m2 kopyası, BTV matrahında YEK var) dahil;
@@ -73,6 +73,9 @@ export interface MuhasebePayload {
   usdKur: number;
   perakendeEnerjiBedeli: number;
   dagitimUreticiBedeli: number;
+  /** MEDAŞ usulü (dagitim_kendi_veris): satış kesintisi = bayraklı tesislerin ayrı
+   *  MEDAŞ veriş faturaları toplamı (InvoiceDetail kartıyla aynı nesne). Yoksa oran. */
+  gesSatisKesinti?: MedasKesinti | null;
 
   // Parametreler (BLOK 6)
   kbk: number;
@@ -391,7 +394,12 @@ export function buildMuhasebeReport(p: MuhasebePayload): MuhasebeReport {
     const cekisCharge = b.distributionCharge + b.distributionAdjustment; // mahsupsuz dağıtım
     // ⚠ BTV anchor: btvMahsupsuz − btvMahsupEffect ≡ b.btvCharge (override & lisanslı güvenli)
     const btvMahsupEffect = p.lisansliSatis ? 0 : (b.energyCharge - b.netEnergyCharge) * btvRate;
-    const distMahsupKwh = b.distributionBaseKwh - b.distributionChargeKwh;
+    // MEDAŞ usulü (dağıtım kendi verişiyle): satır "C × birim_eff" gösterir (chargeKwh = C);
+    // indirim D × min(G,C)/2 → mahsup kWh eşdeğeri min(G,C)/2.
+    const kv = b.dagitimKendiVeris;
+    const distMahsupKwh = kv
+      ? Math.min(kv.gKwh, kv.cKwh) / 2
+      : b.distributionBaseKwh - b.distributionChargeKwh;
 
     blok1Head = [
       item("Gider", "Enerji Bedeli (mahsupsuz)", "Şebekeden çekilen toplam tüketim", p.totalConsumptionKwh, "kWh", p.unitPriceEnergy, b.energyCharge),
@@ -440,6 +448,7 @@ export function buildMuhasebeReport(p: MuhasebePayload): MuhasebeReport {
           usdKur: p.usdKur,
           perakendeEnerjiBedeli: p.perakendeEnerjiBedeli,
           dagitimBedeli: p.dagitimUreticiBedeli,
+          ...(p.gesSatisKesinti ? { medasKesinti: p.gesSatisKesinti } : {}),
         })
       : null;
   const satisKwh = sale ? sale.satisKwh : 0;
@@ -459,7 +468,18 @@ export function buildMuhasebeReport(p: MuhasebePayload): MuhasebeReport {
     "Satış KDV oranı fatura KDV oranı varsayılmıştır; matrah ve oran müşteri muhasebesiyle teyit edilmelidir.";
   const blok3Rows: MuhasebeRow[] = [
     item("Gelir", "Veriş Fazlası Satışı (Brüt)", "Tüketimi aşan üretimin satışı", satisKwh, "kWh", satisBrutBirim, satisBrutGelir, [satisNot, usdNot].filter(Boolean).join(" ")),
-    item("Gelir Azaltıcı", "Dağıtım Kesintisi (Üretici)", "Üretici dağıtım kesintisi", satisKwh, "kWh", satisKesintiRate, -satisDagitimKesintisi, "Gelir bloğunda gider niteliğindedir; satış gelirini azaltır."),
+    sale?.medasKesinti
+      ? item(
+          "Gelir Azaltıcı",
+          "MEDAŞ Veriş Faturası (Sistem Kullanım Bedeli)",
+          sale.medasKesinti.satirlar.map((r) => `${r.serno}: ${r.kwh.toLocaleString("tr-TR", { maximumFractionDigits: 2 })} kWh × ${r.birim}`).join(" · ") || "Bayraklı tesislerin veriş faturaları",
+          sale.medasKesinti.satirlar.reduce((sum, r) => sum + r.kwh, 0),
+          "kWh",
+          null,
+          -satisDagitimKesintisi,
+          "Ayrı MEDAŞ faturası (KDV hariç); satış gelirini azaltır.",
+        )
+      : item("Gelir Azaltıcı", "Dağıtım Kesintisi (Üretici)", "Üretici dağıtım kesintisi", satisKwh, "kWh", satisKesintiRate, -satisDagitimKesintisi, "Gelir bloğunda gider niteliğindedir; satış gelirini azaltır."),
     line("subtotal", "Gelir", "NET SATIŞ GELİRİ (KDV Hariç)", D1, satisNot),
     line("kdv", "Gelir", `GES Satış KDV (%${pct(v)})`, D2, kdvNot),
     line("total", "Gelir", "GES SATIŞ GELİRİ (KDV Dahil)", D3, satisNot),

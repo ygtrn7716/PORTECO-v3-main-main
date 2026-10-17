@@ -26,15 +26,17 @@ import {
   getFacilityAllocation,
   applyAllocationToHourlyRows,
 } from "@/components/utils/gesAllocation";
+import { resolveTrafoKwh } from "@/components/utils/trafoKaybi";
 import {
   isM1MahsupCapPeriod,
   type TariffType,
 } from "@/components/utils/calculateInvoice";
 import {
   calculateInvoiceForMethod,
-  isNetInvoiceMethod,
+  isOsbInvoiceMethod,
+  skipsNextMonthYekdemMahsup,
   isEmbeddedYekdemMethod,
-  methodForProvider,
+  methodForSubscription,
   resolveInvoiceMethods,
   type InvoiceMethodId,
 } from "@/lib/invoiceMethods";
@@ -45,6 +47,7 @@ import {
 import {
   embedYekdemMahsupIntoEnergy,
   isIpragazYekBirlesikPeriod,
+  isTredasDagitimBolunmusPeriod,
   type InvoiceMethodInputs,
   type MethodInvoiceBreakdown,
 } from "@/components/utils/calculateInvoiceNetMethods";
@@ -54,6 +57,10 @@ import {
   computeYekdemMahsupDetailed,
   type InvoiceOverrides,
 } from "@/components/utils/invoiceOverrides";
+import {
+  parseGesSaleDistBasis,
+  type GesSaleDistBasis,
+} from "@/lib/ges/gesUretimSatisi";
 
 // InvoiceDetail:306-307 ile aynı eşikler.
 const REACTIVE_LIMIT_RI = 20;
@@ -71,6 +78,10 @@ const mapTermToTariffType = (term: string | null | undefined): TariffType =>
 const hourKeyUtc = (ts: any): string => new Date(ts).toISOString().slice(0, 13);
 
 export type BilledInvoiceInputs = {
+  /** Girdilerin AİT OLDUĞU kullanıcı/tesis — snapshotParamsFromEngine uyuşmazlık
+   *  kontrolü (yanlış tesise snapshot yazımı, Ağu 2026 10128583 hatası). */
+  userId: string;
+  subscriptionSerno: number;
   periodYear: number;
   periodMonth: number;
   monthLabel: string;
@@ -95,6 +106,17 @@ export type BilledInvoiceInputs = {
   excludeDistributionCharge: boolean;
   netPositiveDrawKwh: number;
   netExcessFeedKwh: number;
+  /** Metot 1 trafo: `trafo_kaybi_saatlik` (t) doluysa t; `trafoDegeri` = t × dönem saati.
+   *  Aksi halde null (trafoDegeri = aylık trafo_degeri). */
+  trafoKaybiSaatlik: number | null;
+  /** t kullanıldıysa t × saat (= trafoDegeri), aksi halde null. */
+  trafoKaybiKwh: number | null;
+  /** Dağıtım kendi verişiyle (MEDAŞ usulü) — yalnız bayraklı Metot 1 tesisinde dolu:
+   *  tesisin KENDİ ham Σgn'i (tahsis öncesi) + dagitim_uretici_1. */
+  dagitimKendiVeris: { ownGnKwh: number; ureticiBirim: number } | null;
+  /** GES Üretim Satışı kartı Trepaş kesinti kWh tabanı (subscription_settings
+   *  .ges_sale_dist_basis). Motora GİRMEZ — yalnız kart + snapshot damgası. */
+  gesSaleDistBasis: GesSaleDistBasis;
 
   // ── reaktif ham veriler (payload override'ı + ceza hesabı için)
   totalRi: number;
@@ -292,6 +314,8 @@ export async function fetchBilledInvoiceInputs(params: {
   let netPositiveDrawKwh = 0;
   let netExcessFeedKwh = 0;
 
+  let lastTs: string | null = null;
+  let lastMs = -Infinity;
   for (const row of hourlyRows as any[]) {
     const cnH = Number(row.cn) || 0;
     const gnH = Number(row.gn) || 0;
@@ -301,7 +325,15 @@ export async function fetchBilledInvoiceInputs(params: {
     totalGn += gnH;
     netPositiveDrawKwh += Math.max(0, cnH - gnH);
     netExcessFeedKwh += Math.max(0, gnH - cnH);
+    const ms = new Date(row.ts).getTime();
+    if (ms > lastMs) {
+      lastMs = ms;
+      lastTs = row.ts;
+    }
   }
+  // Tesisin KENDİ ham verişi — tahsis aşağıda totalGn'i ezmeden ÖNCE (dağıtım kendi
+  // verişiyle kuralı havuz tahsisini/fazlasını kullanmaz).
+  const ownGnRaw = totalGn;
 
   // ── 2) Talep Birleştirme tahsisi (yalnız totalGn/net değerleri değişir;
   //      totalConsumptionKwh/Ri/Rc'ye DOKUNMAZ → reaktif yüzde paydası ham kalır)
@@ -398,7 +430,7 @@ export async function fetchBilledInvoiceInputs(params: {
   const { data: settings, error: settingsErr } = await supabase
     .from("subscription_settings")
     .select(
-      "kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, on_yil, lisansli_satis, unit_price_adjustment"
+      "kbk, terim, gerilim, tarife, guc_bedel_limit, trafo_degeri, trafo_kaybi_saatlik, on_yil, lisansli_satis, unit_price_adjustment, dagitim_kendi_veris, invoice_method_override, ges_sale_dist_basis"
     )
     .eq("user_id", userId)
     .eq("subscription_serno", subscriptionSerno)
@@ -406,6 +438,7 @@ export async function fetchBilledInvoiceInputs(params: {
 
   if (settingsErr) throw settingsErr;
   if (!settings) throw new Error("Tesis ayarları (subscription_settings) bulunamadı.");
+  const gesSaleDistBasis = parseGesSaleDistBasis(settings.ges_sale_dist_basis);
 
   const kbk = settings.kbk != null ? Number(settings.kbk) : 1;
   const unitPriceAdjustment = num(settings.unit_price_adjustment, 0);
@@ -413,7 +446,7 @@ export async function fetchBilledInvoiceInputs(params: {
   const gerilim = (settings.gerilim as string) ?? null;
   const tarife = (settings.tarife as string) ?? null;
   const contractPowerKw = num(settings.guc_bedel_limit, 0);
-  const trafoDegeri = num(settings.trafo_degeri, 0);
+  const trafoDegeriAylik = num(settings.trafo_degeri, 0);
   const onYil = (settings.on_yil as boolean) ?? false;
   const lisansliSatis = (settings.lisansli_satis as boolean) ?? false;
   const tariffType = mapTermToTariffType(terim);
@@ -460,7 +493,27 @@ export async function fetchBilledInvoiceInputs(params: {
       ? { context: "self", userId, supabase }
       : { context: "admin", supabase, userId }
   );
-  const { methodId: invoiceMethodId, invoiceFrom } = methodForProvider(methodMap, provider);
+  // Efektif metod = abonelik override'ı ?? şirket metodu (tek resolver).
+  const { methodId: invoiceMethodId, invoiceFrom } = methodForSubscription(
+    methodMap,
+    provider,
+    settings.invoice_method_override
+  );
+
+  // Trafo kWh — Metot 1'de öncelik trafo_kaybi_saatlik (t × dönem saati) > trafo_degeri.
+  // Diğer metotlar bugünkü aylık trafo_degeri ile (m7 kendi t yolunu kullanır).
+  const trafoRes =
+    invoiceMethodId === 1
+      ? resolveTrafoKwh({
+          trafoKaybiSaatlik: settings.trafo_kaybi_saatlik,
+          trafoDegeri: trafoDegeriAylik,
+          startIso,
+          endIso,
+          lastTs,
+          nowMs: Date.now(),
+        })
+      : { trafoKwh: trafoDegeriAylik, saatlik: null, saat: 0 };
+  const trafoDegeri = trafoRes.trafoKwh;
 
   // ── 7) Resmi tarife
   const tariffRes = await supabase
@@ -479,9 +532,19 @@ export async function fetchBilledInvoiceInputs(params: {
 
   const unitPriceDistribution = isKayseriOsb ? 0 : num(tariffRow.dagitim_bedeli, 0);
   const perakendeEnerjiBedeli = num(tariffRow.perakende_enerji_bedeli, 0);
-  const dagitimUreticiBedeli = lisansliSatis
-    ? num(tariffRow.dagitim_uretici_1, 0)
-    : num(tariffRow.dagitim_uretici_2, 0);
+  // Metod 8 (Kayseri OSB): veriş dağıtım bedeli zaten faturada → GES satışında kesinti YOK.
+  const dagitimUreticiBedeli =
+    isOsbInvoiceMethod(invoiceMethodId) && !lisansliSatis
+      ? 0
+      : lisansliSatis
+        ? num(tariffRow.dagitim_uretici_1, 0)
+        : num(tariffRow.dagitim_uretici_2, 0);
+  // Dağıtım kendi verişiyle (MEDAŞ usulü) — Metot 1 (lisanslı dahil) ve Metot 7. m7 G'yi
+  // kendi meram.ownGnTotal'ından okur; buradan yalnız bayrak + uretici_1 kullanılır.
+  const dagitimKendiVeris =
+    (invoiceMethodId === 1 || invoiceMethodId === 7) && settings.dagitim_kendi_veris === true
+      ? { ownGnKwh: ownGnRaw, ureticiBirim: num(tariffRow.dagitim_uretici_1, 0) }
+      : null;
   const powerPrice = num(tariffRow.guc_bedeli, 0);
   const powerExcessPrice = num(tariffRow.guc_bedeli_asim, 0);
   const btvRate = btvEnabled ? num(tariffRow.btv, 0) / 100 : 0;
@@ -618,6 +681,7 @@ export async function fetchBilledInvoiceInputs(params: {
       tahminiYekdem: monthlyYekdem,
       // Metot 7'de t > 0 ise yok sayılır (t'siz hesaplanmış) → t'li yükleyici.
       current: netAgg,
+      invoiceFrom,
     });
     // Backdated manuel M-1 YEKDEM'i: assembleMethodInputs imzası değişmeden
     // (3 başka caller'ı var) yalnız null kalan prev alanları doldurulur; DB kazanır.
@@ -635,6 +699,8 @@ export async function fetchBilledInvoiceInputs(params: {
   return {
     ok: true,
     inputs: {
+      userId,
+      subscriptionSerno,
       periodYear,
       periodMonth,
       monthLabel,
@@ -658,6 +724,10 @@ export async function fetchBilledInvoiceInputs(params: {
       excludeDistributionCharge: isKayseriOsb,
       netPositiveDrawKwh,
       netExcessFeedKwh,
+      trafoKaybiSaatlik: trafoRes.saatlik,
+      trafoKaybiKwh: trafoRes.saatlik != null ? trafoRes.trafoKwh : null,
+      dagitimKendiVeris,
+      gesSaleDistBasis,
 
       totalRi,
       totalRc,
@@ -762,6 +832,9 @@ export function buildBreakdownFromInputs(
       excludeDistributionCharge: inputs.excludeDistributionCharge,
       netPositiveDrawKwh: inputs.netPositiveDrawKwh,
       netExcessFeedKwh: inputs.netExcessFeedKwh,
+      // Dağıtım kendi verişiyle (MEDAŞ) — yalnız bayraklı m1'de dolu; dispatcher
+      // diğer metotlarda zaten yok sayar.
+      ...(inputs.dagitimKendiVeris ? { dagitimKendiVeris: inputs.dagitimKendiVeris } : {}),
       methodInputs: inputs.methodInputs ?? undefined,
       // Aşama 2K: mahsup tavanı kapısı burada çözülür → admin önizleme,
       // backdated, EnergySoldCard/GesSavingsSection canlı yolları kapsanır.
@@ -772,6 +845,10 @@ export function buildBreakdownFromInputs(
       ipragazYekBirlesik:
         inputs.invoiceMethodId === 5 &&
         isIpragazYekBirlesikPeriod(inputs.periodYear, inputs.periodMonth),
+      // Trepaş 2026-09+: dağıtım ana fatura + GES üretim dağıtım faturası (yalnız m3 okur).
+      tredasDagitimBolunmus:
+        inputs.invoiceMethodId === 3 &&
+        isTredasDagitimBolunmusPeriod(inputs.periodYear, inputs.periodMonth),
     },
     overrides
   );
@@ -781,7 +858,9 @@ export function buildBreakdownFromInputs(
   // D4: Metod 2/3/5'te YEKDEM farkı zaten KDV matrahındaki bir KALEM (yekFarkiCharge)
   // olarak var → toplam-sonrası mahsup 0'a zorlanır (çift sayım önlenir).
   // Metod 6 (Kepsaş): çıplak adder enerji satırına GÖMÜLÜR → post-total 0.
-  const isNetMethod = isNetInvoiceMethod(inputs.invoiceMethodId);
+  // Metod 8: YEKDEM fiyat farkı faturada KALEM; 'yekdem_mahsup' override'ı motorda o kaleme
+  // köprülenir → post-total mahsup HİÇ hesaplanmaz (net aileyle aynı; aksi hâlde çift sayım).
+  const isNetMethod = skipsNextMonthYekdemMahsup(inputs.invoiceMethodId);
   const isEmbedded = isEmbeddedYekdemMethod(inputs.invoiceMethodId);
   const mahsupOv = overrides?.yekdem_mahsup;
   let yekdemMahsup = isNetMethod || isEmbedded ? 0 : inputs.yekdemMahsup;

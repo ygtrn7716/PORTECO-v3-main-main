@@ -24,7 +24,7 @@ import {
 import {
   isNetInvoiceMethod,
   resolveInvoiceMethods,
-  methodForProvider,
+  methodForSubscription,
   type InvoiceMethodId,
 } from "@/lib/invoiceMethods";
 
@@ -181,7 +181,7 @@ export async function precheckBackdatedPeriod(p: {
     await Promise.all([
       supabase
         .from("subscription_settings")
-        .select("kbk, terim, gerilim, tarife, on_yil, lisansli_satis")
+        .select("kbk, terim, gerilim, tarife, on_yil, lisansli_satis, invoice_method_override")
         .eq("user_id", userId)
         .eq("subscription_serno", subscriptionSerno)
         .maybeSingle(),
@@ -288,7 +288,33 @@ export async function precheckBackdatedPeriod(p: {
 
   // Metod çözümü — müşteri yüzeyi: InvoiceDetail ile aynı yol (self RPC).
   const methodMap = await resolveInvoiceMethods({ context: "self", userId, supabase });
-  const { methodId, invoiceFrom } = methodForProvider(methodMap, provider);
+  // Efektif metod = abonelik override'ı ?? şirket metodu (tek resolver).
+  const { methodId, invoiceFrom } = methodForSubscription(
+    methodMap,
+    provider,
+    settingsRes.data?.invoice_method_override
+  );
+
+  // Metod 8 (Kayseri OSB): fatura ayının OSB enerji fiyatı olmadan fatura hesaplanamaz
+  // (geçmiş dönemde "tahmini fiyat" kabul edilmez) → formdan önce görünür neden.
+  if (methodId === 8) {
+    const price = await supabase
+      .from("osb_aylik_fiyatlar")
+      .select("enerji_birim_fiyati")
+      .eq("company_key", invoiceFrom || "kayseri_osb")
+      .eq("period_year", periodYear)
+      .eq("period_month", periodMonth)
+      .maybeSingle();
+    if (price.error || price.data?.enerji_birim_fiyati == null) {
+      return {
+        ok: false,
+        missingHard: [
+          "Bu dönem için Kayseri OSB aylık enerji fiyatı girilmemiş (Admin › OSB Aylık Fiyatları).",
+        ],
+        form: null,
+      };
+    }
+  }
 
   const lisansliSatis = (settings.lisansli_satis as boolean) ?? false;
   const onYil = (settings.on_yil as boolean) ?? false;

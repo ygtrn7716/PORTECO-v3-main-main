@@ -13,13 +13,17 @@
 //       Metod 1  → "Veriş Mahsup" satırı: kWh × efektif enerji birim fiyatı.
 //       Metod 2  → faturada ayrı satır YOK (enerji bedeli saatlik mahsup sonrası
 //                  net tüketim üzerinden) → yalnız kWh gösterilir, TL uydurulmaz.
-//       Metod 3  → "Muhtelif-2" kalemi: +dağıtım − mahsuplaşma kredisi.
+//       Metod 3  → "Muhtelif-2" kalemi: +dağıtım − mahsuplaşma kredisi (2026-09+:
+//                  dağıtım 0; mahsup kWh GES üretim dağıtım faturasında D/2 ile).
 //       Metod 4  → mahsuplaşma kavramı yok.
 //       Lisanslı → mahsuplaşma kapalı, tüm veriş satılır (calculateInvoice.ts:316+).
 
 import {
   calculateGesUretimSatisi,
+  gesSatisKesintiArgs,
+  type GesSaleDistBasis,
   type GesUretimSatisiResult,
+  type MedasKesinti,
 } from "@/lib/ges/gesUretimSatisi";
 import { isNetInvoiceMethod, type InvoiceMethodId } from "@/lib/invoiceMethods";
 import type { MethodInvoiceBreakdown } from "@/components/utils/calculateInvoiceNetMethods";
@@ -61,6 +65,8 @@ export type GesMahsupPresentation =
       dagitim: number;
       /** Muhtelif-2 net (dağıtım − kredi). */
       net: number;
+      /** Trepaş 2026-09+: dağıtım bileşeni GES üretim dağıtım faturasına taşındı (dagitim = 0). */
+      dagitimAyri?: boolean;
     }
   | {
       /** Mahsup gösterilmez. */
@@ -98,13 +104,21 @@ export function deriveGesSatisMahsup(args: {
   dagitimBedeli: number;
   /** EFEKTİF (override uygulanmış) enerji birim fiyatı — M1 mahsup satırı için. */
   unitPriceEnergy: number;
+  /** MEDAŞ usulü (dagitim_kendi_veris): satışa akan bayraklı tesislerin MEDAŞ veriş
+   *  faturaları toplamı (loadMedasVerisKesintisi). Verilmezse oran kesintisi aynen. */
+  medasKesinti?: MedasKesinti | null;
+  /** Trepaş m3 2026-09+ kesinti kWh tabanı (ges_sale_dist_basis; canlıda ayar, replay'de
+   *  snapshot damgası). Verilmezse 'total_veris' (toplam veriş). */
+  gesSaleDistBasis?: GesSaleDistBasis | null;
 }): GesSatisMahsupResult {
   const { invoiceMethodId, breakdown } = args;
 
   // M2/3/5 breakdown'ı gerçekten net motordan mı geldi? (lisanslı ve w_pos'suz
   // eski snapshot'lar M1 çekirdeğine düşer; wPosApplied yalnız net motorda var.)
+  // Metod 8 (Kayseri OSB) net aile değil; breakdown.osb yoksa (lisanslı → m1) m1 sunumu.
   const effectiveMethodId: InvoiceMethodId =
-    isNetInvoiceMethod(invoiceMethodId) && breakdown.wPosApplied === undefined
+    (isNetInvoiceMethod(invoiceMethodId) && breakdown.wPosApplied === undefined) ||
+    (invoiceMethodId === 8 && !breakdown.osb)
       ? 1
       : invoiceMethodId;
 
@@ -124,7 +138,15 @@ export function deriveGesSatisMahsup(args: {
           onYil: args.onYil,
           usdKur: args.usdKur,
           perakendeEnerjiBedeli: args.perakendeEnerjiBedeli,
-          dagitimBedeli: args.dagitimBedeli,
+          // Trepaş m3 2026-09+: kesinti = Σgn × D/2 (breakdown.tredasGesDagitim);
+          // 'sold_only' tabanında satılan veriş × D/2.
+          // MEDAŞ usulü: kesinti = MEDAŞ veriş faturaları toplamı.
+          ...gesSatisKesintiArgs(
+            breakdown,
+            args.dagitimBedeli,
+            args.medasKesinti,
+            args.gesSaleDistBasis
+          ),
         })
       : null;
 
@@ -140,10 +162,16 @@ export function deriveGesSatisMahsup(args: {
     mahsup = { kind: "none", reason: "lisansli" };
   } else if (!(mahsupKwh > 0)) {
     mahsup = { kind: "none", reason: "zero" };
-  } else if (effectiveMethodId === 2 || effectiveMethodId === 5 || effectiveMethodId === 7) {
+  } else if (
+    effectiveMethodId === 2 ||
+    effectiveMethodId === 5 ||
+    effectiveMethodId === 7 ||
+    effectiveMethodId === 8
+  ) {
     // m5 = m2 kopyası: mahsup net faturalamada örtük, ayrı kredi satırı yok.
     // m7 (Meram): mahsup yine net enerjide örtük; faturadaki "mahsuplaşma farkı"
     // bir fiyat düzeltmesidir (Satır 2), mahsup TL kredisi değil.
+    // m8 (Kayseri OSB): aktif enerji net (mahsup sonrası) tüketimden → örtük.
     mahsup = { kind: "implicit-net", kwh: mahsupKwh };
   } else if (effectiveMethodId === 3) {
     mahsup = {
@@ -153,6 +181,7 @@ export function deriveGesSatisMahsup(args: {
       kredi: breakdown.muhtelif2MahsupKredisi ?? 0,
       dagitim: breakdown.muhtelif2Dagitim ?? 0,
       net: breakdown.muhtelif2Net ?? 0,
+      ...(breakdown.tredasGesDagitim ? { dagitimAyri: true } : {}),
     };
   } else {
     // 2K: motorun UYGULADIĞI fiyat/tutar esas — fatura satırıyla birebir

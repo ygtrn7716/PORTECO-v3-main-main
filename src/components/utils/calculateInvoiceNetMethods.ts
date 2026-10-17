@@ -1,5 +1,6 @@
 //src/components/utils/calculateInvoiceNetMethods.ts
 import type {
+  DagitimKendiVerisBreakdown,
   InvoiceBreakdown,
   InvoiceInput,
 } from "@/components/utils/calculateInvoice";
@@ -9,6 +10,8 @@ import type {
   InvoiceOverrideItemKey,
   InvoiceOverrides,
 } from "@/components/utils/invoiceOverrides";
+// Sıfır-import saf helper — göreli yol (tsx kabul testi harness'siz yükler).
+import { hesaplaDagitimKendiVeris, roundHalfUp } from "./dagitimKendiVeris";
 
 /**
  * Metod 2 (Uedaş), Metod 3 (Tredaş), Metod 5 (İpragaz) ve Metod 7 (Meram / MEPAŞ)
@@ -19,9 +22,11 @@ import type {
  *
  * Metod 7 (Meram) aynı iskeleti paylaşır; farklar `method === 7` dallarında
  * (Niğde As Beton Ağustos 2026 faturalarıyla kuruşuna çözüldü):
- *   U = (wPos + Y)×KBK + adj · Enerji = N×U (YEK ayrı satır değil)
+ *   U = round6((wPos + Y)×KBK + adj) · Enerji = N×U (YEK ayrı satır değil)
  *   Satır 2 = F + GDDK, F = M × ((wM + Y)×KBK − perakende) = −M × mahsuplaşmaBirim
- *   Dağıtım = G_own > C ? D×C/2 : D×C − D×G_own/2   (C = trafo dahil brüt)
+ *   Dağıtım = dagitimKendiVeris.ts helper'ı (C = trafo dahil brüt, G = kendi verişi):
+ *             round2(C × round6(D × (C − min(G,C)/2) / C)) — MEPAŞ Ağustos/Eylül faturalarıyla
+ *             kuruşu kuruşuna. Bayrak (dagitim_kendi_veris) varsa ayrıca MEDAŞ veriş bloğu.
  *   BTV = oran × (Enerji + Satır 2) · trafo_degeri ve önceki dönem YEK farkı YOK.
  *
  * Metod 1 (calculateInvoice.ts) AYLIK netleşmeye dayanır; bu metodlar ise
@@ -30,9 +35,10 @@ import type {
  *   wPos  = Σ(pos_h × PTF_h) / Σ pos_h     (ÇIPLAK, pos-ağırlıklı PTF)
  * Agregalar hourlyNetAggregates.ts'de üretilir; bu dosya SAF hesaptır.
  *
- * ⚠️ Bu modül BİLEREK hiçbir runtime import'u yapmaz (yalnız `import type`).
- * Kabul testi script'i (scripts/check-invoice-methods.ts) bunu doğrudan import
- * edebilsin diye — @/lib/supabase zinciri env değişkeni ister.
+ * ⚠️ Bu modül `@/…` runtime import'u YAPMAZ (yalnız `import type`); tek runtime import
+ * sıfır-import saf `./dagitimKendiVeris` (göreli). Kabul testi script'i
+ * (scripts/check-invoice-methods.ts) bunu doğrudan import edebilsin diye —
+ * @/lib/supabase zinciri env değişkeni ister.
  */
 
 // calculateInvoice.ts:73'teki sabitin aynısı (orada modül-private olduğu için
@@ -73,10 +79,89 @@ export type InvoiceMethodInputs = {
   prevGerceklesenYekdem?: number | null;
   /** Metod 3 muhtelif-2 kredisi birim fiyatı. Yoksa T-0 enerji fiyatı kullanılır. */
   mahsuplasmaUnitPrice?: number | null;
+  /** Metod 3 (Tredaş 2026-09+): tesisin KENDİ sayacının dönem verişi (ham Σgn). Ana fatura
+   *  dağıtım tabanı = max(sumCn − ownGnTotal, 0); havuz tahsisi tabanı DEĞİŞTİRMEZ.
+   *  Diğer metodlarda anahtar YOK (sparse). Yoksa motor sumGn'e düşer. */
+  ownGnTotal?: number | null;
   /** Metod 7 (Meram) girdileri. Diğer metodlarda anahtar YOK (sparse).
    *  m7'de `tahminiYekdem` = Y = dönemin yekdem_final'ı (yoksa yekdem_value) ve
    *  sumCn/sumPos/sumMahsup trafo kaybı DAHİL (C/N/M). */
   meram?: MeramMethodInputs;
+  /** Metod 8 (Kayseri OSB) girdileri — calculateInvoiceOsb.ts okur. Diğer metodlarda YOK.
+   *  m8'de sumCn = C (brüt), sumPos = N, sumMahsup = M; `prevSumPos` = önceki ay N
+   *  (YEKDEM fiyat farkı tabanı). wPos/tahminiYekdem/kbk m8'de KULLANILMAZ. */
+  osb?: OsbMethodInputs;
+};
+
+/** Metod 8 (Kayseri OSB) girdileri — hourlyNetAggregates.assembleOsbInputs kurar; snapshot
+ *  replay invoiceSnapshots.methodInputsFromSnapshotRow osb_* kolonlarından yeniden kurar. */
+export type OsbMethodInputs = {
+  /** Fatura dönemi "YYYY-MM" (hata/rozet metinleri için). */
+  donem: string;
+  /** G — tesisin kendi sayacının dönem verişi (ham Σgn). G > 0 → üretim tesisi. */
+  ownGnTotal: number;
+  /** Ham endüktif / kapasitif reaktif (kWh). `reaktif` payload override'ı motorda uygulanır. */
+  riKwh: number;
+  rcKwh: number;
+  /** P — OSB aylık enerji birim fiyatı (TL/kWh). null → yok (motor görünür hata atar,
+   *  'enerji' birim override'ı yoksa). */
+  enerjiFiyati: number | null;
+  /** P, fatura ayından ÖNCEKİ bir aydan alındı (cari ay tahmini). */
+  fiyatTahmini: boolean;
+  /** P'nin geldiği ay "YYYY-MM" (yoksa null). */
+  fiyatDonemi: string | null;
+  /** YEKDEM fark birim fiyatı (TL/kWh, fatura ayının satırından; önceki ay N ile çarpılır). */
+  yekdemFarkBirim: number;
+  /** kayseri_ek_bedeller (TL/kWh). null → satır yok → motor görünür hata atar (0 VARSAYILMAZ). */
+  ekBedel: { iletim: number; osbDagitim: number; cekis: number } | null;
+  /** Lisanssız üretim veriş dağıtım birimi (tarife dagitim_uretici_1, TL/kWh). */
+  verisDagitimBirim: number;
+  /** Reaktif birim (tarife reaktif_bedel, TL/kVArh). */
+  reaktifBirim: number;
+};
+
+/** Metod 8 çıktısının kalemleri (breakdown.osb) — OSB bildirimi sırasıyla gösterilir. */
+export type OsbBreakdown = {
+  aktifEnerji: number;
+  enduktif: number;
+  kapasitif: number;
+  riKwh: number;
+  rcKwh: number;
+  riYuzde: number;
+  rcYuzde: number;
+  enduktifSinirYuzde: number;
+  kapasitifSinirYuzde: number;
+  /** Reaktif toplamı tutar/exclude override'ıyla değiştirildi (kalem ayrımı gösterilmez). */
+  reaktifOverride: boolean;
+  yekdemFiyatFarki: number;
+  /** Önceki ay N (fark tabanı; yoksa null). */
+  oncekiAyNetKwh: number | null;
+  yekdemFarkBirim: number;
+  iletim: number;
+  osbDagitim: number;
+  cekis: number;
+  verisDagitim: number;
+  /** max(0, G − C) — üretim tesisinde veriş dağıtım tabanı. */
+  verisDagitimKwh: number;
+  /** "Enerji ve Güç Bedelleri Toplamı" — YALNIZ aktif enerji (reaktif dahil değil). */
+  enerjiVeGucToplami: number;
+  etv: number;
+  uretimTesisi: boolean;
+  /** Efektif P (override dahil) */
+  enerjiFiyati: number;
+  fiyatTahmini: boolean;
+  fiyatDonemi: string | null;
+  consKwh: number;
+  mahsupKwh: number;
+  netKwh: number;
+  ownGnKwh: number;
+  birimler: {
+    iletim: number;
+    osbDagitim: number;
+    cekis: number;
+    verisDagitim: number;
+    reaktif: number;
+  };
 };
 
 /** Metod 7 (Meram) — hourlyNetAggregates.assembleMethodInputs kurar; snapshot replay
@@ -135,7 +220,26 @@ export type MethodInvoiceInput = InvoiceInput & {
    *  (2K `applyVerisMahsupPerakendeCap` deseni). YALNIZ Metod 5 okur; m2/m3 YOK SAYAR.
    *  Bayrak kapalıyken çıktı bit-identiktir. Toplam/BTV/KDV değişmez — yalnız satır yapısı. */
   ipragazYekBirlesik?: boolean;
+  /** Trepaş 2026-09+ dağıtım iki faturada: ana fatura D × (Σcn − kendi Σgn), GES üretim
+   *  dağıtım faturası Σgn × D/2 (breakdown.tredasGesDagitim). Muhtelif-2'nin dağıtım
+   *  bileşeni 0. KAPI ÇAĞIRANDA çözülür (`methodId === 3 && isTredasDagitimBolunmusPeriod`).
+   *  YALNIZ Metod 3 okur; bayrak kapalıyken çıktı bit-identik. */
+  tredasDagitimBolunmus?: boolean;
 };
+
+/** Trepaş'ın dağıtımı ana fatura + GES üretim dağıtım faturası olarak böldüğü ilk dönem.
+ *  < bu dönem Metod 3 davranışı BİREBİR eski. TEK kaynak. */
+export const TREDAS_DAGITIM_BOLUNMUS_BASLANGIC = { year: 2026, month: 9 } as const;
+
+/** Dönem Trepaş bölünmüş-dağıtım formatında mı? (isIpragazYekBirlesikPeriod deseni;
+ *  geçersiz girdi → false, fail-safe: eski formül.) */
+export function isTredasDagitimBolunmusPeriod(periodYear: number, periodMonth: number): boolean {
+  if (!Number.isFinite(periodYear) || !Number.isFinite(periodMonth)) return false;
+  return (
+    periodYear * 12 + periodMonth >=
+    TREDAS_DAGITIM_BOLUNMUS_BASLANGIC.year * 12 + TREDAS_DAGITIM_BOLUNMUS_BASLANGIC.month
+  );
+}
 
 /** İpragaz'ın YEK bedelini enerji birim fiyatına gömdüğü ilk dönem (fatura formatı
  *  değişikliği). Bu dönemden itibaren Metod 5 çıktısında ayrı "YEK Bedeli" satırı
@@ -181,6 +285,22 @@ export type MethodInvoiceBreakdown = InvoiceBreakdown & {
   /** Metod 7 (Meram): varsa m7 yerleşimi (Satır 2, yarım dağıtım, trafo kaybı notu).
    *  Diğer metodlarda anahtar HİÇ yok → UI kapıları bunu okur. */
   meram?: MeramBreakdown;
+  /** Metod 8 (Kayseri OSB): varsa OSB bildirimi yerleşimi (OsbInvoiceRows). Diğer metodlarda YOK. */
+  osb?: OsbBreakdown;
+  /** Metod 3 Trepaş 2026-09+: ayrı "GES üretim dağıtım faturası" (ana fatura toplamına
+   *  GİRMEZ; GES Üretim Satışı kartında kesinti olarak gösterilir). Diğer durumlarda YOK. */
+  tredasGesDagitim?: TredasGesDagitim;
+};
+
+export type TredasGesDagitim = {
+  /** Σgn — toplam veriş (satılan + mahsup edilen; tahsis dahil efektif). */
+  kwh: number;
+  /** D / 2 (yuvarlanmamış) */
+  birim: number;
+  /** kwh × birim (TL, KDV hariç) */
+  tutar: number;
+  /** Ana fatura dağıtım tabanında düşülen kendi Σgn. */
+  ownGnKwh: number;
 };
 
 /**
@@ -347,9 +467,14 @@ function calculateNetMethod(
   const mr = isMeram ? m.meram : undefined;
 
   // ── Birim fiyatlar (öncelik: calculateInvoice.ts:142-152 ile aynı — override girişte gölgeler)
-  // m7: U = (wPos + Y)×KBK + adj — YEKDEM enerji fiyatının içinde, ayrı YEK satırı yok.
+  // m7: U = round6((wPos + Y)×KBK + adj) — YEKDEM enerji fiyatının içinde, ayrı YEK satırı
+  // yok. MEPAŞ faturası birimi 6 hanede gösterir (Eylül 2026 golden). 'enerji' birim
+  // override'ı aşağıda AYNEN (yuvarlanmadan) yerine geçer.
   const naturalEnergyUnitPrice = isMeram
-    ? (num(m.wPos) + num(m.tahminiYekdem)) * kbk + num(mr?.unitPriceAdjustment)
+    ? roundHalfUp(
+        (num(m.wPos) + num(m.tahminiYekdem)) * kbk + num(mr?.unitPriceAdjustment),
+        6
+      )
     : num(m.wPos) * kbk; // T-0
   const enerjiUnitOv = ov?.enerji?.unitPriceOverride;
   const energyUnitPrice = isFin(enerjiUnitOv) ? Number(enerjiUnitOv) : naturalEnergyUnitPrice;
@@ -410,24 +535,59 @@ function calculateNetMethod(
   const yekFarkiCharge = yekFarkiResolved.amount;
 
   // ── 4) Dağıtım — m3 taban NET, m2/m5 taban BRÜT (muhtelif yok, tek satır)
-  const distributionBaseKwh = method === 3 ? sumPos : sumCn;
+  // m3 Trepaş 2026-09+ (bölünmüş dağıtım): ana fatura tabanı Σcn − KENDİ Σgn (brüt çekiş −
+  // tüm veriş). Havuz tahsisi tabanı değiştirmez. Mahsup kWh artık GES üretim dağıtım
+  // faturasında D/2 ile kesildiği için muhtelif-2 dağıtımı aşağıda 0'lanır.
+  const tredasBolunmus = method === 3 && input.tredasDagitimBolunmus === true;
+  const tredasOwnGn = tredasBolunmus
+    ? isFin(m.ownGnTotal)
+      ? Number(m.ownGnTotal)
+      : sumGn
+    : 0;
+  const distributionBaseKwh = tredasBolunmus
+    ? Math.max(sumCn - tredasOwnGn, 0)
+    : method === 3
+      ? sumPos
+      : sumCn;
   let distributionCharge = distributionBaseKwh * unitPriceDistribution;
   // m7 (Meram): taban C (trafo dahil brüt); YALNIZ tesisin kendi verişi (G_own) düşer,
-  // havuz tahsisi dağıtıma GİRMEZ. Gerçek faturada saatlik-net değil aylık kural:
-  //   G_own > C → D×C/2 · aksi hâlde D×C − D×G_own/2
+  // havuz tahsisi dağıtıma GİRMEZ. Gerçek faturada saatlik-net değil aylık kural —
+  // dagitimKendiVeris.ts helper'ı (Metot 1 MEDAŞ usulüyle aynı, round6 birim + round2 tutar):
+  //   birim = round6(D × (C − min(G_own, C)/2) / C) · tutar = round2(C × birim)
+  // D = efektif dağıtım birimi ('dagitim' birim override'ı dahil); tutar override'ı aşağıda.
+  // Bayrak (input.dagitimKendiVeris; dispatcher yalnız gerçek m7 çağrısına geçirir) varsa
+  // MEDAŞ veriş bloğu da eklenir — G her zaman m7'nin kendi meram.ownGnTotal'ından.
   let meramDagitimYarim = false;
   let meramDistributionAdjustment = 0;
+  let meramEffectiveDistributionUnitPrice = unitPriceDistribution;
+  let meramKendiVeris: DagitimKendiVerisBreakdown | null = null;
   if (isMeram) {
     const ownGn = num(mr?.ownGnTotal);
     meramDagitimYarim = ownGn > sumCn;
-    distributionCharge = meramDagitimYarim
-      ? (unitPriceDistribution * sumCn) / 2
-      : unitPriceDistribution * sumCn - (unitPriceDistribution * ownGn) / 2;
-    meramDistributionAdjustment = unitPriceDistribution * sumCn - distributionCharge;
+    const kv = hesaplaDagitimKendiVeris({
+      cKwh: sumCn,
+      gKwh: ownGn,
+      dagitimBedeli: unitPriceDistribution,
+      ureticiBirim: num(input.dagitimKendiVeris?.ureticiBirim),
+    });
+    distributionCharge = kv.dagitimTutari;
+    meramDistributionAdjustment = kv.indirimTutari;
+    // Açıklama birimi: helper'ın round6 birimi (override öncesi; C = 0 → 0).
+    meramEffectiveDistributionUnitPrice = kv.birimEff;
+    if (input.dagitimKendiVeris != null) {
+      meramKendiVeris = {
+        cKwh: sumCn,
+        gKwh: Math.max(0, ownGn),
+        dagitimBirim: unitPriceDistribution,
+        birimEff: kv.birimEff,
+        dagitimTutari: kv.dagitimTutari,
+        indirimTutari: kv.indirimTutari,
+        medasKwh: kv.medasKwh,
+        medasBirim: kv.medasBirim,
+        medasBedeli: kv.medasBedeli,
+      };
+    }
   }
-  // Açıklama birimi: m7'de efektif birim = doğal tutar / C (override öncesi).
-  const meramEffectiveDistributionUnitPrice =
-    isMeram && sumCn > 0 ? distributionCharge / sumCn : unitPriceDistribution;
 
   // ── 5) Muhtelif-2 (YALNIZ m3): +mahsup×dağıtım ve −mahsup×mahsuplaşmaFiyatı
   // NOT: Gerçek Trepaş faturası mahsuplaşmada 1,82375 kullanmıştı; bu değerin
@@ -453,7 +613,7 @@ function calculateNetMethod(
   let muhtelif2Dagitim = 0;
   let muhtelif2MahsupKredisi = 0;
   if (method === 3) {
-    muhtelif2Dagitim = sumMahsup * unitPriceDistribution;
+    muhtelif2Dagitim = tredasBolunmus ? 0 : sumMahsup * unitPriceDistribution;
     muhtelif2MahsupKredisi = sumMahsup * mahsuplasmaUnitPrice;
   }
 
@@ -636,7 +796,7 @@ function calculateNetMethod(
     distributionCharge,
     distributionBaseKwh,
     // Metod 2/3'te dağıtım düz tarifeden hesaplanır; metod 1'deki "mahsup indirimi"
-    // kavramı yoktur → düzeltme 0. m7: kendi-veriş yarım kredisi (D×C − tutar).
+    // kavramı yoktur → düzeltme 0. m7: kendi-veriş yarım kredisi (round2(D×C) − tutar).
     distributionAdjustment: isMeram ? meramDistributionAdjustment : 0,
     distributionChargeKwh: distributionBaseKwh,
     verisKwh: sumGn,
@@ -668,6 +828,17 @@ function calculateNetMethod(
           muhtelif2MahsupKredisi,
           muhtelif2Net,
           mahsuplasmaUnitPriceApplied: mahsuplasmaUnitPrice,
+        }
+      : {}),
+    // m3 bölünmüş dağıtım: sparse — bayrak kapalıyken anahtar HİÇ eklenmez.
+    ...(tredasBolunmus
+      ? {
+          tredasGesDagitim: {
+            kwh: sumGn,
+            birim: unitPriceDistribution / 2,
+            tutar: (sumGn * unitPriceDistribution) / 2,
+            ownGnKwh: tredasOwnGn,
+          },
         }
       : {}),
     energyUnitPriceApplied: energyUnitPrice,
@@ -703,6 +874,9 @@ function calculateNetMethod(
           },
         }
       : {}),
+    // m7 + dagitim_kendi_veris: MEDAŞ veriş kartı / satış kesintisi / medas_* snapshot alanları.
+    // Sparse — bayraksız m7'de ve diğer metodlarda anahtar HİÇ eklenmez.
+    ...(meramKendiVeris ? { dagitimKendiVeris: meramKendiVeris } : {}),
 
     ...(appliedOverrides ? { appliedOverrides } : {}),
   };

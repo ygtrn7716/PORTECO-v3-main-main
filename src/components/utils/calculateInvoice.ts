@@ -5,6 +5,7 @@ import type {
   InvoiceOverrideItemKey,
   InvoiceOverrides,
 } from "./invoiceOverrides";
+import { hesaplaDagitimKendiVeris } from "./dagitimKendiVeris";
 
 export type TariffType = "single" | "dual";
 
@@ -73,7 +74,41 @@ export interface InvoiceInput {
   // provider bilmez. Perakende yoksa (≤0) tavan uygulanmaz + console.warn
   // (hesap sürer). Bayrak kapalıyken çıktı bit-identiktir.
   applyVerisMahsupPerakendeCap?: boolean;
+
+  // Dağıtım KENDİ VERİŞİYLE (MEPAŞ/MEDAŞ usulü — subscription_settings.dagitim_kendi_veris).
+  // Verildiğinde dağıtım tesisin KENDİ ham sayacından: C = tüketim + trafo (lisanslı
+  // DAHİL), G = ownGnKwh (havuz tahsisi/fazlası etkilemez) → dagitimKendiVeris.ts.
+  // Yalnız Metot 1 okur (dispatcher diğer metotlarda alanı siler). Verilmezse çıktı
+  // bit-identik. Kayseri excludeDistributionCharge önceliklidir.
+  dagitimKendiVeris?: {
+    /** Tesisin kendi ham Σgn'i (kWh) — tahsis uygulanmadan önce. */
+    ownGnKwh: number;
+    /** MEDAŞ Sistem Kullanım Bedeli birimi (dagitim_uretici_1). */
+    ureticiBirim: number;
+  };
 }
+
+/** Dağıtım kendi verişiyle — breakdown'daki ayrıntı (sparse; yalnız bayraklı Metot 1). */
+export type DagitimKendiVerisBreakdown = {
+  /** C = ham çekiş + trafo (kWh). */
+  cKwh: number;
+  /** G = tesisin kendi ham verişi (kWh). */
+  gKwh: number;
+  /** D (efektif; dagitim birim override'ı dahil). */
+  dagitimBirim: number;
+  /** round6(D × (C − min(G,C)/2) / C). */
+  birimEff: number;
+  /** round2(C × birimEff) — DOĞAL tutar (dagitim tutar override'ı distributionCharge'ta). */
+  dagitimTutari: number;
+  /** round2(C × D) − dagitimTutari. */
+  indirimTutari: number;
+  /** max(0, G − C) — ayrı MEDAŞ veriş faturası kWh'ı. */
+  medasKwh: number;
+  /** dagitim_uretici_1. */
+  medasBirim: number;
+  /** round2(medasKwh × medasBirim), KDV hariç — perakende toplamına DAHİL DEĞİL. */
+  medasBedeli: number;
+};
 
 // 10 yıl üstü tesislerin veriş fazlası satışında kullanılan sabit USD birim fiyatı.
 // Toplam birim fiyat (TL/kWh) = VERIS_USD_BIRIM_FIYAT × usd_kur.
@@ -138,6 +173,10 @@ export interface InvoiceBreakdown {
   // Uygulanan override özeti — yalnızca overrides parametresi kalem içerdiğinde
   // set edilir (UI satır gizleme + "düzenlendi" işaretleme için).
   appliedOverrides?: AppliedInvoiceOverrides;
+
+  // Dağıtım kendi verişiyle (MEDAŞ usulü) ayrıntısı + ayrı MEDAŞ veriş faturası.
+  // Yalnız input.dagitimKendiVeris verildiğinde (Kayseri değilken) eklenir.
+  dagitimKendiVeris?: DagitimKendiVerisBreakdown;
 }
 
 export function calculateInvoice(
@@ -199,9 +238,15 @@ export function calculateInvoice(
   // - Lisanslı Satış: tesisin çekişi yok (sadece üretim/satış). Trafo bedeli
   //   ayrı bir gider satırı olarak kalır; dağıtım ve BTV hesabına girmez,
   //   mahsuplaşmaya katılmaz.
-  const distributionBaseKwh = lisansliSatis
-    ? totalConsumptionKwh
-    : totalConsumptionKwh + trafoKwh;
+  // - Dağıtım kendi verişiyle (MEDAŞ): C = tüketim + trafo, lisanslı DAHİL.
+  const kendiVeris =
+    input.dagitimKendiVeris != null && !excludeDistributionCharge
+      ? input.dagitimKendiVeris
+      : null;
+  const distributionBaseKwh =
+    lisansliSatis && !kendiVeris
+      ? totalConsumptionKwh
+      : totalConsumptionKwh + trafoKwh;
 
   // Veriş kWh (pozitifse al, değilse 0)
   const verisKwh = (totalProductionKwh ?? 0) > 0 ? totalProductionKwh! : 0;
@@ -239,6 +284,7 @@ export function calculateInvoice(
   let distributionCharge: number;
   let distributionChargeKwh: number;
   let effectiveDistributionUnitPrice: number;
+  let dagitimKendiVerisBlock: DagitimKendiVerisBreakdown | null = null;
 
   if (excludeDistributionCharge) {
     // Kayseri OSB: dağıtım bedeli faturada yok (OSB ayrı tahsil eder).
@@ -246,6 +292,33 @@ export function calculateInvoice(
     distributionCharge = 0;
     distributionChargeKwh = 0;
     effectiveDistributionUnitPrice = 0;
+  } else if (kendiVeris) {
+    // MEPAŞ/MEDAŞ usulü: tesisin KENDİ ham çekiş/verişiyle, aylık netleşme.
+    // C = tüketim + trafo, G = kendi ham Σgn (tahsis/havuz/p1 fazlası kullanılmaz).
+    // Perakende = round2(C × round6(D×(C−min(G,C)/2)/C)); G > C ise ayrı MEDAŞ veriş
+    // faturası (G−C) × uretici_1 — toplamlara GİRMEZ. Tutar override'ı aşağıda aynen.
+    const kv = hesaplaDagitimKendiVeris({
+      cKwh: distributionBaseKwh,
+      gKwh: kendiVeris.ownGnKwh,
+      dagitimBedeli: unitPriceDistribution,
+      ureticiBirim: kendiVeris.ureticiBirim,
+    });
+    distributionCharge = kv.dagitimTutari;
+    distributionChargeKwh = distributionBaseKwh;
+    effectiveDistributionUnitPrice = kv.birimEff;
+    // "Çekiş − dağıtım" anlamı korunur (çekiş = round2(C × D)).
+    distributionAdjustment = kv.indirimTutari;
+    dagitimKendiVerisBlock = {
+      cKwh: distributionBaseKwh,
+      gKwh: Math.max(0, Number(kendiVeris.ownGnKwh) || 0),
+      dagitimBirim: unitPriceDistribution,
+      birimEff: kv.birimEff,
+      dagitimTutari: kv.dagitimTutari,
+      indirimTutari: kv.indirimTutari,
+      medasKwh: kv.medasKwh,
+      medasBirim: kv.medasBirim,
+      medasBedeli: kv.medasBedeli,
+    };
   } else if (lisansliSatis) {
     // Lisanslı Satış: mahsup yok, dağıtım tam tarifeyle çekiş üzerinden alınır
     distributionAdjustment = 0;
@@ -513,6 +586,8 @@ export function calculateInvoice(
     totalInvoice,
     // Override yokken anahtar hiç eklenmez → override'sız çıktı bit-identik.
     ...(appliedOverrides ? { appliedOverrides } : {}),
+    // Bayrak yokken anahtar hiç eklenmez → bayraksız çıktı bit-identik.
+    ...(dagitimKendiVerisBlock ? { dagitimKendiVeris: dagitimKendiVerisBlock } : {}),
   };
 }
 

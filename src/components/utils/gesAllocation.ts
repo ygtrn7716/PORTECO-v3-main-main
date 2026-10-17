@@ -69,7 +69,9 @@ export type GesMahsupContext = {
   plantMode: Map<string, TahsisModu>;
   /** atanan serno → saatlik trafo kaybı t (kWh/saat, > 0). Metot 7 (Meram): t
    *  tanımlı tesisin tahsis kapasitesi kap(h) = cn(h) + t, dönemin HER saatinde
-   *  (satırı eksik saatler dahil). Yoksa anahtar yok → tahsis bit-identik. */
+   *  (satırı eksik saatler dahil). Yoksa anahtar yok → tahsis bit-identik.
+   *  dagitim_kendi_veris = true tesiste anahtar yok (m1: trafo yalnız fatura kalemi) —
+   *  invoice_method_override = 7 ise bayraktan bağımsız VAR. */
   trafoKaybiBySerno: Map<number, number>;
 };
 
@@ -161,13 +163,21 @@ export async function fetchGesMahsupContext(
 
   // Metot 7 (Meram) saatlik trafo kaybı — yalnız listelenmiş tesisler; kolon NULL ise
   // satır dönmez → harita boş → tahsis bit-identik.
+  // "Dağıtım kendi verişiyle" (MEDAŞ usulü) bayraklı METOT 1 tesisinde trafo yalnız FATURA
+  // kalemidir (enerji + dağıtım C); tahsis kapasitesine GİRMEZ → havuz tahsisi t girilince
+  // de değişmez (kullanıcı kararı 2026-10-10). Abonelik override'ı Metot 7 ise (Niğde As
+  // Beton, 2026-10-14) t bayraktan bağımsız havuz kapasitesine GİRER: kap(h) = cn(h) + t
+  // (Meram Eylül mahsup Excel'i). Bilinen sınır: şirket düzeyinde m7 + bayrak (override'sız)
+  // kombinasyonu bugün yok — o durumda t girmez. Kolonlar: bayrak NOT NULL (default false),
+  // override null → `null = 7` false → bit-identik.
   const trafoKaybiBySerno = new Map<number, number>();
   const { data: tkRows, error: tkErr } = await supabase
     .from("subscription_settings")
     .select("subscription_serno, trafo_kaybi_saatlik")
     .eq("user_id", userId)
     .in("subscription_serno", Array.from(assignedSernos.keys()))
-    .not("trafo_kaybi_saatlik", "is", null);
+    .not("trafo_kaybi_saatlik", "is", null)
+    .or("dagitim_kendi_veris.eq.false,invoice_method_override.eq.7");
   if (tkErr) throw tkErr;
   for (const r of (tkRows ?? []) as Record<string, unknown>[]) {
     const t = normalizeTrafoKaybi(r.trafo_kaybi_saatlik);

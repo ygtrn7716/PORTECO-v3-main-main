@@ -202,6 +202,10 @@ export default function SnapshotGesOlmasaydiCard({
           invoiceMethodId: methodId,
           // Metod 2/3 karşı-olgusal YEK Farkı girdileri snapshot'tan.
           methodInputs: methodInputsFromSnapshotRow(row) ?? null,
+          // MEDAŞ usulü (dagitim_kendi_veris damgalı): karşı-olgu da aynı dağıtım kuralıyla.
+          dagitimKendiVeris: liveBreakdown.dagitimKendiVeris
+            ? { ureticiBirim: liveBreakdown.dagitimKendiVeris.medasBirim }
+            : null,
         });
         if (cancel) return;
 

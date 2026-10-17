@@ -20,7 +20,13 @@
       "Bash(node -e ' *)",
       "Bash(npx tsc *)",
       "Bash(npx eslint *)",
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "PowerShell(git diff --cached --name-status; \"---remote\"; git remote -v; \"---branch\"; git status -sb | Select-Object -First 1; \"---autocrlf\"; git config core.autocrlf; \"---root\"; Get-ChildItem -Name | Where-Object { $_ -match '\\\\.\\(sh|js\\)$' -or $_ -eq '.gitattributes' })",
+      "PowerShell(Get-ChildItem -Directory \"C:\\\\Users\\\\Hawk Gaming\\\\Desktop\" -Name; \"---\"; Get-ChildItem -Directory \"C:\\\\Users\\\\Hawk Gaming\" -Name | Where-Object { $_ -match 'aril|sync' })",
+      "mcp__claude_ai_Supabase__list_migrations"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\Hawk Gaming\\Desktop\\aril-sync-main"
     ]
   }
 }

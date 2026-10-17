@@ -95,6 +95,49 @@ export function addTrafoKaybiToSeries(
   return out;
 }
 
+/**
+ * Metot 1 trafo kWh çözümü — öncelik `trafo_kaybi_saatlik` > `trafo_degeri`.
+ *
+ * t > 0 → trafo = t × pencere saat sayısı (tam dönem = gün × 24; cari dönemde ızgara
+ * tesisin son veri saatinde kapanır — trafoGridCapIso). `trafo_degeri` bu durumda
+ * YOK SAYILIR. t yok/0 → bugünkü davranış: aylık `trafo_degeri` (kWh) aynen.
+ * Sonuç, motora mevcut `trafoDegeri` girdisi olarak verilir (enerji trafoCharge,
+ * dağıtım tabanı, BTV — trafo nereye giriyorsa oraya; yalnız MİKTAR değişir).
+ * Çarpımın float gürültüsü 6 hanede temizlenir (1,12 × 720 → 806,4).
+ */
+export function resolveTrafoKwh(p: {
+  trafoKaybiSaatlik: unknown;
+  trafoDegeri: unknown;
+  startIso: string;
+  endIso: string;
+  endInclusive?: boolean;
+  lastTs: string | number | Date | null | undefined;
+  nowMs: number;
+}): { trafoKwh: number; saatlik: number | null; saat: number } {
+  const t = normalizeTrafoKaybi(p.trafoKaybiSaatlik);
+  if (t > 0) {
+    const capIso = trafoGridCapIso({
+      startIso: p.startIso,
+      endIso: p.endIso,
+      endInclusive: p.endInclusive,
+      lastTs: p.lastTs,
+      nowMs: p.nowMs,
+    });
+    const saat = hourGridKeys(p.startIso, p.endIso, {
+      endInclusive: p.endInclusive,
+      capIso,
+    }).length;
+    return { trafoKwh: Math.round(t * saat * 1e6) / 1e6, saatlik: t, saat };
+  }
+  // Bugünkü `num(trafo_degeri, 0)` ile birebir (≤ 0 değeri motor zaten yok sayar).
+  const aylik = Number(p.trafoDegeri);
+  return {
+    trafoKwh: Number.isFinite(aylik) ? aylik : 0,
+    saatlik: null,
+    saat: 0,
+  };
+}
+
 type TrafoRow = { ts?: string | number | Date; cn?: unknown; gn?: unknown };
 
 /**

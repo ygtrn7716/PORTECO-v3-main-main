@@ -77,12 +77,53 @@ export function GesUretimSatisiBody({
           </span>
         </div>
 
+        {result.kesintiKwh != null && (
+          <>
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-neutral-600">
+                GES Dağıtım kWh (
+                {result.kesintiTabani === "sold_only" ? "satılan veriş" : "toplam veriş"})
+              </span>
+              <span className="text-sm font-medium text-neutral-700">
+                {fmtKwh(result.kesintiKwh)} kWh
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-neutral-600">Dağıtım Birim Fiyatı (tarife / 2)</span>
+              <span className="text-sm font-medium text-neutral-700">
+                {result.dagitimBedeli.toLocaleString("tr-TR", {
+                  minimumFractionDigits: 4,
+                  maximumFractionDigits: 7,
+                })}{" "}
+                TL/kWh
+              </span>
+            </div>
+          </>
+        )}
+
         <div className="flex items-center justify-between">
-          <span className="text-sm text-neutral-600">Dağıtım Kesintisi</span>
+          <span className="text-sm text-neutral-600">
+            {result.medasKesinti
+              ? "MEDAŞ Veriş Faturası (Sistem Kullanım Bedeli, KDV hariç)"
+              : "Dağıtım Kesintisi"}
+          </span>
           <span className="text-sm font-medium text-red-500">
             -{fmtTL(result.satisDagitimKesintisi)} TL
           </span>
         </div>
+
+        {/* MEDAŞ usulü: kesinti hangi tesisin ayrı veriş faturasından geliyor. */}
+        {result.medasKesinti?.satirlar.map((r) => (
+          <p key={r.serno} className="-mt-1 text-right text-[11px] text-neutral-500">
+            {r.serno}
+            {r.label && r.label !== `Tesis ${r.serno}` ? ` (${r.label})` : ""}: {fmtKwh(r.kwh)} kWh ×{" "}
+            {r.birim.toLocaleString("tr-TR", { minimumFractionDigits: 6, maximumFractionDigits: 6 })} ={" "}
+            {fmtTL(r.bedeli)} TL
+          </p>
+        ))}
+        {result.medasKesinti?.hata && (
+          <p className="text-[11px] text-red-600">{result.medasKesinti.hata}</p>
+        )}
 
         <div className="my-2 border-t border-amber-200/70" />
 
@@ -98,14 +139,34 @@ export function GesUretimSatisiBody({
         </div>
       </div>
 
-      {result.dagitimBedeli > 0 && (
+      {result.medasKesinti ? (
+        <>
+          <p className="mt-4 text-xs text-neutral-400">
+            Dağıtım kesintisi: bu satışa veriş akıtan tesislerin ayrı MEDAŞ veriş faturaları
+            (kendi verişi − kendi çekişi) × üretici sistem kullanım bedeli.
+          </p>
+          {result.medasKesinti.uyarilar?.map((u, i) => (
+            <p key={i} className="mt-1 text-xs text-amber-600">
+              {u}
+            </p>
+          ))}
+        </>
+      ) : result.kesintiKwh != null ? (
         <p className="mt-4 text-xs text-neutral-400">
-          Dağıtım Bedeli: {fmtUnit(result.dagitimBedeli)} TL/kWh (
-          {lisansliSatis
-            ? "Lisanslı satış üretici tarifesi"
-            : "Lisanslı olmayan üretici tarifesi"}
-          )
+          {result.kesintiTabani === "sold_only"
+            ? "GES üretim dağıtım faturası: satılan veriş × dağıtım tarifesinin yarısı."
+            : "GES üretim dağıtım faturası: toplam veriş (satılan + mahsup edilen) × dağıtım tarifesinin yarısı."}
         </p>
+      ) : (
+        result.dagitimBedeli > 0 && (
+          <p className="mt-4 text-xs text-neutral-400">
+            Dağıtım Bedeli: {fmtUnit(result.dagitimBedeli)} TL/kWh (
+            {lisansliSatis
+              ? "Lisanslı satış üretici tarifesi"
+              : "Lisanslı olmayan üretici tarifesi"}
+            )
+          </p>
+        )
       )}
 
       {result.satisModu === "usd" ? (

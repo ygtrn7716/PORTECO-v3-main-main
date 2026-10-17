@@ -13,6 +13,7 @@ import {
 } from "@/lib/invoiceMethods";
 import {
   isIpragazYekBirlesikPeriod,
+  isTredasDagitimBolunmusPeriod,
   type InvoiceMethodInputs,
   type MethodInvoiceBreakdown,
 } from "@/components/utils/calculateInvoiceNetMethods";
@@ -60,6 +61,10 @@ export function methodInputsFromSnapshotRow(
   row: RecomputeRow
 ): InvoiceMethodInputs | undefined {
   const methodId = coerceInvoiceMethodId(row.invoice_method);
+  // Metod 8 (Kayseri OSB): w_pos kullanmaz; osb_* kolonlarından kurulur. Kolonlar seçilmemiş
+  // veya m8 damgası yoksa (lisanslı → m1 yazımı) undefined → dispatcher (lisanslı değilse)
+  // görünür hata atar → recompute saklı toplama düşer.
+  if (methodId === 8) return osbMethodInputsFromSnapshotRow(row);
   // Metod 1 ve Metod 4 (GES'siz düz fatura) saatlik-net girdisi taşımaz (w_pos yok) →
   // undefined; dispatcher metod-1 çekirdeğinden hesaplar (m4 dalı üretimi sıfırlar).
   if (!isNetInvoiceMethod(methodId)) return undefined;
@@ -98,6 +103,80 @@ export function methodInputsFromSnapshotRow(
     mahsuplasmaUnitPrice:
       row.mahsuplasma_unit_price != null ? Number(row.mahsuplasma_unit_price) : null,
     ...(meram ? { meram } : {}),
+    ...(methodId === 3 ? { ownGnTotal: tredasOwnGnFromSnapshotRow(row) } : {}),
+  };
+}
+
+/** Metod 3 replay: tesisin kendi Σgn'i (Trepaş 2026-09+ ana fatura dağıtım tabanı).
+ *  Damga (own_gn_kwh) varsa o. Yoksa (damga öncesi yazılmış satır): tahsis yoksa kendi
+ *  gn = Σgn (total_production_kwh); tahsisli satırda kendi gn bilinemez → 0 + uyarı
+ *  (bugünkü tahsisli m3 alıcısının kendi verişi 0). Motor bu alanı yalnız bayrak açıkken okur. */
+function tredasOwnGnFromSnapshotRow(row: RecomputeRow): number {
+  if (row.own_gn_kwh != null) return Number(row.own_gn_kwh);
+  if (row.allocated_ges_kwh == null) return Number(row.total_production_kwh ?? 0);
+  if (isTredasDagitimBolunmusPeriod(Number(row.period_year), Number(row.period_month))) {
+    console.warn(
+      `invoiceSnapshots: m3 snapshot (${row.subscription_serno} ${row.period_year}-${row.period_month}) own_gn_kwh yok ve tahsisli — kendi veriş 0 varsayıldı.`
+    );
+  }
+  return 0;
+}
+
+/** Metod 8 replay girdileri. C = total_consumption_kwh (ham Σcn; Kayseri'de trafo yok),
+ *  N = net_positive_draw_kwh (m8 yazımında girdilerden damgalı), M = C − N,
+ *  RI/RC = saklı EFEKTİF % × C (motor reaktif payload'ını mutlak uygular → idempotent). */
+function osbMethodInputsFromSnapshotRow(row: RecomputeRow): InvoiceMethodInputs | undefined {
+  if (row.osb_enerji_birim_fiyati == null || row.own_gn_kwh === undefined) return undefined;
+  const C = Number(row.total_consumption_kwh ?? 0);
+  const N = Number(row.net_positive_draw_kwh ?? 0);
+  const numOrNull = (v: unknown) => (v != null && Number.isFinite(Number(v)) ? Number(v) : null);
+  const iletim = numOrNull(row.osb_iletim_birim);
+  const osbDagitim = numOrNull(row.osb_dagitim_birim);
+  const cekis = numOrNull(row.osb_cekis_birim);
+  return {
+    sumCn: C,
+    sumGn: Number(row.total_production_kwh ?? 0),
+    sumPos: N,
+    sumMahsup: Math.max(0, C - N),
+    sumExcess: Number(row.net_excess_feed_kwh ?? 0),
+    wPos: 0,
+    kbk: Number(row.kbk ?? 0),
+    tahminiYekdem: 0,
+    prevSumPos: numOrNull(row.prev_sum_pos),
+    osb: {
+      donem: `${row.period_year}-${String(row.period_month).padStart(2, "0")}`,
+      ownGnTotal: Number(row.own_gn_kwh ?? 0),
+      riKwh: (Number(row.reactive_ri_percent ?? 0) / 100) * C,
+      rcKwh: (Number(row.reactive_rc_percent ?? 0) / 100) * C,
+      enerjiFiyati: Number(row.osb_enerji_birim_fiyati),
+      fiyatTahmini: row.osb_fiyat_tahmini === true,
+      fiyatDonemi: null,
+      yekdemFarkBirim: Number(row.osb_yekdem_fark_birim ?? 0),
+      ekBedel:
+        iletim != null && osbDagitim != null && cekis != null
+          ? { iletim, osbDagitim, cekis }
+          : null,
+      verisDagitimBirim: Number(row.osb_veris_dagitim_birim ?? 0),
+      reaktifBirim: Number(row.osb_reaktif_birim ?? 0),
+    },
+  };
+}
+
+/** Dağıtım kendi verişiyle (MEDAŞ usulü) replay girdisi. Yalnız damgası true olan
+ *  satırda: G = own_gn_kwh (yazımda damgalanır), uretici birimi = medas_veris_birim.
+ *  Damga null/false (eski satır, bayraksız tesis) → undefined → bugünkü m1 yolu. */
+function kendiVerisFromSnapshotRow(
+  row: RecomputeRow
+): { ownGnKwh: number; ureticiBirim: number } | undefined {
+  if (row.dagitim_kendi_veris !== true) return undefined;
+  if (row.own_gn_kwh == null) {
+    console.warn(
+      `invoiceSnapshots: dagitim_kendi_veris snapshot (${row.subscription_serno} ${row.period_year}-${row.period_month}) own_gn_kwh yok — kendi veriş 0 varsayıldı.`
+    );
+  }
+  return {
+    ownGnKwh: Number(row.own_gn_kwh ?? 0),
+    ureticiBirim: Number(row.medas_veris_birim ?? 0),
   };
 }
 
@@ -126,6 +205,7 @@ export function buildSnapshotBreakdown(
   // Tarihsel sadakat: metod snapshot'ın kesildiği andaki değerden okunur (null → metod 1).
   const methodId = coerceInvoiceMethodId(row.invoice_method);
   const methodInputs = methodInputsFromSnapshotRow(row);
+  const kendiVeris = kendiVerisFromSnapshotRow(row);
 
   return calculateInvoiceForMethod(
     methodId,
@@ -150,6 +230,8 @@ export function buildSnapshotBreakdown(
       netPositiveDrawKwh: row.net_positive_draw_kwh != null ? Number(row.net_positive_draw_kwh) : undefined,
       netExcessFeedKwh: row.net_excess_feed_kwh != null ? Number(row.net_excess_feed_kwh) : undefined,
       methodInputs,
+      // Dağıtım kendi verişiyle (MEDAŞ) — yalnız damgalı satırda (dispatcher m1 dışında siler).
+      ...(kendiVeris ? { dagitimKendiVeris: kendiVeris } : {}),
       // Metod 6 (Kepsaş) replay: gömülen çıplak YEKDEM adder'ı saklı kolondan → dispatcher
       // enerji satırına yeniden gömer. Diğer metodlarda null → 0 → etkisiz (bit-identik).
       embeddedYekdemAdderTL:
@@ -166,6 +248,10 @@ export function buildSnapshotBreakdown(
       ipragazYekBirlesik:
         methodId === 5 &&
         isIpragazYekBirlesikPeriod(Number(row.period_year), Number(row.period_month)),
+      // Trepaş 2026-09+ bölünmüş dağıtım replay'i (yalnız m3 okur; dönem yoksa kapı kapalı).
+      tredasDagitimBolunmus:
+        methodId === 3 &&
+        isTredasDagitimBolunmusPeriod(Number(row.period_year), Number(row.period_month)),
     },
     overrides
   );
@@ -188,7 +274,7 @@ export function recomputeSnapshotTotalWithMahsup(
 /** Tek noktadan import edilen "snapshot select" listesi — recompute yapacak
  * çağıran tarafların kullanması beklenir. */
 export const INVOICE_SNAPSHOT_RECOMPUTE_FIELDS =
-  "period_year, period_month, total_consumption_kwh, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, total_with_mahsup, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price, embedded_yekdem_adder, unit_price_adjustment, trafo_kaybi_saatlik, trafo_kaybi_kwh, own_gn_kwh, yekdem_gddk, yekdem_is_final";
+  "period_year, period_month, total_consumption_kwh, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, total_with_mahsup, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price, embedded_yekdem_adder, unit_price_adjustment, trafo_kaybi_saatlik, trafo_kaybi_kwh, own_gn_kwh, allocated_ges_kwh, yekdem_gddk, yekdem_is_final, osb_enerji_birim_fiyati, osb_fiyat_tahmini, osb_yekdem_fark_birim, osb_iletim_birim, osb_dagitim_birim, osb_cekis_birim, osb_veris_dagitim_birim, osb_reaktif_birim, dagitim_kendi_veris, medas_veris_kwh, medas_veris_birim, medas_veris_bedeli, ges_sale_dist_basis";
 
 export type InvoiceType = "billed" | "backdated";
 
@@ -297,6 +383,28 @@ export type InvoiceSnapshotRow = {
   own_gn_kwh: number | null;                // G_own (tesisin kendi ham verişi) — dağıtım
   yekdem_gddk: number | null;               // yazım anındaki efektif YEKDEM GDDK (TL)
   yekdem_is_final: boolean | null;          // yekdem_tahmini = yekdem_final mı
+
+  // ── Metod 8 (Kayseri OSB) replay alanları. Diğer metodlarda null. Yeniden kullanılan:
+  // own_gn_kwh (G), prev_sum_pos (önceki ay N), net_positive_draw_kwh (N), reactive_*_percent.
+  osb_enerji_birim_fiyati: number | null;   // P (doğal; override replay'de ayrıca uygulanır)
+  osb_fiyat_tahmini: boolean | null;        // P fatura ayından önceki bir aydan (tahmini)
+  osb_yekdem_fark_birim: number | null;     // YEKDEM fark birim fiyatı (TL/kWh)
+  osb_iletim_birim: number | null;          // kayseri_ek_bedeller.iletim_bedeli_aktif_tuketim
+  osb_dagitim_birim: number | null;         // kayseri_ek_bedeller.osb_dagitim_kullanim_bedeli
+  osb_cekis_birim: number | null;           // kayseri_ek_bedeller.lisanssiz_uretim_cekis_bedeli
+  osb_veris_dagitim_birim: number | null;   // tarife dagitim_uretici_1
+  osb_reaktif_birim: number | null;         // tarife reaktif_bedel
+
+  // ── Dağıtım kendi verişiyle (MEDAŞ usulü, 20261010201938). Payload'a her satırda açık
+  // yazılır (bayraksız → false/null). Replay: true ise G = own_gn_kwh.
+  dagitim_kendi_veris: boolean | null;
+  medas_veris_kwh: number | null;           // max(0, G − C)
+  medas_veris_birim: number | null;         // dagitim_uretici_1
+  medas_veris_bedeli: number | null;        // KDV hariç; perakende toplamına DAHİL DEĞİL
+
+  // ── GES Üretim Satışı kartı kesinti tabanı (yalnız Metot 3 Trepaş 2026-09+).
+  // 'total_veris' = Σgn × D/2, 'sold_only' = satılan veriş × D/2. Mevcut satırlar default.
+  ges_sale_dist_basis: string | null;
 };
 
 /**
@@ -368,6 +476,10 @@ export function buildInvoiceSnapshotPayload(params: {
   methodInputs?: InvoiceMethodInputs | null;
   /** Metod 6 (Kepsaş): enerji birim fiyatına gömülen çıplak YEKDEM adder'ı (replay damgası). */
   embeddedYekdemAdder?: number | null;
+  /** Metot 1 saatlik trafo (t) kullanıldıysa t ve t × saat (= trafoDegeri); audit damgası.
+   *  Replay trafo_degeri'den yapılır. m7 kendi damgasını yazar (breakdown.meram). */
+  trafoKaybiSaatlik?: number | null;
+  trafoKaybiKwh?: number | null;
 
   // ── Backdated damgaları. monthly_* yalnız parametre VERİLDİĞİNDE payload'a
   // girer (billed writer'lar kolona dokunmaz); kbk/prev_* metod-1'de de damga
@@ -377,6 +489,8 @@ export function buildInvoiceSnapshotPayload(params: {
   kbk?: number | null;
   prevYekdemTahmini?: number | null;
   prevYekdemGerceklesen?: number | null;
+  /** GES Üretim Satışı kartı kesinti tabanı (subscription_settings.ges_sale_dist_basis). */
+  gesSaleDistBasis?: string | null;
 }) {
   const invoiceType = params.invoiceType ?? "billed";
 
@@ -458,6 +572,10 @@ export function buildInvoiceSnapshotPayload(params: {
     // Aşama 2L: Metod 6 (Kepsaş) gömülü çıplak YEKDEM adder'ı (diğer metodlarda null).
     embedded_yekdem_adder: params.embeddedYekdemAdder ?? null,
 
+    // GES Üretim Satışı kartı kesinti tabanı — verilirse damgalanır (billed writer
+    // güncel ayarı gönderir), verilmezse alan payload'a GİRMEZ (mevcut kolon korunur).
+    ...(params.gesSaleDistBasis !== undefined ? { ges_sale_dist_basis: params.gesSaleDistBasis } : {}),
+
     // Backdated damgaları: yalnız parametre verildiğinde alan payload'a girer —
     // billed writer'ların upsert'i mevcut kolon değerini KORUR (alan yok = dokunma).
     ...(params.monthlyYekdem !== undefined ? { monthly_yekdem: params.monthlyYekdem } : {}),
@@ -478,6 +596,64 @@ export function buildInvoiceSnapshotPayload(params: {
           own_gn_kwh: params.methodInputs.meram.ownGnTotal,
           yekdem_gddk: params.breakdown.meram.gddk,
           yekdem_is_final: params.methodInputs.meram.yekdemIsFinal,
+        }
+      : {}),
+
+    // Metod 3 (Trepaş 2026-09+): ana fatura dağıtım tabanı kendi Σgn ile → replay için damga.
+    // Yalnız m3 motorundan gelen breakdown'da (muhtelif2Net anahtarı) yazılır.
+    ...(params.breakdown.muhtelif2Net !== undefined &&
+    params.methodInputs?.ownGnTotal != null &&
+    Number.isFinite(Number(params.methodInputs.ownGnTotal))
+      ? { own_gn_kwh: Number(params.methodInputs.ownGnTotal) }
+      : {}),
+
+    // Metod 8 (Kayseri OSB): breakdown gerçekten m8 motorundan geldiyse (lisanslı → m1 hariç)
+    // agregalar girdilerden (sonraki ayın önceki-ay N'i BUNU okur), OSB birimleri donmuş;
+    // net-aile kolonları null (m8 net değil). GES satışında dağıtım kesintisi yok → 0.
+    ...(params.breakdown.osb && params.methodInputs?.osb
+      ? {
+          net_positive_draw_kwh: params.methodInputs.sumPos,
+          net_excess_feed_kwh: params.methodInputs.sumExcess,
+          total_production_kwh: params.methodInputs.sumGn,
+          own_gn_kwh: params.methodInputs.osb.ownGnTotal,
+          prev_sum_pos: params.methodInputs.prevSumPos ?? null,
+          unit_price_energy: params.breakdown.osb.enerjiFiyati,
+          ges_satis_dagitim_bedeli: 0,
+          w_pos: null,
+          w_mahsup: null,
+          yekdem_tahmini: null,
+          prev_yekdem_tahmini: null,
+          prev_yekdem_gerceklesen: null,
+          mahsuplasma_unit_price: null,
+          osb_enerji_birim_fiyati:
+            params.methodInputs.osb.enerjiFiyati ?? params.breakdown.osb.enerjiFiyati,
+          osb_fiyat_tahmini: params.methodInputs.osb.fiyatTahmini,
+          osb_yekdem_fark_birim: params.methodInputs.osb.yekdemFarkBirim,
+          osb_iletim_birim: params.breakdown.osb.birimler.iletim,
+          osb_dagitim_birim: params.breakdown.osb.birimler.osbDagitim,
+          osb_cekis_birim: params.breakdown.osb.birimler.cekis,
+          osb_veris_dagitim_birim: params.breakdown.osb.birimler.verisDagitim,
+          osb_reaktif_birim: params.breakdown.osb.birimler.reaktif,
+        }
+      : {}),
+
+    // Dağıtım kendi verişiyle (MEDAŞ usulü): her satırda AÇIK yazılır — bayrak kapatılıp
+    // yeniden yazılan satırda bayat true kalmasın. Değerler breakdown'dan (iki yazıcı —
+    // InvoiceDetail + snapshotParamsFromEngine — için tek kaynak). G yalnız bayraklıda
+    // own_gn_kwh'a damgalanır (asla null yazılmaz; m3/m7/m8 kendi damgalarını yazar).
+    dagitim_kendi_veris: params.breakdown.dagitimKendiVeris != null,
+    medas_veris_kwh: params.breakdown.dagitimKendiVeris?.medasKwh ?? null,
+    medas_veris_birim: params.breakdown.dagitimKendiVeris?.medasBirim ?? null,
+    medas_veris_bedeli: params.breakdown.dagitimKendiVeris?.medasBedeli ?? null,
+    ...(params.breakdown.dagitimKendiVeris
+      ? { own_gn_kwh: params.breakdown.dagitimKendiVeris.gKwh }
+      : {}),
+
+    // Metot 1 saatlik trafo damgası (m7 satırında meram spread'i yazar).
+    ...(params.trafoKaybiSaatlik != null && !params.breakdown.meram
+      ? {
+          trafo_kaybi_saatlik: params.trafoKaybiSaatlik,
+          trafo_kaybi_kwh: params.trafoKaybiKwh ?? null,
         }
       : {}),
   };
@@ -511,7 +687,7 @@ export async function listInvoiceSnapshots(params: {
   const base = supabase
     .from("invoice_snapshots")
     .select(
-      "user_id, subscription_serno, period_year, period_month, invoice_type, month_label, total_with_mahsup, total_invoice, total_consumption_kwh, updated_at, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price, embedded_yekdem_adder, unit_price_adjustment, trafo_kaybi_saatlik, trafo_kaybi_kwh, own_gn_kwh, yekdem_gddk, yekdem_is_final"
+      "user_id, subscription_serno, period_year, period_month, invoice_type, month_label, total_with_mahsup, total_invoice, total_consumption_kwh, updated_at, unit_price_energy, unit_price_distribution, btv_rate, vat_rate, tariff_type, contract_power_kw, month_final_demand_kw, power_price, power_excess_price, reactive_penalty_charge, reactive_ri_percent, reactive_rc_percent, trafo_degeri, total_production_kwh, on_yil, lisansli_satis, perakende_enerji_bedeli, usd_kur, net_positive_draw_kwh, net_excess_feed_kwh, yekdem_mahsup, diger_degerler, invoice_method, invoice_from, w_pos, w_mahsup, kbk, yekdem_tahmini, prev_sum_pos, prev_yekdem_tahmini, prev_yekdem_gerceklesen, mahsuplasma_unit_price, embedded_yekdem_adder, unit_price_adjustment, trafo_kaybi_saatlik, trafo_kaybi_kwh, own_gn_kwh, allocated_ges_kwh, yekdem_gddk, yekdem_is_final, osb_enerji_birim_fiyati, osb_fiyat_tahmini, osb_yekdem_fark_birim, osb_iletim_birim, osb_dagitim_birim, osb_cekis_birim, osb_veris_dagitim_birim, osb_reaktif_birim, dagitim_kendi_veris, medas_veris_kwh, medas_veris_birim, medas_veris_bedeli, ges_sale_dist_basis"
     )
     .eq("user_id", params.userId);
 
@@ -570,6 +746,13 @@ export function snapshotParamsFromEngine(args: {
   invoiceType: InvoiceType;
 }): Parameters<typeof upsertInvoiceSnapshot>[0] {
   const { userId, subscriptionSerno, inputs, result, overrides, invoiceType } = args;
+  // Girdiler BAŞKA bir tesisin/kullanıcının olamaz (admin ekranında tesis değişirken
+  // eski girdilerle yeni serno'ya snapshot yazılmıştı — Ağu 2026 10128583).
+  if (inputs.userId !== userId || inputs.subscriptionSerno !== subscriptionSerno) {
+    throw new Error(
+      `Girdi/tesis uyuşmazlığı — snapshot yazılmadı (hedef ${subscriptionSerno}, girdiler ${inputs.subscriptionSerno}).`
+    );
+  }
   return {
     userId,
     subscriptionSerno,
@@ -622,5 +805,9 @@ export function snapshotParamsFromEngine(args: {
     methodInputs: inputs.methodInputs,
     // Metod 6 (Kepsaş): gömülen çıplak YEKDEM adder'ı (diğer metodlarda 0).
     embeddedYekdemAdder: result.embeddedYekdemAdder,
+    trafoKaybiSaatlik: inputs.trafoKaybiSaatlik,
+    trafoKaybiKwh: inputs.trafoKaybiKwh,
+    // GES Üretim Satışı kartı kesinti tabanı — ayardan damgalanır.
+    gesSaleDistBasis: inputs.gesSaleDistBasis,
   };
 }

@@ -13,6 +13,10 @@ import {
   type MethodInvoiceBreakdown,
   type MethodInvoiceInput,
 } from "@/components/utils/calculateInvoiceNetMethods";
+import {
+  calculateInvoiceMethod8,
+  OsbInvoiceInputError,
+} from "@/components/utils/calculateInvoiceOsb";
 
 export type {
   InvoiceMethodInputs,
@@ -33,7 +37,7 @@ export type {
  * bkz. billedInvoiceInputs.ts başındaki not) → admin bağlamında doğrudan sorgu.
  */
 
-export type InvoiceMethodId = 1 | 2 | 3 | 4 | 5 | 6 | 7;
+export type InvoiceMethodId = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
 export const DEFAULT_INVOICE_METHOD: InvoiceMethodId = 1;
 
 /** Saatlik-net motorundan geçen metodlar (2=Uedaş, 3=Tredaş, 5=İpragaz, 7=Meram).
@@ -45,12 +49,31 @@ export function isNetInvoiceMethod(id: InvoiceMethodId): boolean {
   return id === 2 || id === 3 || id === 5 || id === 7;
 }
 
+/** Metod 8 (Kayseri OSB): OSB aylık enerji fiyatı + ek bedeller; NET AİLE DEĞİL (wPos/YEK
+ *  kavramı yok, fatura tablosu tamamen farklı — UI `breakdown.osb` ile kapılar). */
+export function isOsbInvoiceMethod(id: InvoiceMethodId): boolean {
+  return id === 8;
+}
+
+/** Saatlik-net girdi bloğuna (`assembleMethodInputs`) ihtiyaç duyan metodlar: net aile + Metod 8. */
+export function needsMethodInputs(id: InvoiceMethodId): boolean {
+  return isNetInvoiceMethod(id) || isOsbInvoiceMethod(id);
+}
+
+/** Toplam-sonrası "sonraki ay YEKDEM mahsubu" HİÇ HESAPLANMAYAN metodlar: net aile (fark
+ *  KDV matrahındaki kalem) + Metod 8 (YEKDEM fiyat farkı faturada kalem; 'yekdem_mahsup'
+ *  override'ı motorda o kaleme köprülenir — post-total'a da eklenirse ÇİFT sayılır).
+ *  Metod 6 burada YOK: onun mahsubu hesaplanır (enerjiye gömülür). */
+export function skipsNextMonthYekdemMahsup(id: InvoiceMethodId): boolean {
+  return isNetInvoiceMethod(id) || isOsbInvoiceMethod(id);
+}
+
 /** Post-total "Önceki Dönem YEKDEM Mahsubu" satırını BASTIRAN metodlar:
  *  net metodlar (fark KDV matrahındaki kalem) + Metod 6 (fark enerji birim
- *  fiyatına gömülü). Bu metodlarda caller'lar totalWithMahsup'a post-total
- *  mahsup EKLEMEZ ve fatura satırını gizler (aksi halde çift sayım). */
+ *  fiyatına gömülü) + Metod 8 (YEKDEM fiyat farkı kalem). Bu metodlarda caller'lar
+ *  totalWithMahsup'a post-total mahsup EKLEMEZ ve fatura satırını gizler (aksi halde çift sayım). */
 export function hidesPostTotalMahsup(id: InvoiceMethodId): boolean {
-  return isNetInvoiceMethod(id) || id === 6;
+  return isNetInvoiceMethod(id) || id === 6 || isOsbInvoiceMethod(id);
 }
 
 /** Metod 6 (Kepsaş): önceki dönem YEKDEM mahsubu enerji birim fiyatına gömülür. */
@@ -71,7 +94,9 @@ export type ResolveInvoiceMethodsParams =
   | { context: "admin"; userId: string; supabase: SupabaseClient };
 
 export function isInvoiceMethodId(v: unknown): v is InvoiceMethodId {
-  return v === 1 || v === 2 || v === 3 || v === 4 || v === 5 || v === 6 || v === 7;
+  return (
+    v === 1 || v === 2 || v === 3 || v === 4 || v === 5 || v === 6 || v === 7 || v === 8
+  );
 }
 
 /** Snapshot/DB'den gelen metod değerini güvenle daraltır.
@@ -208,6 +233,47 @@ export function methodForProvider(
   return { methodId: hit.methodId, invoiceFrom: hit.invoiceFrom };
 }
 
+/** subscription_settings.invoice_method_override değerini daraltır.
+ *  null/undefined → null (override yok, şirket metodu). Geçerli metod id (1..8) → id.
+ *  Geçersiz değer → warn + null (sessizce yanlış metoda düşülmez; şirket metodu kullanılır). */
+export function parseInvoiceMethodOverride(v: unknown): InvoiceMethodId | null {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  if (isInvoiceMethodId(n)) return n;
+  console.warn(
+    `invoiceMethods: geçersiz invoice_method_override (${String(v)}) — şirket metodu kullanılıyor.`
+  );
+  return null;
+}
+
+/**
+ * Aboneliğin EFEKTİF fatura metodu — TEK resolver.
+ * efektif = subscription_settings.invoice_method_override ?? şirket metodu
+ * (user_integrations.provider → invoice_from → invoice_companies.method_id).
+ *
+ * `invoiceFrom` override'da da ŞİRKET anahtarı olarak kalır: snapshot `invoice_from`
+ * damgası ve Kayseri replay kapısı (`invoice_from !== 'kayseri_osb'`) buna bağlı.
+ * Bilinen sınır: Kayseri dışı bir tesise override = 8 verilirse OSB fiyat anahtarı
+ * şirket anahtarı olur (bugün kullanım yok).
+ */
+export function methodForSubscription(
+  map: InvoiceMethodMap,
+  provider: string | null | undefined,
+  override: unknown
+): {
+  methodId: InvoiceMethodId;
+  invoiceFrom: string | null;
+  source: "override" | "company" | "default";
+} {
+  const ov = parseInvoiceMethodOverride(override);
+  if (ov != null) {
+    const hit = provider ? map.get(provider) : undefined;
+    return { methodId: ov, invoiceFrom: hit?.invoiceFrom ?? null, source: "override" };
+  }
+  const base = methodForProvider(map, provider);
+  return { ...base, source: base.invoiceFrom != null ? "company" : "default" };
+}
+
 /**
  * Metod dispatcher'ı (Aşama 2B).
  *
@@ -219,11 +285,33 @@ export function methodForProvider(
  */
 export function calculateInvoiceForMethod(
   methodId: InvoiceMethodId,
-  input: MethodInvoiceInput,
+  rawInput: MethodInvoiceInput,
   overrides?: InvoiceOverrides | null,
   methodInputs?: InvoiceMethodInputs
 ): MethodInvoiceBreakdown {
+  // "Dağıtım kendi verişiyle" (MEDAŞ usulü) Metot 1 ve Metot 7'nin kuralı. Girişte
+  // methodId !== 1 için alan silinir → m2–m6, m8 ve TÜM m1 fallback/yönlendirmeleri
+  // (m7 lisanslı / methodInputs yok / meram yok dahil) bayraktan bağımsız, bit-identik.
+  // Yalnız GERÇEK m7 motor çağrısı ham girdiyi (bayrak + uretici_1) alır; m7 G'yi kendi
+  // meram.ownGnTotal'ından okur.
+  const input: MethodInvoiceInput =
+    methodId !== 1 && rawInput.dagitimKendiVeris != null
+      ? { ...rawInput, dagitimKendiVeris: undefined }
+      : rawInput;
   const mi = methodInputs ?? input.methodInputs;
+
+  if (isOsbInvoiceMethod(methodId)) {
+    // Metod 8 — Kayseri OSB. Lisanslı satış (henüz yok) metod 1 semantiğinde kalır.
+    // Girdi yoksa SESSİZCE Metod 1'e DÜŞÜLMEZ (yanlış bir OSB faturası üretirdi):
+    // görünür hata. Eksik fiyat / ek bedel hatasını motor fırlatır.
+    if (input.lisansliSatis) return calculateInvoice(input, overrides);
+    if (!mi?.osb) {
+      throw new OsbInvoiceInputError(
+        "Metot 8 (Kayseri OSB) için tesis girdileri (saatlik veri / OSB bedelleri) kurulamadı."
+      );
+    }
+    return calculateInvoiceMethod8(input, overrides, mi);
+  }
 
   if (isNetInvoiceMethod(methodId)) {
     // Lisanslı satış: net motor (saatlik mahsuplaşma) bu senaryoyu desteklemiyor.
@@ -248,7 +336,7 @@ export function calculateInvoiceForMethod(
         );
         return calculateInvoice(input, overrides);
       }
-      return calculateInvoiceMethod7(input, overrides, mi);
+      return calculateInvoiceMethod7(rawInput, overrides, mi);
     }
     return methodId === 2
       ? calculateInvoiceMethod2(input, overrides, mi)

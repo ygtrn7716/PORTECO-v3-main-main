@@ -68,6 +68,7 @@ import IntakeFormsAdmin from "@/pages/admin/IntakeFormsAdmin";
 import DataHealthAdmin from "@/pages/admin/DataHealthAdmin";
 import InvoiceOverridesAdmin from "@/pages/admin/InvoiceOverridesAdmin";
 import InvoiceMethodsAdmin from "@/pages/admin/InvoiceMethodsAdmin";
+import OsbAylikFiyatlarAdmin from "@/pages/admin/OsbAylikFiyatlarAdmin";
 
 export default function App() {
   const { pathname } = useLocation();
@@ -144,6 +145,7 @@ export default function App() {
               <Route path="finans" element={<FinanceAdmin />} />
               <Route path="faturalar" element={<InvoiceOverridesAdmin />} />
               <Route path="fatura-metodlari" element={<InvoiceMethodsAdmin />} />
+              <Route path="osb-fiyatlari" element={<OsbAylikFiyatlarAdmin />} />
             </Route>
           </Route>
         </Routes>

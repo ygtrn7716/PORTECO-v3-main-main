@@ -14,7 +14,12 @@
     "check:method-snapshots": "tsx scripts/check-invoice-method-snapshots.ts",
     "check:muhasebe": "tsx scripts/check-muhasebe-report.ts",
     "check:ges-modes": "tsx scripts/check-ges-allocation-modes.ts",
-    "compare:meram-m7": "tsx --tsconfig scripts/tsconfig.harness.json scripts/compare-meram-m7.ts"
+    "compare:meram-m7": "tsx --tsconfig scripts/tsconfig.harness.json scripts/compare-meram-m7.ts",
+    "compare:osb-m8": "tsx --tsconfig scripts/tsconfig.harness.json scripts/compare-osb-m8.ts",
+    "check:dagitim-kv": "tsx --tsconfig scripts/tsconfig.harness.json scripts/check-dagitim-kendi-veris.ts",
+    "compare:dagitim-kv": "tsx --tsconfig scripts/tsconfig.harness.json scripts/compare-dagitim-kv.ts",
+    "compare:ges-sale-basis": "tsx --tsconfig scripts/tsconfig.harness.json scripts/compare-ges-sale-basis.ts",
+    "check:method-override": "tsx --tsconfig scripts/tsconfig.harness.json scripts/check-method-override.ts"
   },
   "dependencies": {
     "@radix-ui/react-slot": "^1.2.3",

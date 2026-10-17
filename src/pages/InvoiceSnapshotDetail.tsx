@@ -19,14 +19,28 @@ import {
 } from "@/components/utils/invoiceOverrides";
 import GesUretimSatisiCard from "@/components/dashboard/shared/GesUretimSatisiCard";
 import {
+  OsbInvoiceNotes,
+  OsbInvoiceRows,
+} from "@/components/dashboard/shared/OsbInvoiceRows";
+import {
   MERAM_BTV_TEXT,
   MeramDagitimNote,
   MeramInvoiceNotes,
   MeramSatir2Row,
   MeramYekdemBadge,
 } from "@/components/dashboard/shared/MeramInvoiceParts";
-import { calculateGesUretimSatisi } from "@/lib/ges/gesUretimSatisi";
+import {
+  calculateGesUretimSatisi,
+  gesSatisKesintiArgs,
+  parseGesSaleDistBasis,
+  type MedasKesinti,
+} from "@/lib/ges/gesUretimSatisi";
 import { resolveGesSatisDagitimRate } from "@/lib/ges/gesSatisDagitimRate";
+import {
+  loadMedasVerisKesintisiSafe,
+  medasHostKatkiFromBreakdown,
+} from "@/lib/ges/medasVerisKesinti";
+import MedasVerisFaturasiCard from "@/components/dashboard/shared/MedasVerisFaturasiCard";
 
 const fmtMoney2 = (n: number | null | undefined) =>
   n == null || !Number.isFinite(Number(n))
@@ -167,6 +181,8 @@ const yekdemCell = useMemo(() => {
   const snapEmbeddedAdder = Number(liveBreakdown?.embeddedYekdemAdderTL ?? 0);
   // Metod 7 (Meram): replay motoru m7 çıktısı ürettiyse (m7 kolonları seçili + damga 7).
   const snapMeram = liveBreakdown?.meram;
+  // Metod 8 (Kayseri OSB): replay m8 çıktısı ürettiyse OSB bildirimi gövdesi.
+  const snapOsb = liveBreakdown?.osb;
 
   // Efektif (override'lı) enerji birim fiyatı — kart + satır açıklamaları.
   const effUnitPriceEnergyDisplay = useMemo(() => {
@@ -208,15 +224,20 @@ const yekdemCell = useMemo(() => {
   //  • Eski snapshot'larda (null) subscription_settings + distribution_tariff_official'dan
   //    canlı fallback ile çekilir (GES sayfasının davranışıyla tutarlı).
   const [gesSatisDagitimRate, setGesSatisDagitimRate] = useState<number | null>(null);
+  // MEDAŞ usulü (dagitim_kendi_veris damgalı): satışa akan bayraklı tesislerin veriş
+  // faturaları — katkıcılar aynı tip/dönem snapshot'larından (yoksa canlı).
+  const [medasKesinti, setMedasKesinti] = useState<MedasKesinti | null>(null);
   useEffect(() => {
     if (!row || !uid) {
       setGesSatisDagitimRate(null);
+      setMedasKesinti(null);
       return;
     }
     // Fazla satışı yoksa hesaba gerek yok.
     const fazlaKwh = Number(liveBreakdown?.verisFazlaKwh ?? 0);
     if (!(fazlaKwh > 0)) {
       setGesSatisDagitimRate(null);
+      setMedasKesinti(null);
       return;
     }
 
@@ -229,13 +250,28 @@ const yekdemCell = useMemo(() => {
         storedRate: (row as any).ges_satis_dagitim_bedeli,
         lisansliSatis: (row as any).lisansli_satis,
       });
-      if (!cancel) setGesSatisDagitimRate(rate);
+      const medas = liveBreakdown?.dagitimKendiVeris
+        ? await loadMedasVerisKesintisiSafe({
+            supabase,
+            userId: uid,
+            hostSerno: sub,
+            periodYear: year,
+            periodMonth: month,
+            invoiceType,
+            prefer: "snapshot",
+            host: medasHostKatkiFromBreakdown(liveBreakdown),
+          })
+        : null;
+      if (!cancel) {
+        setMedasKesinti(medas);
+        setGesSatisDagitimRate(rate);
+      }
     })();
 
     return () => {
       cancel = true;
     };
-  }, [row, uid, sub, liveBreakdown]);
+  }, [row, uid, sub, year, month, invoiceType, liveBreakdown]);
 
   // GES Üretim Satışı kart sonucu (fazla satışı + donmuş/canlı dağıtım oranı).
   const gesSatisResult = useMemo(() => {
@@ -247,9 +283,14 @@ const yekdemCell = useMemo(() => {
       onYil: row.on_yil ?? false,
       usdKur: Number(row.usd_kur ?? 0),
       perakendeEnerjiBedeli: Number(row.perakende_enerji_bedeli ?? 0),
-      dagitimBedeli: gesSatisDagitimRate,
+      ...gesSatisKesintiArgs(
+        liveBreakdown,
+        gesSatisDagitimRate,
+        medasKesinti,
+        parseGesSaleDistBasis(row.ges_sale_dist_basis)
+      ),
     });
-  }, [row, liveBreakdown, gesSatisDagitimRate]);
+  }, [row, liveBreakdown, gesSatisDagitimRate, medasKesinti]);
 
 
 
@@ -335,6 +376,17 @@ const yekdemCell = useMemo(() => {
                 </thead>
 
                 <tbody>
+                  {snapOsb && liveBreakdown ? (
+                    <OsbInvoiceRows
+                      osb={snapOsb}
+                      subtotalBeforeVat={liveBreakdown.subtotalBeforeVat}
+                      vatCharge={liveBreakdown.vatCharge}
+                      totalInvoice={liveBreakdown.totalInvoice}
+                      btvRate={Number(row.btv_rate ?? 0)}
+                      vatRate={Number(row.vat_rate ?? 0)}
+                    />
+                  ) : (
+                  <>
                   {!excludedItems.has("enerji") && (
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Enerji Bedeli</td>
@@ -401,10 +453,23 @@ const yekdemCell = useMemo(() => {
 
                   {!excludedItems.has("dagitim") && (
                     <tr className="border-b border-neutral-100">
-                      <td className="py-2 pr-4">Dağıtım Bedeli</td>
+                      <td className="py-2 pr-4">
+                        {liveBreakdown?.dagitimKendiVeris ? "Elektrik Dağıtım Bedeli" : "Dağıtım Bedeli"}
+                      </td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        {fmtUnit(liveBreakdown?.effectiveDistributionUnitPrice ?? row.effective_distribution_unit_price ?? row.unit_price_distribution)} TL/kWh × {fmtKwh(liveBreakdown?.distributionChargeKwh ?? (Number(row.total_consumption_kwh ?? 0) - Number(row.veris_kwh ?? 0)))} kWh
+                        {liveBreakdown?.dagitimKendiVeris
+                          ? `${fmtKwh(liveBreakdown.distributionChargeKwh)} kWh × ${fmtUnit(liveBreakdown.effectiveDistributionUnitPrice)} TL/kWh`
+                          : `${fmtUnit(liveBreakdown?.effectiveDistributionUnitPrice ?? row.effective_distribution_unit_price ?? row.unit_price_distribution)} TL/kWh × ${fmtKwh(liveBreakdown?.distributionChargeKwh ?? (Number(row.total_consumption_kwh ?? 0) - Number(row.veris_kwh ?? 0)))} kWh`}
                         {snapMeram && <MeramDagitimNote meram={snapMeram} />}
+                        {/* m7'de MeramDagitimNote aynı açıklamayı veriyor → çift not yok. */}
+                        {liveBreakdown?.dagitimKendiVeris && !snapMeram && (
+                          <span className="block text-[11px] text-neutral-500">
+                            Kendi veriş {fmtKwh(liveBreakdown.dagitimKendiVeris.gKwh)} kWh
+                            {liveBreakdown.dagitimKendiVeris.gKwh >= liveBreakdown.dagitimKendiVeris.cKwh
+                              ? " ≥ çekiş → D/2"
+                              : " → D × (1 − G/2C)"}
+                          </span>
+                        )}
                       </td>
                       <td className="py-2 pr-4 text-right">{fmtMoney2(liveBreakdown?.distributionCharge ?? row.distribution_charge)}</td>
                     </tr>
@@ -415,7 +480,9 @@ const yekdemCell = useMemo(() => {
                     <tr className="border-b border-neutral-100">
                       <td className="py-2 pr-4">Muhtelif-2</td>
                       <td className="py-2 pr-4 text-neutral-600">
-                        +{fmtMoney2(liveBreakdown?.muhtelif2Dagitim ?? 0)} dağıtım −{" "}
+                        {liveBreakdown?.tredasGesDagitim
+                          ? "Mahsuplaşma: −"
+                          : `+${fmtMoney2(liveBreakdown?.muhtelif2Dagitim ?? 0)} dağıtım − `}
                         {fmtMoney2(liveBreakdown?.muhtelif2MahsupKredisi ?? 0)} mahsuplaşma
                       </td>
                       <td
@@ -541,6 +608,9 @@ const yekdemCell = useMemo(() => {
                     </tr>
                   )}
 
+                  </>
+                  )}
+
 {digerDegerler !== 0 && (
   <tr className="border-b border-neutral-100">
     <td className="py-2 pr-4 font-semibold">Diğer Bedeller</td>
@@ -556,7 +626,7 @@ const yekdemCell = useMemo(() => {
 
                   <tr>
                     <td className="py-3 pr-4 font-semibold text-neutral-900">
-                      {snapIsM6 ? "Genel Toplam (Ödenecek)" : "Genel Toplam (YEKDEM Mahsubu Dahil)"}
+                      {snapIsM6 || snapOsb ? "Genel Toplam (Ödenecek)" : "Genel Toplam (YEKDEM Mahsubu Dahil)"}
                     </td>
                     <td className="py-3 pr-4 text-neutral-600">Ödenecek toplam</td>
                     <td className="py-3 pr-4 text-right text-lg font-semibold text-neutral-900">
@@ -569,7 +639,17 @@ const yekdemCell = useMemo(() => {
             {snapMeram && (
               <MeramInvoiceNotes meram={snapMeram} netKwh={liveBreakdown?.netEnergyKwh ?? 0} />
             )}
+            {snapOsb && <OsbInvoiceNotes osb={snapOsb} />}
           </div>
+
+          {/* MEDAŞ Veriş Faturası — ayrı fatura (G > C), toplamlara DAHİL DEĞİL.
+              Replay edilmiş breakdown'a göre kapılanır (saklı kolonlara değil). */}
+          {liveBreakdown?.dagitimKendiVeris && (
+            <MedasVerisFaturasiCard
+              kv={liveBreakdown.dagitimKendiVeris}
+              vatRate={Number(row.vat_rate ?? 0)}
+            />
+          )}
 
           {/* GES Üretim Satışı — fazla üretim satışı, faturaya dahil DEĞİL */}
           {gesSatisResult && (

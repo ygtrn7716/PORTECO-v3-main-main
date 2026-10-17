@@ -1,6 +1,8 @@
 // scripts/compare-meram-m7.ts
 //
 // Metot 7 (Meram / MEPAŞ) CANLI KARŞILAŞTIRMA — Metod 1 (bugün) vs Metod 7.
+// Niğde As Beton (10128583, 10126953, 9062757) abonelik bazlı override ile m7'ye geçer
+// (subscription_settings.invoice_method_override = 7); şirket (meram) Metot 1'de kalır.
 //
 // ⚠️ %100 SALT-OKUNUR. DB'ye hiçbir şey yazmaz: "@/lib/supabase" harness tsconfig'iyle
 // scripts/shims/supabaseService.ts'e yönlenir (servis istemcisi; insert/update/upsert/
@@ -11,10 +13,13 @@
 // Kullanım:
 //   npx tsx --tsconfig scripts/tsconfig.harness.json scripts/compare-meram-m7.ts [YYYY-MM] [--pending]
 //
-//   YYYY-MM    dönem (varsayılan 2026-08)
-//   --pending  As Beton için ONAY BEKLEYEN ayarları (KBK 0,952 · trafo_kaybi_saatlik 1,12 ·
-//              yekdem_gddk) DB'ye yazmadan, bellek içinde uygular. Bayraksız → DB'deki
-//              ayarlar aynen (ayarlar yazıldıktan sonraki doğrulama).
+//   YYYY-MM    dönem (varsayılan 2026-08; Eylül golden'ı için 2026-09)
+//   --pending  As Beton için ONAY BEKLEYEN ayarları DB'ye yazmadan, bellek içinde uygular:
+//              invoice_method_override 7 · KBK 0,952 · trafo_kaybi_saatlik 1,12 (havuz tahsis
+//              bağlamına da yamalanır — DB'de override yokken t-kapısı bayraklı tesisi dışlar) ·
+//              Ağustos yekdem_gddk (Eylül 0). Bayraksız → DB'deki ayarlar aynen (veri SQL'i
+//              uygulandıktan sonraki doğrulama). 2026-09 + --pending'de canlı beklenti tablosuyla
+//              (kullanıcı spec'i) otomatik karşılaştırma yapılır.
 //   --snapshots  As Beton'un 3 tesisi için "Kaydet + Snapshot'ı Yeniden Yaz" (InvoiceOverridesAdmin)
 //              akışının YAZMADAN önizlemesi: aynı yol (taslak GDDK tek kaynak → buildBreakdownFromInputs
 //              → snapshotParamsFromEngine → buildInvoiceSnapshotPayload); saklı satırla alan alan
@@ -51,18 +56,31 @@ const [periodYear, periodMonth] = periodArg.split("-").map(Number);
 const usePending = args.includes("--pending");
 const showSnapshots = args.includes("--snapshots");
 
-/** As Beton için onay bekleyen ayarlar (validasyon adımı 2). */
-const PENDING: Record<number, { kbk: number; t: number; gddk: number }> = {
-  10126953: { kbk: 0.952, t: 1.12, gddk: 82.26 },
-  10128583: { kbk: 0.952, t: 0, gddk: 1180.11 },
-  9062757: { kbk: 0.952, t: 1.12, gddk: 51.54 },
+/** As Beton için onay bekleyen ayarlar (data-fixes/2026-10-14_asbeton_m7_override.sql).
+ *  GDDK yalnız Ağustos 2026 (MEPAŞ fatura notları); diğer aylarda 0. */
+const AUG_GDDK: Record<number, number> = { 10126953: 82.26, 10128583: 1180.11, 9062757: 51.54 };
+const PENDING: Record<number, { kbk: number; t: number; gddk: number; override: 7 }> = {
+  10126953: { kbk: 0.952, t: 1.12, gddk: periodArg === "2026-08" ? AUG_GDDK[10126953] : 0, override: 7 },
+  10128583: { kbk: 0.952, t: 0, gddk: periodArg === "2026-08" ? AUG_GDDK[10128583] : 0, override: 7 },
+  9062757: { kbk: 0.952, t: 1.12, gddk: periodArg === "2026-08" ? AUG_GDDK[9062757] : 0, override: 7 },
 };
 
-/** Gerçek MEPAŞ faturaları (Ağustos 2026) — yalnız referans. */
-const MERAM_ACTUAL: Record<number, number> = {
-  10126953: 197435.24,
-  10128583: 1231516.78,
-  9062757: 30074.21,
+/** Meram referansı — Ağustos: gerçek MEPAŞ faturaları; Eylül: Meram mahsup Excel'i (faturalarla
+ *  ±0,04 TL). Yalnız referans. */
+const MERAM_ACTUAL_BY_PERIOD: Record<string, Record<number, number>> = {
+  "2026-08": { 10126953: 197435.24, 10128583: 1231516.78, 9062757: 30074.21 },
+  "2026-09": { 10126953: 158872.6, 10128583: 876211.69, 9062757: 30957.49 },
+};
+const MERAM_ACTUAL: Record<number, number> = MERAM_ACTUAL_BY_PERIOD[periodArg] ?? {};
+
+/** Canlı veri beklentisi (2026-09, --pending; kullanıcı spec'i 2026-10-14). */
+const EXPECTED_LIVE_SEP: Record<
+  number,
+  { M: number; N: number; U: number; enerji: number; F: number; dagitim: number; etv: number; toplam: number }
+> = {
+  10128583: { M: 2654.93, N: 174970.42, U: 3.505569, enerji: 613370.87, F: 1928.06, dagitim: 105017.26, etv: 6152.99, toplam: 871763.02 },
+  10126953: { M: 16924.12, N: 23133.08, U: 3.656589, enerji: 84588.16, F: 2573.24, dagitim: 44780.3, etv: 871.61, toplam: 159375.97 },
+  9062757: { M: 9964.13, N: 3416.23, U: 3.938212, enerji: 13453.82, F: -2621.86, dagitim: 15821.7, etv: 108.32, toplam: 32114.38 },
 };
 
 const money = (n: number | null | undefined) =>
@@ -80,7 +98,7 @@ async function pendingMeramInputs(
   inputs: BilledInvoiceInputs,
   userId: string,
   serno: number,
-  pending: Record<number, { kbk: number; t: number; gddk: number }>
+  pending: Record<number, { kbk: number; t: number; gddk: number; override: 7 }>
 ): Promise<InvoiceMethodInputs | null> {
   const p = pending[serno];
   const ctx = await fetchGesMahsupContext(supabase, userId);
@@ -190,8 +208,10 @@ async function snapshotRewritePreview(p: {
     "invoice_method", "kbk", "trafo_degeri", "total_consumption_kwh", "net_positive_draw_kwh",
     "net_excess_feed_kwh", "total_production_kwh", "w_pos", "w_mahsup", "yekdem_tahmini",
     "unit_price_adjustment", "trafo_kaybi_saatlik", "trafo_kaybi_kwh", "own_gn_kwh", "yekdem_gddk",
-    "yekdem_is_final", "energy_charge", "distribution_charge", "btv_charge", "subtotal_before_vat",
-    "vat_charge", "total_invoice", "has_yekdem_mahsup", "yekdem_mahsup", "total_with_mahsup",
+    "yekdem_is_final", "energy_charge", "distribution_charge", "effective_distribution_unit_price",
+    "btv_charge", "subtotal_before_vat", "vat_charge", "total_invoice", "has_yekdem_mahsup",
+    "yekdem_mahsup", "total_with_mahsup", "dagitim_kendi_veris", "medas_veris_kwh",
+    "medas_veris_birim", "medas_veris_bedeli",
   ];
   const fmt = (v: unknown) =>
     v == null ? "—" : typeof v === "number" ? (Number.isInteger(v) ? String(v) : v.toFixed(6)) : String(v);
@@ -220,6 +240,8 @@ type Row = {
   title: string;
   hidden: boolean;
   lisansli: boolean;
+  /** Efektif metot (DB: override ?? şirket; --pending'de As Beton için 7). */
+  efektif: string;
   m1Invoice: number | null;
   m1Payable: number | null;
   m7Invoice: number | null;
@@ -233,7 +255,7 @@ type Row = {
 
 async function main() {
   console.log(
-    `\n=== Meram · Metod 1 (bugün) vs Metod 7 · ${periodArg}${usePending ? " · As Beton ONAY BEKLEYEN ayarlar bellek içinde" : " · DB ayarları"} ===\n`
+    `\n=== Meram · Metod 1 (bugün) vs Metod 7 · ${periodArg}${usePending ? " · As Beton ONAY BEKLEYEN ayarlar bellek içinde (override 7, KBK 0,952, t 1,12)" : " · DB ayarları"} ===\n`
   );
 
   const { data: subs, error: subsErr } = await supabase
@@ -246,7 +268,7 @@ async function main() {
 
   const { data: settingsRows, error: setErr } = await supabase
     .from("subscription_settings")
-    .select("user_id, subscription_serno, is_hidden, active")
+    .select("user_id, subscription_serno, is_hidden, active, invoice_method_override")
     .in("subscription_serno", (subs ?? []).map((s) => Number(s.subscription_serno)));
   if (setErr) throw setErr;
 
@@ -263,6 +285,7 @@ async function main() {
       title: String(s.title ?? "").slice(0, 38),
       hidden: st?.is_hidden === true || st?.active === false,
       lisansli: false,
+      efektif: "—",
       m1Invoice: null,
       m1Payable: null,
       m7Invoice: null,
@@ -300,7 +323,13 @@ async function main() {
     base.m1Payable = r1.totalWithMahsup;
     base.b1 = r1.breakdown;
     base.m1YekdemMahsup = r1.yekdemMahsup;
+    // fetchBilledInvoiceInputs efektif metodu (override ?? şirket) zaten çözüyor.
+    const pend = usePending && PENDING[serno] != null;
+    base.efektif = pend
+      ? "m7 (pending override)"
+      : `m${inputs.invoiceMethodId}${st?.invoice_method_override != null ? " (override)" : " (şirket)"}`;
     if (inputs.invoiceMethodId !== 1) base.note += `bugünkü metod ${inputs.invoiceMethodId}; `;
+    if (!pend && inputs.invoiceMethodId !== 7) base.note += "m7 sütunu HİPOTETİK (efektif metot 7 değil); ";
 
     const mi7 =
       usePending && PENDING[serno]
@@ -338,6 +367,7 @@ async function main() {
   const head = [
     "serno".padEnd(9),
     "tesis".padEnd(38),
+    "efektif".padEnd(22),
     "m1 ödenecek".padStart(15),
     "m7 ödenecek".padStart(15),
     "Δ (m7−m1)".padStart(13),
@@ -353,6 +383,7 @@ async function main() {
       [
         String(r.serno).padEnd(9),
         (r.title + (r.hidden ? " (gizli)" : "")).slice(0, 38).padEnd(38),
+        r.efektif.padEnd(22),
         money(r.m1Payable).padStart(15),
         money(r.m7Payable).padStart(15),
         money(d).padStart(13),
@@ -389,13 +420,52 @@ async function main() {
     );
     console.log(
       `  Enerji ${money(b.energyCharge)} · F ${money(m.mahsuplasmaFarki)} · GDDK ${money(m.gddk)}` +
-        ` · Satır2 ${money(m.satir2)} · Dağıtım ${money(b.distributionCharge)}${m.dagitimYarim ? " (½)" : ""}` +
+        ` · Satır2 ${money(m.satir2)} · Dağıtım ${money(b.distributionCharge)} (birim ${unit(b.effectiveDistributionUnitPrice)})${m.dagitimYarim ? " (½)" : ""}` +
         ` · Reaktif ${money(b.reactivePenaltyCharge)} · Güç ${money(b.powerTotalCharge)}`
     );
     console.log(
       `  BTV ${money(b.btvCharge)} · Matrah ${money(b.subtotalBeforeVat)} · KDV ${money(b.vatCharge)}` +
         ` · Toplam ${money(b.totalInvoice)} · m1 toplam ${money(r.m1Invoice)} / ödenecek ${money(r.m1Payable)}`
     );
+    if (b.dagitimKendiVeris) {
+      const kv = b.dagitimKendiVeris;
+      console.log(
+        `  MEDAŞ veriş (ayrı fatura, KDV hariç) ${money(kv.medasBedeli)} = ${kwh(kv.medasKwh)} kWh × ${unit(kv.medasBirim)}` +
+          ` · satış kWh ${kwh(b.verisFazlaKwh)}`
+      );
+    }
+  }
+
+  // ── Canlı beklenti karşılaştırması (2026-09 + --pending; kullanıcı spec'i)
+  if (usePending && periodArg === "2026-09") {
+    console.log("\n=== Canlı beklenti (spec) vs hesap — 2026-09, override 7 bellek içinde ===");
+    let fails = 0;
+    const chk = (label: string, a: number, e: number, tol: number) => {
+      const ok = Math.abs(a - e) <= tol;
+      if (!ok) fails++;
+      return `${label} ${a.toFixed(label === "U" ? 6 : 2)} (spec ${e.toFixed(label === "U" ? 6 : 2)}) ${ok ? "✅" : "❌"}`;
+    };
+    for (const r of rows) {
+      const e = EXPECTED_LIVE_SEP[r.serno];
+      const b = r.b7;
+      if (!e || !b?.meram) continue;
+      console.log(
+        `  ${r.serno}: ` +
+          [
+            chk("Mahsup", b.meram.mahsupKwh, e.M, 0.01),
+            chk("Net", b.netEnergyKwh, e.N, 0.01),
+            chk("U", b.energyUnitPriceApplied ?? NaN, e.U, 0),
+            chk("Enerji", b.energyCharge, e.enerji, 0.01),
+            chk("F", b.meram.mahsuplasmaFarki, e.F, 0.01),
+            chk("Dağıtım", b.distributionCharge, e.dagitim, 0.01),
+            chk("ETV", b.btvCharge, e.etv, 0.01),
+            // MEPAŞ satırları 2 haneye yuvarlayıp toplar; motor satır tutarlarını yuvarlamaz →
+            // KDV dahil toplamda ≤ birkaç kuruş (golden toleransıyla aynı: ±0,05).
+            chk("KDV dahil", b.totalInvoice, e.toplam, 0.05),
+          ].join(" · ")
+      );
+    }
+    console.log(fails === 0 ? "  → canlı beklentiyle birebir ✅" : `  → ${fails} kalem farklı ❌`);
   }
   if (showSnapshots) {
     console.log(
